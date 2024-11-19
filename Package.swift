@@ -4,6 +4,10 @@ import PackageDescription
 
 let package = Package(
     name: "ReliaBLE",
+    platforms: [
+        .iOS(.v16),
+        .macOS(.v10_14)
+    ],
     products: [
         .library(
             name: "ReliaBLE",
