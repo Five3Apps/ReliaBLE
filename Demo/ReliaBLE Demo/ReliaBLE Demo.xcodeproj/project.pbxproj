@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		8B771ADE2CEC48E2002F0E31 /* ReliaBLE in Frameworks */ = {isa = PBXBuildFile; productRef = 8B771ADD2CEC48E2002F0E31 /* ReliaBLE */; };
+		8BE1BEC92CF39B83002FC492 /* ReliaBLE in Frameworks */ = {isa = PBXBuildFile; productRef = 8B771AC52CEC3CC6002F0E31 /* ReliaBLE */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -56,6 +57,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8BE1BEC92CF39B83002FC492 /* ReliaBLE in Frameworks */,
 				8B771ADE2CEC48E2002F0E31 /* ReliaBLE in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

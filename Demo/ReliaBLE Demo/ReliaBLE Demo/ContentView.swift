@@ -6,67 +6,23 @@
 //
 
 import SwiftUI
-import SwiftData
-
-import ReliaBLE
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var devices: [Device]
-    
-    private var reliaBLE = ReliaBLE()
-
     var body: some View {
-        NavigationSplitView {
-            Text(reliaBLE.testFunction())
+        TabView {
+            PeripheralView()
+                .tabItem {
+                    Label("Peripheral", systemImage: "dot.radiowaves.left.and.right")
+                }
             
-            List {
-                ForEach(devices) { device in
-                    NavigationLink {
-                        Text("Device seen at \(device.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(device.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
+            CentralView()
+                .tabItem {
+                    Label("Central", systemImage: "antenna.radiowaves.left.and.right")
                 }
-                .onDelete(perform: deleteDevices)
-            }
-#if os(macOS)
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-#endif
-            .toolbar {
-#if os(iOS)
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
-                }
-#endif
-                ToolbarItem {
-                    Button(action: addDevice) {
-                        Label("Add Device", systemImage: "plus")
-                    }
-                }
-            }
-        } detail: {
-            Text("Select an device")
-        }
-    }
-
-    private func addDevice() {
-        withAnimation {
-            let newDevice = Device(timestamp: Date())
-            modelContext.insert(newDevice)
-        }
-    }
-
-    private func deleteDevices(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(devices[index])
-            }
         }
     }
 }
 
 #Preview {
     ContentView()
-        .modelContainer(for: Device.self, inMemory: true)
 }
