@@ -3,6 +3,6 @@ import Testing
 
 @Test func correctFunction() async throws {
     // Write your test here and use APIs like `#expect(...)` to check expected conditions.
-    let package = ReliaBLE()
+    let package = ReliaBLEManager()
     #expect(package.testFunction() == "Hello, this is ReliaBLE!", "Incorrect response string")
 }

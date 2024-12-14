@@ -1,5 +1,5 @@
 //
-//  ReliaBLE.swift
+//  ReliaBLEManager.swift
 //  ReliaBLE
 //
 //  Created by Justin Bergen on 11/18/24.
@@ -8,7 +8,7 @@
 import Foundation
 
 /// The main entry point for the ReliaBLE library.
-public class ReliaBLE {
+public class ReliaBLEManager {
     public init() {
         
     }
