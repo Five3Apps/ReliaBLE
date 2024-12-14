@@ -205,7 +205,6 @@
 			mainGroup = 8B771A8B2CEC3B9A002F0E31;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				8B771ADC2CEC48E2002F0E31 /* XCLocalSwiftPackageReference "../../../ReliaBLE" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 8B771A952CEC3B9A002F0E31 /* Products */;
@@ -609,13 +608,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
-/* Begin XCLocalSwiftPackageReference section */
-		8B771ADC2CEC48E2002F0E31 /* XCLocalSwiftPackageReference "../../../ReliaBLE" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = ../../../ReliaBLE;
-		};
-/* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
 		8B771AC52CEC3CC6002F0E31 /* ReliaBLE */ = {
