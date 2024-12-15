@@ -33,11 +33,27 @@ struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
     @Query private var devices: [Device]
     
+    @State private var logsButtonTitle = "Enable Logging"
+    
     private var reliaBLE = ReliaBLEManager()
 
     var body: some View {
         NavigationSplitView {
-            Text(reliaBLE.testFunction())
+            Button("Call Test Function") {
+                _ = reliaBLE.testFunction()
+            }
+            .buttonStyle(.bordered)
+            
+            Button(logsButtonTitle) {
+                if logsButtonTitle == "Enable Logging" {
+                    reliaBLE.loggingService.enableLogging(true)
+                    logsButtonTitle = "Disable Logging"
+                } else {
+                    reliaBLE.loggingService.enableLogging(false)
+                    logsButtonTitle = "Enable Logging"
+                }
+            }
+            .buttonStyle(.bordered)
             
             List {
                 ForEach(devices) { device in
