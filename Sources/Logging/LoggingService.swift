@@ -1,10 +1,8 @@
 //
-//  ReliaBLEManager.swift
+//  LoggingService.swift
 //  ReliaBLE
 //
-//  Created by Justin Bergen on 11/18/24.
-//
-//  Copyright (c) 2024 Five3 Apps, LLC <justin@five3apps.com>
+//  Created by Justin Bergen on 12/14/24.
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -28,23 +26,18 @@ import Foundation
 
 @preconcurrency import Willow
 
-/// The main entry point for the ReliaBLE library.
-public class ReliaBLEManager {
-    public let loggingService: LoggingService
+public class LoggingService {
+    let willowLogger: Logger
     
-    private let log: Logger
-    
-    public init(config: ReliaBLEConfig = ReliaBLEConfig()) {
-        loggingService = LoggingService(levels: config.logLevels, writers: config.logWriters, queue: config.logQueue)
-        loggingService.enableLogging(config.loggingEnabled)
-        log = loggingService.willowLogger
+    init(levels: LogLevel, writers: [LogWriter], queue: DispatchQueue) {
+        willowLogger = Logger(
+            logLevels: levels,
+            writers: writers,
+            executionMethod: .asynchronous(queue: queue)
+        )
     }
     
-    /// This is a test function that returns a string.
-    /// - Returns: A string that says "Hello, this is ReliaBLE!"
-    public func testFunction() -> String {
-        log.debugMessage("testFunction() called")
-        
-        return "Hello, this is ReliaBLE!"
+    public func enableLogging(_ enabled: Bool) {
+        willowLogger.enabled = enabled
     }
 }
