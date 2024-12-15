@@ -1,6 +1,6 @@
 //
-//  ReliaBLEManager.swift
-//  ReliaBLE
+//  ReliaBLEManagerTests.swift
+//  ReliaBLETests
 //
 //  Created by Justin Bergen on 11/18/24.
 //
@@ -24,17 +24,11 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Foundation
+import Testing
+@testable import ReliaBLE
 
-/// The main entry point for the ReliaBLE library.
-public class ReliaBLEManager {
-    public init() {
-        
-    }
-    
-    /// This is a test function that returns a string.
-    /// - Returns: A string that says "Hello, this is ReliaBLE!"
-    public func testFunction() -> String {
-        return "Hello, this is ReliaBLE!"
-    }
+@Test func correctFunction() async throws {
+    // Write your test here and use APIs like `#expect(...)` to check expected conditions.
+    let package = ReliaBLEManager()
+    #expect(package.testFunction() == "Hello, this is ReliaBLE!", "Incorrect response string")
 }
