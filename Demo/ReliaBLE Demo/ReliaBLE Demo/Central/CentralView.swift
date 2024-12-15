@@ -14,7 +14,7 @@ struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
     @Query private var devices: [Device]
     
-    private var reliaBLE = ReliaBLE()
+    private var reliaBLE = ReliaBLEManager()
 
     var body: some View {
         NavigationSplitView {
