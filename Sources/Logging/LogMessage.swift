@@ -45,17 +45,17 @@ enum LogTag {
     }
 }
 
-struct LogMessage: Willow.LogMessage {
+public struct LogMessage: Willow.LogMessage {
     var tags: [LogTag]?
     var message: String
     
     // MARK: - LogMessage
     
-    var name: String {
+    public var name: String {
         message
     }
     
-    var attributes: [String : Any] {
+    public var attributes: [String : Any] {
         guard let tags else {
             return [:]
         }
@@ -73,7 +73,7 @@ struct LogMessage: Willow.LogMessage {
         }
 
         if !categories.isEmpty {
-            result["Category"] = categories.joined(separator: ",")
+            result["Categories"] = categories.joined(separator: ", ")
         }
 
         return result
