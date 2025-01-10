@@ -26,15 +26,29 @@
 
 import Foundation
 
+@preconcurrency import Willow
+
 /// The main entry point for the ReliaBLE library.
 public class ReliaBLEManager {
-    public init() {
+    public let loggingService: LoggingService
+    
+    private let log: LoggingService
+    
+    public init(config: ReliaBLEConfig = ReliaBLEConfig()) {
+        loggingService = LoggingService(levels: config.logLevels, writers: config.logWriters, queue: config.logQueue)
+        loggingService.enabled = config.loggingEnabled
         
+        log = loggingService
     }
     
     /// This is a test function that returns a string.
     /// - Returns: A string that says "Hello, this is ReliaBLE!"
     public func testFunction() -> String {
+        log.debug(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
+        log.info(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
+        log.warn(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
+        log.error(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
+        
         return "Hello, this is ReliaBLE!"
     }
 }

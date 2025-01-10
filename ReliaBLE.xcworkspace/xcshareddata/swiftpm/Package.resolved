@@ -1,5 +1,5 @@
 {
-  "originHash" : "0bf665e3c9caa48de30a4e18cd5ed6db89bce4b7e0309f3594c6f072213ea88e",
+  "originHash" : "50ae41968c3c2a4917878110142f17be1230d8ea8407d801971ea65b33603c99",
   "pins" : [
     {
       "identity" : "swift-docc-plugin",
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "b45d1f2ed151d057b54504d653e0da5552844e34",
         "version" : "1.0.0"
+      }
+    },
+    {
+      "identity" : "willow",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/itsniper/Willow",
+      "state" : {
+        "branch" : "main",
+        "revision" : "8952bb792c9206caa3b69fcf7432d2b5280c3db5"
       }
     }
   ],

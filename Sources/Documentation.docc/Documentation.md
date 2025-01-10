@@ -8,6 +8,11 @@ This is a temporary overview.
 
 ## Topics
 
-### Main Class
+### Essentials
 
-- ``ReliaBLEManager``
+- <doc:GettingStarted>
+- <doc:Logging>
+
+### Advanced Usage
+
+- <doc:Logging>

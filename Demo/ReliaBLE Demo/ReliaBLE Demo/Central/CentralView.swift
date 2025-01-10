@@ -31,13 +31,29 @@ import ReliaBLE
 
 struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.bleManager) private var reliaBLE
+    
     @Query private var devices: [Device]
     
-    private var reliaBLE = ReliaBLEManager()
-
+    @State private var logsButtonTitle = "Disable Logging"
+    
     var body: some View {
         NavigationSplitView {
-            Text(reliaBLE.testFunction())
+            Button("Call Test Function") {
+                _ = reliaBLE?.testFunction()
+            }
+            .buttonStyle(.bordered)
+            
+            Button(logsButtonTitle) {
+                if logsButtonTitle == "Enable Logging" {
+                    reliaBLE?.loggingService.enabled = true
+                    logsButtonTitle = "Disable Logging"
+                } else {
+                    reliaBLE?.loggingService.enabled = false
+                    logsButtonTitle = "Enable Logging"
+                }
+            }
+            .buttonStyle(.bordered)
             
             List {
                 ForEach(devices) { device in
