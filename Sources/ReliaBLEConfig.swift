@@ -30,7 +30,7 @@ public typealias LogLevel = Willow.LogLevel
 
 public struct ReliaBLEConfig {
     public var logLevels = LogLevel.all
-    public var logWriters = [OSLogWriter(subsystem: "com.five3apps.relia-ble", category: "BLE")]
+    public var logWriters: [LogWriter] = [OSLogWriter(subsystem: "com.five3apps.relia-ble", category: "BLE")]
     public var logQueue = DispatchQueue(label: "com.five3apps.relia-ble.logging", qos: .utility)
     public var loggingEnabled = false
     

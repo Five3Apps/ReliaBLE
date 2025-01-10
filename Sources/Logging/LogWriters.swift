@@ -29,6 +29,11 @@ import os
 
 @preconcurrency import Willow
 
+public typealias LogModifier = Willow.LogModifier
+public typealias LogWriter = Willow.LogWriter
+public typealias LogModifierWriter = Willow.LogModifierWriter
+public typealias ConsoleWriter = Willow.ConsoleWriter
+
 /// The OSLogWriter class runs all modifiers in the order they were created and passes the resulting message
 /// off to an OSLog with the specified subsystem and category.
 public class OSLogWriter: LogModifierWriter {
@@ -45,6 +50,7 @@ public class OSLogWriter: LogModifierWriter {
     /// - Parameters:
     ///   - subsystem: The subsystem.
     ///   - category:  The category.
+    ///  -  modifiers: The modifiers that the writer should execute (in order) on incoming messages.
     public init(subsystem: String, category: String, modifiers: [LogModifier] = []) {
         self.subsystem = subsystem
         self.category = category
