@@ -46,10 +46,10 @@ struct CentralView: View {
             
             Button(logsButtonTitle) {
                 if logsButtonTitle == "Enable Logging" {
-                    reliaBLE.loggingService.enableLogging(true)
+                    reliaBLE.loggingService.enabled = true
                     logsButtonTitle = "Disable Logging"
                 } else {
-                    reliaBLE.loggingService.enableLogging(false)
+                    reliaBLE.loggingService.enabled = false
                     logsButtonTitle = "Enable Logging"
                 }
             }

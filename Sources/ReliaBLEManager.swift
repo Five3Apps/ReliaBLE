@@ -36,7 +36,7 @@ public class ReliaBLEManager {
     
     public init(config: ReliaBLEConfig = ReliaBLEConfig()) {
         loggingService = LoggingService(levels: config.logLevels, writers: config.logWriters, queue: config.logQueue)
-        loggingService.enableLogging(config.loggingEnabled)
+        loggingService.enabled = config.loggingEnabled
         log = loggingService.willowLogger
     }
     

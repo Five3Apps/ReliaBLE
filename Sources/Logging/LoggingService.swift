@@ -37,7 +37,8 @@ public class LoggingService {
         )
     }
     
-    public func enableLogging(_ enabled: Bool) {
-        willowLogger.enabled = enabled
+    public var enabled: Bool {
+        get { willowLogger.enabled }
+        set { willowLogger.enabled = newValue }
     }
 }
