@@ -26,6 +26,8 @@ import Foundation
 
 @preconcurrency import Willow
 
+public typealias LogLevel = Willow.LogLevel
+
 public struct ReliaBLEConfig {
     public var logLevels = LogLevel.all
     public var logWriters = [OSLogWriter(subsystem: "com.five3apps.relia-ble", category: "BLE")]

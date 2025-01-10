@@ -24,6 +24,18 @@
 
 import SwiftUI
 import SwiftData
+import ReliaBLE
+
+private struct BLEManagerKey: EnvironmentKey {
+    static let defaultValue: ReliaBLEManager? = nil
+}
+
+extension EnvironmentValues {
+    var bleManager: ReliaBLEManager? {
+        get { self[BLEManagerKey.self] }
+        set { self[BLEManagerKey.self] = newValue }
+    }
+}
 
 @main
 struct ReliaBLE_DemoApp: App {
@@ -39,11 +51,23 @@ struct ReliaBLE_DemoApp: App {
             fatalError("Could not create ModelContainer: \(error)")
         }
     }()
+    
+    var reliaBLE: ReliaBLEManager = {
+        var config = ReliaBLEConfig()
+        // Uncomment to disable debug level logs
+//        config.logLevels = [LogLevel.info, LogLevel.warn, LogLevel.error]
+        config.logWriters = [OSLogWriter(subsystem: "com.five3apps.relia-ble-demo", category: "BLE")]
+        config.logQueue = DispatchQueue(label: "com.five3apps.relia-ble-demo.logging", qos: .utility)
+        config.loggingEnabled = true
+        
+        return ReliaBLEManager(config: config)
+    }()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
         .modelContainer(sharedModelContainer)
+        .environment(\.bleManager, reliaBLE)
     }
 }
