@@ -43,4 +43,54 @@ public class LoggingService {
         get { willowLogger.enabled }
         set { willowLogger.enabled = newValue }
     }
+    
+    // MARK: - Log Messages
+    
+    func debug(
+        file: StaticString = #file,
+        function: StaticString = #function,
+        line: UInt = #line,
+        column: UInt = #column,
+        tags: [LogTag] = [],
+        _ message: @autoclosure @escaping () -> String
+    ) {
+        let message = LogMessage(tags: tags, message: message())
+        willowLogger.debug(file: file, function: function, line: line, column: column, message)
+    }
+    
+    func info(
+        file: StaticString = #file,
+        function: StaticString = #function,
+        line: UInt = #line,
+        column: UInt = #column,
+        tags: [LogTag] = [],
+        _ message: @autoclosure @escaping () -> String
+    ) {
+        let message = LogMessage(tags: tags, message: message())
+        willowLogger.info(file: file, function: function, line: line, column: column, message)
+    }
+    
+    func warn(
+        file: StaticString = #file,
+        function: StaticString = #function,
+        line: UInt = #line,
+        column: UInt = #column,
+        tags: [LogTag] = [],
+        _ message: @autoclosure @escaping () -> String
+    ) {
+        let message = LogMessage(tags: tags, message: message())
+        willowLogger.warn(file: file, function: function, line: line, column: column, message)
+    }
+    
+    func error(
+        file: StaticString = #file,
+        function: StaticString = #function,
+        line: UInt = #line,
+        column: UInt = #column,
+        tags: [LogTag] = [],
+        _ message: @autoclosure @escaping () -> String
+    ) {
+        let message = LogMessage(tags: tags, message: message())
+        willowLogger.error(file: file, function: function, line: line, column: column, message)
+    }
 }
