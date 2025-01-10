@@ -32,7 +32,6 @@ import os
 /// The OSLogWriter class runs all modifiers in the order they were created and passes the resulting message
 /// off to an OSLog with the specified subsystem and category.
 public class OSLogWriter: LogModifierWriter {
-    
     public let subsystem: String
     public let category: String
 

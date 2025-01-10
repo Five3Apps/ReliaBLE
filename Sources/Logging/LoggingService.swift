@@ -26,6 +26,7 @@ import Foundation
 
 @preconcurrency import Willow
 
+/// Service for managing all logging within ReliaBLE.
 public class LoggingService {
     let willowLogger: Logger
     
@@ -37,6 +38,7 @@ public class LoggingService {
         )
     }
     
+    /// Controls whether to allow log messages to be sent to the writers.
     public var enabled: Bool {
         get { willowLogger.enabled }
         set { willowLogger.enabled = newValue }

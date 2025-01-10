@@ -26,15 +26,22 @@
 
 @preconcurrency import Willow
 
-enum LogTag {
-    enum Category: String {
+/// An enumeration representing defined tags that can be associated with log messages. These are used
+/// to categorize log messages for better organization and filtering.
+public enum LogTag {
+    /// A tag representing a specific category the log message relates to. See ``Category`` for more details.
+    case category(Category)
+    /// A tag representing a specific peripheral device, identified by its unique identifier.
+    case peripheral(String)
+    
+    /// A special tag representing a specific category of log messages, such as "scanning" or "connection".
+    /// Log messages can have multiple category tags but that should be the exception rather than the rule.
+    public enum Category: String {
         case scanning
         case connection
     }
     
-    case category(Category)
-    case peripheral(String)
-
+    /// A convenience property that returns the tag as a key/value tuple to be used in ``LogMessage.attributes``.
     var attribute: (key: String, value: String) {
         switch self {
         case .peripheral(let peripheralId):
@@ -45,16 +52,24 @@ enum LogTag {
     }
 }
 
+/// A message structure that conforms to Willow's LogMessage protocol for structured logging.
+/// Contains optional tags for categorization and metadata, along with the main message content.
 public struct LogMessage: Willow.LogMessage {
     var tags: [LogTag]?
     var message: String
     
-    // MARK: - LogMessage
+    // MARK: - Willow.LogMessage Conformance
     
+    /// The name of the log message, which returns the message content.
     public var name: String {
         message
     }
     
+    /// A dictionary of attributes associated with the log message. Converts any tags into a
+    /// dictionary format to be used as attributes in the log message. "Categories" contains a
+    /// comma-separated list of all category tags and other keys contain their respective tag
+    ///  values.
+    /// - Returns: A dictionary containing tag attributes.
     public var attributes: [String : Any] {
         guard let tags else {
             return [:]

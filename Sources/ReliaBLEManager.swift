@@ -43,8 +43,8 @@ public class ReliaBLEManager {
     /// This is a test function that returns a string.
     /// - Returns: A string that says "Hello, this is ReliaBLE!"
     public func testFunction() -> String {
-        log.debugMessage("testFunction() called")
-        log.debug(LogMessage(tags: [.category(.connection), .category(.scanning), .peripheral("123")], message: "testFunction() called"))
+        log.debugMessage("String Message: testFunction() called")
+        log.debug(LogMessage(tags: [.category(.connection), .category(.scanning), .peripheral("123")], message: "Log Message: testFunction() called"))
         
         return "Hello, this is ReliaBLE!"
     }
