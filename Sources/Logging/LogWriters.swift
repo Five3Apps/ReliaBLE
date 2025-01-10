@@ -29,9 +29,18 @@ import os
 
 @preconcurrency import Willow
 
+/// The LogModifier protocol defines a single method for modifying a log message after it has been constructed.
+/// This is very flexible allowing any object that conforms to modify messages in any way it wants.
 public typealias LogModifier = Willow.LogModifier
+/// The LogWriter protocol defines a single API for writing a log message. The message can be written in any way
+/// the conforming object sees fit. For example, it could write to the console, write to a file, remote log to a third
+/// party service, etc.
 public typealias LogWriter = Willow.LogWriter
+/// LogModifierWriter extends LogWriter to allow for standard writers that utilize MessageModifiers
+/// to transform the message before being output.
 public typealias LogModifierWriter = Willow.LogModifierWriter
+/// The ConsoleWriter class runs all modifiers in the order they were created and prints the resulting message
+/// to the console.
 public typealias ConsoleWriter = Willow.ConsoleWriter
 
 /// The OSLogWriter class runs all modifiers in the order they were created and passes the resulting message
@@ -50,7 +59,7 @@ public class OSLogWriter: LogModifierWriter {
     /// - Parameters:
     ///   - subsystem: The subsystem.
     ///   - category:  The category.
-    ///  -  modifiers: The modifiers that the writer should execute (in order) on incoming messages.
+    ///   -  modifiers: The modifiers that the writer should execute (in order) on incoming messages.
     public init(subsystem: String, category: String, modifiers: [LogModifier] = []) {
         self.subsystem = subsystem
         self.category = category
