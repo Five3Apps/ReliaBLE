@@ -36,13 +36,23 @@ struct CentralView: View {
     @Query private var devices: [Device]
     
     @State private var logsButtonTitle = "Disable Logging"
+    @State private var currentState: BluetoothState = .unknown
     
     var body: some View {
         NavigationSplitView {
-            Button("Call Test Function") {
-                _ = reliaBLE?.testFunction()
+            if let reliaBLE {
+                Text("ReliaBLE state: \(currentState.description)")
+                    .onReceive(reliaBLE.state.receive(on: DispatchQueue.main)) { newState in
+                        self.currentState = newState
+                    }
             }
-            .buttonStyle(.bordered)
+            
+            if case BluetoothState.unauthorized(let authState) = currentState, authState == .notDetermined {
+                Button("Authorize Bluetooth") {
+                    try? reliaBLE?.authorizeBluetooth()
+                }
+                .buttonStyle(.bordered)
+            }
             
             Button(logsButtonTitle) {
                 if logsButtonTitle == "Enable Logging" {
