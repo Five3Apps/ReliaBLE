@@ -34,22 +34,9 @@
 		8B771AB12CEC3B9C002F0E31 /* ReliaBLE DemoUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "ReliaBLE DemoUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
-/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		8B8B1A4A2D3B099B008FC3BE /* Exceptions for "ReliaBLE Demo" folder in "ReliaBLE Demo" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				"ReliaBLE-Demo-Info.plist",
-			);
-			target = 8B771A932CEC3B9A002F0E31 /* ReliaBLE Demo */;
-		};
-/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		8B771A962CEC3B9A002F0E31 /* ReliaBLE Demo */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				8B8B1A4A2D3B099B008FC3BE /* Exceptions for "ReliaBLE Demo" folder in "ReliaBLE Demo" target */,
-			);
 			path = "ReliaBLE Demo";
 			sourceTree = "<group>";
 		};
@@ -423,7 +410,7 @@
 				INFOPLIST_FILE = "ReliaBLE-Demo-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = ReliaBLE;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Demo ReliaBLE capabilities";
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Demonstrate ReliaBLE capabilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -467,7 +454,7 @@
 				INFOPLIST_FILE = "ReliaBLE-Demo-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = ReliaBLE;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Demo ReliaBLE capabilities";
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Demonstrate ReliaBLE capabilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
