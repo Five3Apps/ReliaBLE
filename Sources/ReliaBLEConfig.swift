@@ -30,12 +30,24 @@ import Foundation
 /// that is used to satisfy the raw value backing the log level.
 public typealias LogLevel = Willow.LogLevel
 
+/// The `ReliaBLEConfig` struct defines the configuration options for the ReliaBLE library. This struct is used to
+/// configure the logging service used by ReliaBLE.
 public struct ReliaBLEConfig {
+    /// The log levels to that will be send to ``logWriters`` for logging. The default value is all log levels.
     public var logLevels = LogLevel.all
+
+    /// The log writers that will receive log messages. The default value is a single ``OSLogWriter`` with the subsystem
+    /// "com.five3apps.relia-ble" and the category "BLE".
     public var logWriters: [LogWriter] = [OSLogWriter(subsystem: "com.five3apps.relia-ble", category: "BLE")]
+
+    /// The queue that will be used for processing log messages. The default value is a utility queue with the label
+    /// "com.five3apps.relia-ble.logging".
     public var logQueue = DispatchQueue(label: "com.five3apps.relia-ble.logging", qos: .utility)
+    
+    /// Whether or not logging is enabled. The default value is `false`.
     public var loggingEnabled = false
     
+    /// Initializes a new `ReliaBLEConfig` instance with the default values.
     public init() {
         
     }

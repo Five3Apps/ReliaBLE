@@ -27,14 +27,14 @@ import SwiftUI
 struct ContentView: View {
     var body: some View {
         TabView {
-            PeripheralView()
-                .tabItem {
-                    Label("Peripheral", systemImage: "dot.radiowaves.left.and.right")
-                }
-            
             CentralView()
                 .tabItem {
                     Label("Central", systemImage: "antenna.radiowaves.left.and.right")
+                }
+            
+            PeripheralView()
+                .tabItem {
+                    Label("Peripheral", systemImage: "dot.radiowaves.left.and.right")
                 }
         }
     }

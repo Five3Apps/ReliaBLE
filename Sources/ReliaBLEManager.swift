@@ -24,6 +24,7 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
+import Combine
 import Foundation
 
 @preconcurrency import Willow
@@ -33,22 +34,41 @@ public class ReliaBLEManager {
     public let loggingService: LoggingService
     
     private let log: LoggingService
+    private let bluetoothManager: BluetoothManager
     
+    /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
+    ///
+    /// Initializing a ReliaBLEManager does not start the CBCentralManager or trigger an authorization alert. This
+    /// allows the integrating app to control when and how Bluetooth autorization is presented to the user. When the
+    /// integrating app desires to request Bluetooth authorization from iOS it can call ``authorizeBluetooth()``.
+    ///
+    /// - Parameter config: A ReliaBLEConfig with the desired configurations set. If the value is `nil`, a default
+    /// configuration is used. See ``ReliaBLEConfig`` for details on the default configuration.
     public init(config: ReliaBLEConfig = ReliaBLEConfig()) {
         loggingService = LoggingService(levels: config.logLevels, writers: config.logWriters, queue: config.logQueue)
         loggingService.enabled = config.loggingEnabled
         
         log = loggingService
+        bluetoothManager = BluetoothManager(loggingService: loggingService)
     }
     
-    /// This is a test function that returns a string.
-    /// - Returns: A string that says "Hello, this is ReliaBLE!"
-    public func testFunction() -> String {
-        log.debug(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
-        log.info(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
-        log.warn(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
-        log.error(tags: [.category(.connection), .category(.scanning), .peripheral("123")], "testFunction() called")
-        
-        return "Hello, this is ReliaBLE!"
+    // MARK: - State
+
+    /// Publisher for the real-time state of the underlying Core Bluetooth system.
+    public var state: AnyPublisher<BluetoothState, Never> {
+        bluetoothManager.state
+    }
+    
+    /// Synchronous, thread-safe access to the current state of the underlying Core Bluetooth system.
+    public var currentState: BluetoothState {
+        bluetoothManager.currentState
+    }
+    
+    /// Requests authorization to use Bluetooth. This method will throw an error if the user has denied or restricted
+    /// Bluetooth access.
+    ///
+    /// - Throws: An ``AuthorizationError`` error if the user has denied or restricted Bluetooth access.
+    public func authorizeBluetooth() throws {
+        try bluetoothManager.authorize()
     }
 }
