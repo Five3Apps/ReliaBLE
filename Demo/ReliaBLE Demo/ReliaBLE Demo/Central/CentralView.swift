@@ -52,6 +52,16 @@ struct CentralView: View {
                     try? reliaBLE?.authorizeBluetooth()
                 }
                 .buttonStyle(.bordered)
+            } else if case BluetoothState.ready = currentState {
+                Button("Start Scanning") {
+                    reliaBLE?.startScanning()
+                }
+                .buttonStyle(.bordered)
+            } else if case BluetoothState.scanning = currentState {
+                Button("Stop Scanning") {
+                    reliaBLE?.stopScanning()
+                }
+                .buttonStyle(.bordered)
             }
             
             Button(logsButtonTitle) {

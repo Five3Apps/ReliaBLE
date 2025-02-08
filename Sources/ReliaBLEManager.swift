@@ -71,4 +71,17 @@ public class ReliaBLEManager {
     public func authorizeBluetooth() throws {
         try bluetoothManager.authorize()
     }
+    
+    /// Starts scanning for all peripheral devices.
+    ///
+    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
+    /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
+    public func startScanning() {
+        bluetoothManager.startScanning()
+    }
+    
+    /// Stops scanning for peripheral devices.
+    public func stopScanning() {
+        bluetoothManager.stopScanning()
+    }
 }

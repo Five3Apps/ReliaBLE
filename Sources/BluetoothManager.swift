@@ -98,6 +98,14 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
             break
         }
         
+        // Check for scanning before checking the centralManager state. If the centralManager is scanning, it has
+        // to be in a poweredOn state. So scanning is the "higher" state.
+        if centralManager?.isScanning == true {
+            stateSubject.send(.scanning)
+            
+            return
+        }
+        
         switch centralManager?.state {
         case .poweredOn:
             stateSubject.send(.ready)
@@ -135,12 +143,59 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
         }
     }
     
+    // MARK: - Scanning
+    
+    /// Starts (or restarts) scanning for peripherals. If scanning is already in progress, this method will replace the
+    /// current scan with a new scan.
+    ///
+    /// - Parameter services: An array of CBUUID objects that the app is interested in scanning for. If the value is
+    /// `nil`, the app scans for all peripherals.
+    ///
+    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning.
+    func startScanning(services: [CBUUID]? = nil) {
+        guard let centralManager else {
+            log.warn(tags: [.category(.scanning)], "Attempted to start scan without a central manager")
+            
+            return
+        }
+        
+        centralManager.scanForPeripherals(withServices: services, options: nil)
+        
+        if centralManager.isScanning {
+            log.info(tags: [.category(.scanning)], "Scanning started")
+            updateState()
+        } else {
+            log.warn(tags: [.category(.scanning)], "Failed to start scanning")
+        }
+    }
+    
+    /// Stops scanning for peripherals.
+    func stopScanning() {
+        guard let centralManager else {
+            log.warn(tags: [.category(.scanning)], "Attempted to stop scan without a central manager")
+            
+            return
+        }
+        
+        centralManager.stopScan()
+        
+        if !centralManager.isScanning {
+            log.info(tags: [.category(.scanning)], "Scanning stopped")
+            updateState()
+        } else {
+            log.warn(tags: [.category(.scanning)], "Failed to stop scanning")
+        }
+    }
+    
     // MARK: - CBCentralManagerDelegate
     
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         log.debug("centralManagerDidUpdateState: \(central.state.rawValue)")
         
         updateState()
+    }
+    
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
     }
 }
 
@@ -155,6 +210,8 @@ public typealias AuthorizationStatus = CBManagerAuthorization
 /// This enumeration provides a thread-safe representation of possible Bluetooth states that can be used across
 /// concurrent environments.
 public enum BluetoothState: Sendable {
+    /// The `BluetoothManager` is currently scanning for peripherals.
+    case scanning
     /// Bluetooth is powered on and the `BluetoothManager` is ready to use.
     case ready
     /// Bluetooth is currently powered off on the device.
@@ -179,6 +236,8 @@ public enum BluetoothState: Sendable {
     /// - Returns: A string describing the `BluetoothState`.
     public var description: String {
         switch self {
+        case .scanning:
+            "Scanning"
         case .ready:
             "Ready"
         case .poweredOff:
@@ -211,6 +270,8 @@ public enum BluetoothState: Sendable {
 /// This type conforms to Swift's `Error` protocol and encapsulates various authorization failures that may occur
 /// during Bluetooth operations.
 public enum AuthorizationError: Error {
+    /// The user has not yet been asked for Bluetooth permissions.
+    case unauthorized
     /// The user explicitly denied Bluetooth access for this app.
     case denied
     /// Indicates this app isn’t authorized to use Bluetooth.
