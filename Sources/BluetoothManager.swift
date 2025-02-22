@@ -40,8 +40,8 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     // MARK: - Initialization
 
     /// Initializes the BluetoothManager with the provided LoggingService. Initializing a BluetoothManager does not
-    /// start the CBCentralManager or trigger an authorization alert. This allows the integrating app to control when
-    /// and how Bluetooth autorization is presented to the user.
+    /// start the `CBCentralManager` *unless* the user has already authorized Bluetooth. This allows the integrating
+    /// app to control when and how Bluetooth autorization is presented to the user.
     ///
     /// When the integrating app desires to request Bluetooth authorization from iOS it can call ``authorize()``.
     ///

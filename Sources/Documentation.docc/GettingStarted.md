@@ -34,7 +34,7 @@ iOS requires permission from the user for BLE access. To set this up in your pro
 
    ```xml
    <key>NSBluetoothAlwaysUsageDescription</key>
-   <string>This app uses Bluetooth to collect your health data from your wearable devie.</string>
+   <string>This app uses Bluetooth to collect your health data from your wearable device.</string>
    ```
 
 2. Request authorization when needed.
@@ -71,3 +71,32 @@ iOS requires permission from the user for BLE access. To set this up in your pro
    ```
 
 Note: The authorization prompt will only appear once. It is safe to call `ReliaBLEManager.authorizeBluetooth()` multiple times. If the user already granted permission it will be a no-op. If the user denies permission, they'll need to enable it manually through the Settings app.
+
+## Scanning for Peripherals
+
+Once Bluetooth is authorized, you can start scanning for nearby Bluetooth Low Energy (BLE) peripheral devices.
+
+The ReliaBLEManager provides methods to control scanning:
+
+1. Ensure Bluetooth is ready before scanning. Scanning won't work if Bluetooth is unauthorized or powered off.
+2. Use ``ReliaBLEManager/startScanning()`` to begin discovering peripherals.
+3. Use ``ReliaBLEManager/stopScanning()`` to stop the scan when done.
+
+Example of starting and stopping a scan:
+
+```swift
+// Check if Bluetooth is ready
+if bleManager.currentState == .ready {
+    bleManager.startScanning()
+
+    // Stop scanning after 10 seconds
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+        bleManager.stopScanning()
+    }
+} else {
+    // Handle Bluetooth not ready (e.g., prompt user to enable Bluetooth)
+    print("Bluetooth is not ready for scanning")
+}
+```
+
+You can monitor the ``ReliaBLEManager/state`` publisher (as shown in the Authorizing Bluetooth section) to ensure Bluetooth is in the `.ready` state before calling `startScanning()`. Scanning will continue until you explicitly call `stopScanning()` or if Bluetooth becomes unavailable.

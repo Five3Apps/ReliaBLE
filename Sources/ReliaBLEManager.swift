@@ -38,9 +38,9 @@ public class ReliaBLEManager {
     
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
-    /// Initializing a ReliaBLEManager does not start the CBCentralManager or trigger an authorization alert. This
-    /// allows the integrating app to control when and how Bluetooth autorization is presented to the user. When the
-    /// integrating app desires to request Bluetooth authorization from iOS it can call ``authorizeBluetooth()``.
+    /// Initializing a ReliaBLEManager does not start the `CBCentralManager` unless the user has already authorized
+    /// Bluetooth. This allows the integrating app to control when and how Bluetooth autorization is presented to the
+    /// user. When the integrating app desires to request Bluetooth authorization from iOS it can call ``authorizeBluetooth()``.
     ///
     /// - Parameter config: A ReliaBLEConfig with the desired configurations set. If the value is `nil`, a default
     /// configuration is used. See ``ReliaBLEConfig`` for details on the default configuration.
