@@ -74,20 +74,40 @@ Note: The authorization prompt will only appear once. It is safe to call `ReliaB
 
 ## Scanning for Peripherals
 
-Once Bluetooth is authorized, you can start scanning for nearby Bluetooth Low Energy (BLE) peripheral devices.
+Once Bluetooth is authorized, you can start scanning for nearby Bluetooth Low Energy (BLE) peripheral devices, optionally filtering by specific services.
 
 The ReliaBLEManager provides methods to control scanning:
 
 1. Ensure Bluetooth is ready before scanning. Scanning won't work if Bluetooth is unauthorized or powered off.
-2. Use ``ReliaBLEManager/startScanning()`` to begin discovering peripherals.
+2. Use ``ReliaBLEManager/startScanning(services:)`` to begin discovering peripherals. You can pass an optional array of `CBUUID` objects to filter for peripherals advertising specific services, or omit the parameter to scan for all peripherals.
 3. Use ``ReliaBLEManager/stopScanning()`` to stop the scan when done.
 
-Example of starting and stopping a scan:
+Example of starting and stopping a scan for all peripherals:
 
 ```swift
 // Check if Bluetooth is ready
 if bleManager.currentState == .ready {
     bleManager.startScanning()
+
+    // Stop scanning after 10 seconds
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+        bleManager.stopScanning()
+    }
+} else {
+    // Handle Bluetooth not ready (e.g., prompt user to enable Bluetooth)
+    print("Bluetooth is not ready for scanning")
+}
+```
+
+Example of scanning for peripherals with specific services (e.g., Heart Rate and Battery):
+
+```swift
+import CoreBluetooth
+
+// Check if Bluetooth is ready
+if bleManager.currentState == .ready {
+    let serviceUUIDs = [CBUUID(string: "180D"), CBUUID(string: "180F")] // Heart Rate and Battery services
+    bleManager.startScanning(services: serviceUUIDs)
 
     // Stop scanning after 10 seconds
     DispatchQueue.main.asyncAfter(deadline: .now() + 10) {

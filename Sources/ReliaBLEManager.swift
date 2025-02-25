@@ -26,6 +26,7 @@
 
 import Combine
 import Foundation
+import CoreBluetooth
 
 @preconcurrency import Willow
 
@@ -39,7 +40,7 @@ public class ReliaBLEManager {
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
     /// Initializing a ReliaBLEManager does not start the `CBCentralManager` unless the user has already authorized
-    /// Bluetooth. This allows the integrating app to control when and how Bluetooth autorization is presented to the
+    /// Bluetooth. This allows the integrating app to control when and how Bluetooth authorization is presented to the
     /// user. When the integrating app desires to request Bluetooth authorization from iOS it can call ``authorizeBluetooth()``.
     ///
     /// - Parameter config: A ReliaBLEConfig with the desired configurations set. If the value is `nil`, a default
@@ -72,12 +73,13 @@ public class ReliaBLEManager {
         try bluetoothManager.authorize()
     }
     
-    /// Starts scanning for all peripheral devices.
+    /// Starts scanning for peripheral devices, optionally filtering by specific services.
     ///
-    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
-    /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
-    public func startScanning() {
-        bluetoothManager.startScanning()
+    /// - Parameter services: An optional array of `CBUUID` objects representing the services to scan for. If provided, only peripherals advertising these services will be discovered. If `nil`, scans for all peripheral devices.
+    ///
+    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
+    public func startScanning(services: [CBUUID]? = nil) {
+        bluetoothManager.startScanning(services: services)
     }
     
     /// Stops scanning for peripheral devices.
