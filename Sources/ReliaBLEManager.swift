@@ -73,6 +73,14 @@ public class ReliaBLEManager {
         try bluetoothManager.authorize()
     }
     
+    // MARK: - Scanning
+
+    /// Publisher that emits peripheral discovery events during scanning. It is meant to be a lightweight
+    /// advertisements feed for cases where the integrating app needs to process individual advertisements.
+    public var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
+        bluetoothManager.peripheralDiscoveries
+    }
+    
     /// Starts scanning for peripheral devices, optionally filtering by specific services.
     ///
     /// - Parameter services: An optional array of `CBUUID` objects representing the services to scan for. If provided, only peripherals advertising these services will be discovered. If `nil`, scans for all peripheral devices.

@@ -35,8 +35,6 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     private let queue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated, attributes: [.concurrent])
     private let log: LoggingService
     
-    private let stateSubject = CurrentValueSubject<BluetoothState, Never>(.unknown)
-    
     // MARK: - Initialization
 
     /// Initializes the BluetoothManager with the provided LoggingService. Initializing a BluetoothManager does not
@@ -69,6 +67,8 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     }
     
     // MARK: - State
+    
+    private let stateSubject = CurrentValueSubject<BluetoothState, Never>(.unknown)
     
     /// Publisher for the real-time state of the underlying Core Bluetooth system.
     var state: AnyPublisher<BluetoothState, Never> {
@@ -186,6 +186,15 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
             log.warn(tags: [.category(.scanning)], "Failed to stop scanning")
         }
     }
+
+    // MARK: - Peripheral Discovery
+    
+    private let discoverySubject = PassthroughSubject<PeripheralDiscoveryEvent, Never>()
+    
+    /// Publisher that emits peripheral discovery events during scanning.
+    public var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
+        discoverySubject.eraseToAnyPublisher()
+    }
     
     // MARK: - CBCentralManagerDelegate
     
@@ -196,6 +205,14 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        let peripheralDiscoveryEvent = PeripheralDiscoveryEvent(peripheral: peripheral,
+                                                                advertisementData: advertisementData,
+                                                                rssi: RSSI.intValue)
+        // Log before sending event so logs are time ordered correctly
+        // TODO: Implement verbose log level
+//        log.debug("Discovered peripheral: \(peripheralDiscoveryEvent.name ?? "Unknown") (RSSI: \(RSSI.stringValue))")
+        discoverySubject.send(peripheralDiscoveryEvent)
+        
     }
 }
 
