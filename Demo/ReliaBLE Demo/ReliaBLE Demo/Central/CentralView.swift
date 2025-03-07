@@ -24,6 +24,8 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
+import Combine
+import CoreBluetooth
 import SwiftUI
 import SwiftData
 
@@ -33,10 +35,13 @@ struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.bleManager) private var reliaBLE
     
+    @Query private var discoveries: [DiscoveryEvent]
     @Query private var devices: [Device]
     
     @State private var logsButtonTitle = "Disable Logging"
     @State private var currentState: BluetoothState = .unknown
+    @State private var cancellables = Set<AnyCancellable>()
+    @State private var servicesInput: String = ""
     
     var body: some View {
         NavigationSplitView {
@@ -53,8 +58,13 @@ struct CentralView: View {
                 }
                 .buttonStyle(.bordered)
             } else if case BluetoothState.ready = currentState {
+                TextField("Enter service UUIDs (comma-separated)", text: $servicesInput)
+                    .textFieldStyle(.roundedBorder)
+                    .padding()
+                
                 Button("Start Scanning") {
-                    reliaBLE?.startScanning()
+                    let services = parseServices(from: servicesInput)
+                    reliaBLE?.startScanning(services: services)
                 }
                 .buttonStyle(.bordered)
             } else if case BluetoothState.scanning = currentState {
@@ -76,14 +86,23 @@ struct CentralView: View {
             .buttonStyle(.bordered)
             
             List {
-                ForEach(devices) { device in
+                ForEach(discoveries) { discoveryEvent in
+                    let timestampString = discoveryEvent.timestamp.formatted(date: .numeric, time: .standard)
+                    let deviceName = discoveryEvent.name
+                    
                     NavigationLink {
-                        Text("Device seen at \(device.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
+                        Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
                     } label: {
-                        Text(device.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
+                        Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
                     }
                 }
-                .onDelete(perform: deleteDevices)
+                .onDelete(perform: deleteDiscoveries)
+            }
+            .onAppear {
+                subscribeToDiscoveryEvents()
+            }
+            .onDisappear {
+                cancellables.removeAll()
             }
 #if os(macOS)
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
@@ -91,27 +110,60 @@ struct CentralView: View {
             .toolbar {
 #if os(iOS)
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
-                }
-#endif
-                ToolbarItem {
-                    Button(action: addDevice) {
-                        Label("Add Device", systemImage: "plus")
+                    Button("Clear All") {
+                        clearAllData()
                     }
                 }
+#endif
             }
         } detail: {
-            Text("Select an device")
+            Text("Select a device")
         }
     }
-
-    private func addDevice() {
+    
+    // MARK: - Private Helpers
+    
+    private func parseServices(from input: String) -> [CBUUID]? {
+        let components = input.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let uuids = components.filter { !$0.isEmpty }.map { CBUUID(string: $0) }
+        
+        return uuids.isEmpty ? nil : uuids
+    }
+    
+    private func subscribeToDiscoveryEvents() {
+        reliaBLE?.peripheralDiscoveries
+            .receive(on: DispatchQueue.main)
+            .sink { discoveryEvent in
+                let event = DiscoveryEvent(
+                    peripheralIdentifier: discoveryEvent.id.uuidString,
+                    name: discoveryEvent.name ?? "Unknown",
+                    rssi: discoveryEvent.rssi,
+                    timestamp: Date()
+                )
+                
+                modelContext.insert(event)
+                try? modelContext.save()
+            }
+            .store(in: &cancellables)
+    }
+    
+    private func clearAllData() {
         withAnimation {
-            let newDevice = Device(timestamp: Date())
-            modelContext.insert(newDevice)
+            discoveries.forEach { modelContext.delete($0) }
+            devices.forEach { modelContext.delete($0) }
+            try? modelContext.save()
         }
     }
-
+    
+    private func deleteDiscoveries(offsets: IndexSet) {
+        withAnimation {
+            for index in offsets {
+                modelContext.delete(discoveries[index])
+            }
+            try? modelContext.save()
+        }
+    }
+    
     private func deleteDevices(offsets: IndexSet) {
         withAnimation {
             for index in offsets {
@@ -123,5 +175,8 @@ struct CentralView: View {
 
 #Preview {
     CentralView()
-        .modelContainer(for: Device.self, inMemory: true)
+        .modelContainer(
+            for: [Device.self, DiscoveryEvent.self],
+            inMemory: true
+        )
 }

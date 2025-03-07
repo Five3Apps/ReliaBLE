@@ -212,7 +212,6 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
         // TODO: Implement verbose log level
 //        log.debug("Discovered peripheral: \(peripheralDiscoveryEvent.name ?? "Unknown") (RSSI: \(RSSI.stringValue))")
         discoverySubject.send(peripheralDiscoveryEvent)
-        
     }
 }
 

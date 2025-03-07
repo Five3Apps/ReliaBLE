@@ -42,6 +42,7 @@ struct ReliaBLE_DemoApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Device.self,
+            DiscoveryEvent.self
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
