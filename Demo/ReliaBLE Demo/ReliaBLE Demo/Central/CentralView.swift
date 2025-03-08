@@ -38,50 +38,35 @@ struct CentralView: View {
     @Query private var discoveries: [DiscoveryEvent]
     @Query private var devices: [Device]
     
-    @State private var logsButtonTitle = "Disable Logging"
-    @State private var currentState: BluetoothState = .unknown
-    @State private var cancellables = Set<AnyCancellable>()
-    @State private var servicesInput: String = ""
+    @StateObject private var viewModel = CentralViewModel()
     
     var body: some View {
         NavigationSplitView {
-            if let reliaBLE {
-                Text("ReliaBLE state: \(currentState.description)")
-                    .onReceive(reliaBLE.state.receive(on: DispatchQueue.main)) { newState in
-                        self.currentState = newState
-                    }
-            }
+            Text("ReliaBLE state: \(viewModel.currentState.description)")
             
-            if case BluetoothState.unauthorized(let authState) = currentState, authState == .notDetermined {
+            if case BluetoothState.unauthorized(let authState) = viewModel.currentState, authState == .notDetermined {
                 Button("Authorize Bluetooth") {
-                    try? reliaBLE?.authorizeBluetooth()
+                    viewModel.authorizeBluetooth()
                 }
                 .buttonStyle(.bordered)
-            } else if case BluetoothState.ready = currentState {
-                TextField("Enter service UUIDs (comma-separated)", text: $servicesInput)
+            } else if case BluetoothState.ready = viewModel.currentState {
+                TextField("Enter service UUIDs (comma-separated)", text: $viewModel.servicesInput)
                     .textFieldStyle(.roundedBorder)
                     .padding()
                 
                 Button("Start Scanning") {
-                    let services = parseServices(from: servicesInput)
-                    reliaBLE?.startScanning(services: services)
+                    viewModel.startScanning()
                 }
                 .buttonStyle(.bordered)
-            } else if case BluetoothState.scanning = currentState {
+            } else if case BluetoothState.scanning = viewModel.currentState {
                 Button("Stop Scanning") {
-                    reliaBLE?.stopScanning()
+                    viewModel.stopScanning()
                 }
                 .buttonStyle(.bordered)
             }
             
-            Button(logsButtonTitle) {
-                if logsButtonTitle == "Enable Logging" {
-                    reliaBLE?.loggingService.enabled = true
-                    logsButtonTitle = "Disable Logging"
-                } else {
-                    reliaBLE?.loggingService.enabled = false
-                    logsButtonTitle = "Enable Logging"
-                }
+            Button(viewModel.logsButtonTitle) {
+                viewModel.toggleLogging()
             }
             .buttonStyle(.bordered)
             
@@ -96,13 +81,16 @@ struct CentralView: View {
                         Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
                     }
                 }
-                .onDelete(perform: deleteDiscoveries)
+                .onDelete { offsets in
+                    let itemsToDelete = offsets.map { discoveries[$0] }
+                    viewModel.deleteDiscoveries(itemsToDelete)
+                }
             }
             .onAppear {
-                subscribeToDiscoveryEvents()
+                viewModel.setDependencies(modelContext: modelContext, reliaBLE: reliaBLE)
             }
             .onDisappear {
-                cancellables.removeAll()
+                viewModel.cancellables.removeAll()
             }
 #if os(macOS)
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
@@ -111,64 +99,13 @@ struct CentralView: View {
 #if os(iOS)
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Clear All") {
-                        clearAllData()
+                        viewModel.clearAllData()
                     }
                 }
 #endif
             }
         } detail: {
             Text("Select a device")
-        }
-    }
-    
-    // MARK: - Private Helpers
-    
-    private func parseServices(from input: String) -> [CBUUID]? {
-        let components = input.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-        let uuids = components.filter { !$0.isEmpty }.map { CBUUID(string: $0) }
-        
-        return uuids.isEmpty ? nil : uuids
-    }
-    
-    private func subscribeToDiscoveryEvents() {
-        reliaBLE?.peripheralDiscoveries
-            .receive(on: DispatchQueue.main)
-            .sink { discoveryEvent in
-                let event = DiscoveryEvent(
-                    peripheralIdentifier: discoveryEvent.id.uuidString,
-                    name: discoveryEvent.name ?? "Unknown",
-                    rssi: discoveryEvent.rssi,
-                    timestamp: Date()
-                )
-                
-                modelContext.insert(event)
-                try? modelContext.save()
-            }
-            .store(in: &cancellables)
-    }
-    
-    private func clearAllData() {
-        withAnimation {
-            discoveries.forEach { modelContext.delete($0) }
-            devices.forEach { modelContext.delete($0) }
-            try? modelContext.save()
-        }
-    }
-    
-    private func deleteDiscoveries(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(discoveries[index])
-            }
-            try? modelContext.save()
-        }
-    }
-    
-    private func deleteDevices(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(devices[index])
-            }
         }
     }
 }
