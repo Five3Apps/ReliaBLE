@@ -39,6 +39,7 @@ struct CentralView: View {
     @Query private var devices: [Device]
     
     @StateObject private var viewModel = CentralViewModel()
+    @State private var selectedView: String = "Devices"
     
     var body: some View {
         NavigationSplitView {
@@ -65,42 +66,76 @@ struct CentralView: View {
                 .buttonStyle(.bordered)
             }
             
-            List {
-                ForEach(discoveries) { discoveryEvent in
-                    let timestampString = discoveryEvent.timestamp.formatted(date: .numeric, time: .standard)
-                    let deviceName = discoveryEvent.name
-                    
-                    NavigationLink {
-                        Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
-                    } label: {
-                        Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
-                    }
-                }
-                .onDelete { offsets in
-                    let itemsToDelete = offsets.map { discoveries[$0] }
-                    viewModel.deleteDiscoveries(itemsToDelete)
+            Picker("Select View", selection: $selectedView) {
+                Text("Devices").tag("Devices")
+                Text("Discoveries").tag("Discoveries")
+            }
+            .pickerStyle(SegmentedPickerStyle())
+            .padding()
+            
+            Group {
+                if selectedView == "Devices" {
+                    deviceList
+                } else {
+                    discoveriesList
                 }
             }
-            .onAppear {
-                viewModel.setDependencies(modelContext: modelContext, reliaBLE: reliaBLE)
-            }
-            .onDisappear {
-                viewModel.cancellables.removeAll()
-            }
-#if os(macOS)
+            #if os(macOS)
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-#endif
+            #endif
             .toolbar {
-#if os(iOS)
+                #if os(iOS)
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Clear All") {
                         viewModel.clearAllData()
                     }
                 }
-#endif
+                #endif
             }
         } detail: {
             Text("Select a device")
+        }
+        .onAppear {
+            viewModel.setDependencies(modelContext: modelContext, reliaBLE: reliaBLE)
+        }
+        .onDisappear {
+            viewModel.cancellables.removeAll()
+        }
+    }
+    
+    private var deviceList: some View {
+        List {
+            ForEach(devices) { device in
+                NavigationLink {
+                    Text("Device Details")
+                    
+                    Text("Last seen: \(device.timestamp)")
+                } label: {
+                    Text("Device \(device.timestamp.formatted(date: .numeric, time: .standard))")
+                }
+            }
+            .onDelete { offsets in
+                let itemsToDelete = offsets.map { devices[$0] }
+                viewModel.deleteDevices(itemsToDelete)
+            }
+        }
+    }
+    
+    private var discoveriesList: some View {
+        List {
+            ForEach(discoveries) { discoveryEvent in
+                let timestampString = discoveryEvent.timestamp.formatted(date: .numeric, time: .standard)
+                let deviceName = discoveryEvent.name
+                NavigationLink {
+                    Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
+                } label: {
+                    Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
+                }
+            }
+            .onDelete { offsets in
+                let itemsToDelete = offsets.map { discoveries[$0] }
+                viewModel.deleteDiscoveries(itemsToDelete)
+            }
         }
     }
 }
