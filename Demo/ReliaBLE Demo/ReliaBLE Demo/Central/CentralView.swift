@@ -65,11 +65,6 @@ struct CentralView: View {
                 .buttonStyle(.bordered)
             }
             
-            Button(viewModel.logsButtonTitle) {
-                viewModel.toggleLogging()
-            }
-            .buttonStyle(.bordered)
-            
             List {
                 ForEach(discoveries) { discoveryEvent in
                     let timestampString = discoveryEvent.timestamp.formatted(date: .numeric, time: .standard)

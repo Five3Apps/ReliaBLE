@@ -7,7 +7,6 @@ import ReliaBLE
 
 class CentralViewModel: ObservableObject {
     @Published var currentState: BluetoothState = .unknown
-    @Published var logsButtonTitle = "Disable Logging"
     @Published var servicesInput = ""
     
     var cancellables = Set<AnyCancellable>()
@@ -56,16 +55,6 @@ class CentralViewModel: ObservableObject {
     
     func stopScanning() {
         reliaBLE?.stopScanning()
-    }
-    
-    func toggleLogging() {
-        if logsButtonTitle == "Enable Logging" {
-            reliaBLE?.loggingService.enabled = true
-            logsButtonTitle = "Disable Logging"
-        } else {
-            reliaBLE?.loggingService.enabled = false
-            logsButtonTitle = "Enable Logging"
-        }
     }
     
     func clearAllData() {
