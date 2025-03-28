@@ -27,9 +27,13 @@ import SwiftData
 
 @Model
 final class Device {
-    var timestamp: Date
-    
-    init(timestamp: Date) {
-        self.timestamp = timestamp
+    var id: String
+    var name: String?
+    var lastSeen: Date?
+
+    init(id: String, name: String?, lastSeen: Date?) {
+        self.id = id
+        self.name = name
+        self.lastSeen = lastSeen
     }
 }

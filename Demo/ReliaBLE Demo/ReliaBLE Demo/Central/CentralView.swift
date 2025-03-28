@@ -108,10 +108,10 @@ struct CentralView: View {
             ForEach(devices) { device in
                 NavigationLink {
                     Text("Device Details")
-                    
-                    Text("Last seen: \(device.timestamp)")
+                    Text("ID: \(device.id)")
+                    Text("Last seen: \(device.lastSeen?.formatted(date: .numeric, time: .standard) ?? "")")
                 } label: {
-                    Text("Device \(device.timestamp.formatted(date: .numeric, time: .standard))")
+                    Text("\(device.name ?? "Unknown")")
                 }
             }
             .onDelete { offsets in
