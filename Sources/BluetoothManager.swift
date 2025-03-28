@@ -162,6 +162,12 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
             return
         }
         
+        guard centralManager.state == .poweredOn else {
+            log.warn(tags: [.category(.scanning)], "Attempted to start scan while central manager is not ready (poweredOn)")
+            
+            return
+        }
+        
         centralManager.scanForPeripherals(withServices: services, options: nil)
         
         if centralManager.isScanning {
