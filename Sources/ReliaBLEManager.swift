@@ -36,6 +36,7 @@ public class ReliaBLEManager {
     
     private let log: LoggingService
     private let bluetoothManager: BluetoothManager
+    private let peripheralManager: PeripheralManager
     
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
@@ -50,7 +51,8 @@ public class ReliaBLEManager {
         loggingService.enabled = config.loggingEnabled
         
         log = loggingService
-        bluetoothManager = BluetoothManager(loggingService: loggingService)
+        peripheralManager = PeripheralManager(loggingService: loggingService)
+        bluetoothManager = BluetoothManager(loggingService: loggingService, peripheralManager: peripheralManager)
     }
     
     // MARK: - State
@@ -81,11 +83,18 @@ public class ReliaBLEManager {
         bluetoothManager.peripheralDiscoveries
     }
     
+    /// Publisher that emits the current list of discovered peripherals.
+    public var discoveredPeripherals: AnyPublisher<[Peripheral], Never> {
+        peripheralManager.discoveredPeripheralsPublisher
+    }
+    
     /// Starts scanning for peripheral devices, optionally filtering by specific services.
     ///
-    /// - Parameter services: An optional array of `CBUUID` objects representing the services to scan for. If provided, only peripherals advertising these services will be discovered. If `nil`, scans for all peripheral devices.
+    /// - Parameter services: An optional array of `CBUUID` objects representing the services to scan for. If provided,
+    /// only peripherals advertising these services will be discovered. If `nil`, scans for all peripheral devices.
     ///
-    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
+    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
+    /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
     public func startScanning(services: [CBUUID]? = nil) {
         bluetoothManager.startScanning(services: services)
     }

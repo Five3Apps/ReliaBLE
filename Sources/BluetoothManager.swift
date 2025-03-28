@@ -31,9 +31,11 @@ import Foundation
 /// High-level manager for all Bluetooth operations. Manages the CBCentralManager and provides a single point of access
 /// for all Bluetooth operations.
 class BluetoothManager: NSObject, CBCentralManagerDelegate {
+    private let log: LoggingService
+    private let peripheralManager: PeripheralManager
+    
     private var centralManager: CBCentralManager?
     private let queue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated, attributes: [.concurrent])
-    private let log: LoggingService
     
     // MARK: - Initialization
 
@@ -45,8 +47,9 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     ///
     /// - Parameter loggingService: The LoggingService to use for logging.
     /// - Returns: A new instance of BluetoothManager.
-    init(loggingService: LoggingService) {
-        log = loggingService
+    init(loggingService: LoggingService, peripheralManager: PeripheralManager) {
+        self.log = loggingService
+        self.peripheralManager = peripheralManager
         
         super.init()
         
@@ -212,6 +215,8 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
         // TODO: Implement verbose log level
 //        log.debug("Discovered peripheral: \(peripheralDiscoveryEvent.name ?? "Unknown") (RSSI: \(RSSI.stringValue))")
         discoverySubject.send(peripheralDiscoveryEvent)
+        
+        peripheralManager.discoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
     }
 }
 
