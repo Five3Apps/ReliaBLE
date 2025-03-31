@@ -32,6 +32,8 @@ class PeripheralManager {
     
     private var discoveredPeripherals = [Peripheral]()
     private let discoveredPeripheralsSubject = PassthroughSubject<[Peripheral], Never>()
+    private let queue = DispatchQueue(label: "com.five3apps.relia-ble.peripheralmanager", qos: .userInitiated, attributes: [.concurrent])
+    
     public var discoveredPeripheralsPublisher: AnyPublisher<[Peripheral], Never> {
         discoveredPeripheralsSubject.eraseToAnyPublisher()
     }
@@ -45,25 +47,55 @@ class PeripheralManager {
         // TODO: If there's no identifier should we ignore it?
         let identifier = cbPeripheral.name ?? advertisementData?[CBAdvertisementDataLocalNameKey] as? String ?? cbPeripheral.identifier.uuidString
         
-        // First check if the peripheral has already been discovered by identifier
-        if let existingPeripheral = discoveredPeripherals.first(where: { $0.id == identifier }) {
-            existingPeripheral.update(cbPeripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
-            discoveredPeripheralsSubject.send(discoveredPeripherals)
+        queue.sync {
+            // First check if the peripheral has already been discovered by identifier
+            if let existingPeripheral = discoveredPeripherals.first(where: { $0.id == identifier }) {
+                existingPeripheral.update(cbPeripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
+                discoveredPeripheralsSubject.send(discoveredPeripherals)
+                return
+            }
             
-            return
-        }
-        
-        // Next check if the peripheral has already been discovered by CBPeripheral identifier
-        if let existingPeripheral = discoveredPeripherals.first(where: { $0.peripheral?.identifier == cbPeripheral.identifier }) {
-            existingPeripheral.update(cbPeripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
-            discoveredPeripheralsSubject.send(discoveredPeripherals)
+            // Next check if the peripheral has already been discovered by CBPeripheral identifier
+            if let existingPeripheral = discoveredPeripherals.first(where: { $0.peripheral?.identifier == cbPeripheral.identifier }) {
+                existingPeripheral.update(cbPeripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
+                discoveredPeripheralsSubject.send(discoveredPeripherals)
+                return
+            }
             
-            return
+            let newPeripheral = Peripheral(id: identifier, peripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
+            log.debug(tags: [.category(.scanning), .peripheral(newPeripheral.id)], "Adding newly discovered peripheral")
+            discoveredPeripherals.append(newPeripheral)
+            discoveredPeripheralsSubject.send(discoveredPeripherals)
         }
-        
-        let newPeripheral = Peripheral(id: identifier, peripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
-        log.debug(tags: [.category(.scanning), .peripheral(newPeripheral.id)], "Adding newly discovered peripheral")
-        discoveredPeripherals.append(newPeripheral)
-        discoveredPeripheralsSubject.send(discoveredPeripherals)
+    }
+    
+    func invalidatePeripherals() {
+        queue.sync {
+            for peripheral in discoveredPeripherals {
+                peripheral.peripheral = nil
+            }
+            discoveredPeripheralsSubject.send(discoveredPeripherals)
+            log.debug("Invalidated all peripheral references")
+        }
+    }
+    
+    func refreshPeripherals(using centralManager: CBCentralManager) {
+        queue.sync {
+            let identifiers = discoveredPeripherals.compactMap { $0.peripheralIdentifier }
+            guard !identifiers.isEmpty else {
+                log.debug("No peripheral identifiers to refresh")
+                
+                return
+            }
+            
+            let retrievedPeripherals = centralManager.retrievePeripherals(withIdentifiers: identifiers)
+            for cbPeripheral in retrievedPeripherals {
+                if let peripheral = discoveredPeripherals.first(where: { $0.peripheralIdentifier == cbPeripheral.identifier }) {
+                    peripheral.update(cbPeripheral: cbPeripheral)
+                }
+            }
+            discoveredPeripheralsSubject.send(discoveredPeripherals)
+            log.debug("Refreshed \(retrievedPeripherals.count) peripherals from CBCentralManager")
+        }
     }
 }

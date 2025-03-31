@@ -24,8 +24,8 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Foundation
 import CoreBluetooth
+import Foundation
 
 /// A representation of a discovered Bluetooth peripheral with metadata.
 ///
@@ -38,6 +38,9 @@ import CoreBluetooth
 public class Peripheral: Identifiable, Hashable {
     /// Unique identifier for the peripheral as set by the integrating app.
     public let id: String
+    
+    /// The CoreBluetooth peripheral identifier, used to retrieve the peripheral after invalidation.
+    var peripheralIdentifier: UUID?
     
     /// Reference to the CoreBluetooth peripheral object
     ///
@@ -74,18 +77,29 @@ public class Peripheral: Identifiable, Hashable {
     ///  - rssi: Signal strength indicator (RSSI) of the most recent advertisement
     public init(id: String, peripheral: CBPeripheral? = nil, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
         self.id = id
+        self.peripheralIdentifier = peripheral?.identifier
         self.peripheral = peripheral
         self.rssi = rssi
         self.advertisementData = advertisementData
         
-        self.lastSeen = Date()
+        if peripheral != nil && rssi != nil {
+            // Only set the last seen date if we have a valid CBPeripheral and RSSI value.
+            // This indicates that we have received an advertisement from the peripheral.
+            self.lastSeen = Date()
+        }
     }
     
     func update(cbPeripheral: CBPeripheral, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
+        self.peripheralIdentifier = cbPeripheral.identifier
+        self.peripheral = cbPeripheral
         self.advertisementData = advertisementData
         self.rssi = rssi
         
-        self.lastSeen = Date()
+        if rssi != nil {
+            // Only set the last seen date if we have a valid RSSI value.
+            // This indicates that we have received an advertisement from the peripheral.
+            self.lastSeen = Date()
+        }
     }
     
     public func hash(into hasher: inout Hasher) {

@@ -210,6 +210,23 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         log.debug("centralManagerDidUpdateState: \(central.state.rawValue)")
         
+        // Invalidate or refresh peripherals based on the new state
+        switch central.state {
+        case .poweredOn:
+            peripheralManager.refreshPeripherals(using: central)
+        case .poweredOff: fallthrough
+        case .unknown:
+            // This state does not invalidate peripherals.
+            break
+        case .resetting: fallthrough
+        case .unsupported: fallthrough
+        case .unauthorized:
+            peripheralManager.invalidatePeripherals()
+        @unknown default:
+            log.error("Unknown CBCentralManager state encountered: \(central.state.rawValue)")
+            assertionFailure("Unknown CBCentralManager state encountered: \(central.state.rawValue)")
+        }
+        
         updateState()
     }
     
