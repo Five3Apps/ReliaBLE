@@ -25,10 +25,14 @@
 import CoreBluetooth
 import SwiftUI
 
+// Default values for demo purposes
+private let defaultPeripheralName = "ReliaBLE Demo"
+private let defaultServiceUUID = "12345678-90AB-CDEF-1234-567890ABCDEF"
+
 struct PeripheralView: View {
     @StateObject private var peripheralManager = PeripheralManager()
-    @State private var peripheralName: String = ""
-    @State private var serviceUUIDString: String = ""
+    @State private var peripheralName: String = defaultPeripheralName
+    @State private var serviceUUIDString: String = defaultServiceUUID
 
     var serviceUUID: CBUUID? {
         let uuidString = serviceUUIDString
@@ -55,10 +59,34 @@ struct PeripheralView: View {
     var body: some View {
         Form {
             Section(header: Text("Peripheral Settings")) {
-                TextField("Peripheral Name", text: $peripheralName)
-                    .disabled(peripheralManager.isAdvertising)
-                TextField("Service UUID (e.g., 180F or 128-bit)", text: $serviceUUIDString)
-                    .disabled(peripheralManager.isAdvertising)
+                HStack {
+                    TextField("Peripheral Name", text: $peripheralName)
+                    if !peripheralName.isEmpty {
+                        Button(action: {
+                            peripheralName = ""
+                        }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.gray)
+                        }
+                        .accessibilityLabel("Clear peripheral name")
+                    }
+                }
+                .disabled(peripheralManager.isAdvertising)
+
+                HStack {
+                    TextField("Service UUID (e.g., 180F or 128-bit)", text: $serviceUUIDString)
+                    if !serviceUUIDString.isEmpty {
+                        Button(action: {
+                            serviceUUIDString = ""
+                        }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.gray)
+                        }
+                        .accessibilityLabel("Clear service UUID")
+                    }
+                }
+                .disabled(peripheralManager.isAdvertising)
+
                 if !serviceUUIDString.isEmpty && serviceUUID == nil {
                     Text("Invalid UUID (use 4, 8, or 36 chars)").foregroundColor(.red)
                 }
