@@ -6,7 +6,7 @@ let package = Package(
     name: "ReliaBLE",
     platforms: [
         .iOS(.v16),
-        .macOS(.v10_14)
+        .macOS(.v10_15)
     ],
     products: [
         .library(
