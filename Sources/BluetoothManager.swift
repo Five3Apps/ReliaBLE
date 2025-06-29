@@ -171,7 +171,7 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
         centralManager.scanForPeripherals(withServices: services, options: nil)
         
         if centralManager.isScanning {
-            log.info(tags: [.category(.scanning)], "Scanning started")
+            log.info(tags: [.category(.scanning)], "Scanning started with services: \(services ?? [])")
             updateState()
         } else {
             log.warn(tags: [.category(.scanning)], "Failed to start scanning")
