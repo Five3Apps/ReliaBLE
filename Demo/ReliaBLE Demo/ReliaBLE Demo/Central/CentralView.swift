@@ -24,6 +24,8 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
+import Combine
+import CoreBluetooth
 import SwiftUI
 import SwiftData
 
@@ -33,79 +35,106 @@ struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.bleManager) private var reliaBLE
     
+    @Query private var discoveries: [DiscoveryEvent]
     @Query private var devices: [Device]
     
-    @State private var logsButtonTitle = "Disable Logging"
-    @State private var currentState: BluetoothState = .unknown
+    @StateObject private var viewModel = CentralViewModel()
+    @State private var selectedView: String = "Devices"
     
     var body: some View {
         NavigationSplitView {
-            if let reliaBLE {
-                Text("ReliaBLE state: \(currentState.description)")
-                    .onReceive(reliaBLE.state.receive(on: DispatchQueue.main)) { newState in
-                        self.currentState = newState
-                    }
-            }
+            Text("ReliaBLE state: \(viewModel.currentState.description)")
             
-            if case BluetoothState.unauthorized(let authState) = currentState, authState == .notDetermined {
+            if case BluetoothState.unauthorized(let authState) = viewModel.currentState, authState == .notDetermined {
                 Button("Authorize Bluetooth") {
-                    try? reliaBLE?.authorizeBluetooth()
+                    viewModel.authorizeBluetooth()
+                }
+                .buttonStyle(.bordered)
+            } else if case BluetoothState.ready = viewModel.currentState {
+                TextField("Enter service UUIDs (comma-separated)", text: $viewModel.servicesInput)
+                    .textFieldStyle(.roundedBorder)
+                    .padding()
+                
+                Button("Start Scanning") {
+                    viewModel.startScanning()
+                }
+                .buttonStyle(.bordered)
+            } else if case BluetoothState.scanning = viewModel.currentState {
+                Button("Stop Scanning") {
+                    viewModel.stopScanning()
                 }
                 .buttonStyle(.bordered)
             }
             
-            Button(logsButtonTitle) {
-                if logsButtonTitle == "Enable Logging" {
-                    reliaBLE?.loggingService.enabled = true
-                    logsButtonTitle = "Disable Logging"
-                } else {
-                    reliaBLE?.loggingService.enabled = false
-                    logsButtonTitle = "Enable Logging"
-                }
+            Picker("Select View", selection: $selectedView) {
+                Text("Devices").tag("Devices")
+                Text("Discoveries").tag("Discoveries")
             }
-            .buttonStyle(.bordered)
+            .pickerStyle(SegmentedPickerStyle())
+            .padding()
             
-            List {
-                ForEach(devices) { device in
-                    NavigationLink {
-                        Text("Device seen at \(device.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(device.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
+            Group {
+                if selectedView == "Devices" {
+                    deviceList
+                } else {
+                    discoveriesList
                 }
-                .onDelete(perform: deleteDevices)
             }
-#if os(macOS)
+            #if os(macOS)
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-#endif
+            #endif
             .toolbar {
-#if os(iOS)
+                #if os(iOS)
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
-                }
-#endif
-                ToolbarItem {
-                    Button(action: addDevice) {
-                        Label("Add Device", systemImage: "plus")
+                    Button("Clear All") {
+                        viewModel.clearAllData()
                     }
                 }
+                #endif
             }
         } detail: {
-            Text("Select an device")
+            Text("Select a device")
+        }
+        .onAppear {
+            viewModel.setDependencies(modelContext: modelContext, reliaBLE: reliaBLE)
+        }
+        .onDisappear {
+            viewModel.cancellables.removeAll()
         }
     }
-
-    private func addDevice() {
-        withAnimation {
-            let newDevice = Device(timestamp: Date())
-            modelContext.insert(newDevice)
+    
+    private var deviceList: some View {
+        List {
+            ForEach(devices) { device in
+                NavigationLink {
+                    Text("Device Details")
+                    Text("ID: \(device.id)")
+                    Text("Last seen: \(device.lastSeen?.formatted(date: .numeric, time: .standard) ?? "")")
+                } label: {
+                    Text("\(device.name ?? "Unknown")")
+                }
+            }
+            .onDelete { offsets in
+                let itemsToDelete = offsets.map { devices[$0] }
+                viewModel.deleteDevices(itemsToDelete)
+            }
         }
     }
-
-    private func deleteDevices(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(devices[index])
+    
+    private var discoveriesList: some View {
+        List {
+            ForEach(discoveries) { discoveryEvent in
+                let timestampString = discoveryEvent.timestamp.formatted(date: .numeric, time: .standard)
+                let deviceName = discoveryEvent.name
+                NavigationLink {
+                    Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
+                } label: {
+                    Text("Device \(deviceName) seen at \(timestampString): \(discoveryEvent.rssi) dBm")
+                }
+            }
+            .onDelete { offsets in
+                let itemsToDelete = offsets.map { discoveries[$0] }
+                viewModel.deleteDiscoveries(itemsToDelete)
             }
         }
     }
@@ -113,5 +142,8 @@ struct CentralView: View {
 
 #Preview {
     CentralView()
-        .modelContainer(for: Device.self, inMemory: true)
+        .modelContainer(
+            for: [Device.self, DiscoveryEvent.self],
+            inMemory: true
+        )
 }

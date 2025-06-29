@@ -27,11 +27,11 @@ import SwiftData
 import ReliaBLE
 
 private struct BLEManagerKey: EnvironmentKey {
-    static let defaultValue: ReliaBLEManager? = nil
+    static let defaultValue: ReliaBLEManager = ReliaBLEManager(config: ReliaBLEConfig())
 }
 
 extension EnvironmentValues {
-    var bleManager: ReliaBLEManager? {
+    var bleManager: ReliaBLEManager {
         get { self[BLEManagerKey.self] }
         set { self[BLEManagerKey.self] = newValue }
     }
@@ -42,6 +42,7 @@ struct ReliaBLE_DemoApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Device.self,
+            DiscoveryEvent.self
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 

@@ -31,24 +31,25 @@ import Foundation
 /// High-level manager for all Bluetooth operations. Manages the CBCentralManager and provides a single point of access
 /// for all Bluetooth operations.
 class BluetoothManager: NSObject, CBCentralManagerDelegate {
+    private let log: LoggingService
+    private let peripheralManager: PeripheralManager
+    
     private var centralManager: CBCentralManager?
     private let queue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated, attributes: [.concurrent])
-    private let log: LoggingService
-    
-    private let stateSubject = CurrentValueSubject<BluetoothState, Never>(.unknown)
     
     // MARK: - Initialization
 
     /// Initializes the BluetoothManager with the provided LoggingService. Initializing a BluetoothManager does not
-    /// start the CBCentralManager or trigger an authorization alert. This allows the integrating app to control when
-    /// and how Bluetooth autorization is presented to the user.
+    /// start the `CBCentralManager` *unless* the user has already authorized Bluetooth. This allows the integrating
+    /// app to control when and how Bluetooth autorization is presented to the user.
     ///
     /// When the integrating app desires to request Bluetooth authorization from iOS it can call ``authorize()``.
     ///
     /// - Parameter loggingService: The LoggingService to use for logging.
     /// - Returns: A new instance of BluetoothManager.
-    init(loggingService: LoggingService) {
-        log = loggingService
+    init(loggingService: LoggingService, peripheralManager: PeripheralManager) {
+        self.log = loggingService
+        self.peripheralManager = peripheralManager
         
         super.init()
         
@@ -69,6 +70,8 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     }
     
     // MARK: - State
+    
+    private let stateSubject = CurrentValueSubject<BluetoothState, Never>(.unknown)
     
     /// Publisher for the real-time state of the underlying Core Bluetooth system.
     var state: AnyPublisher<BluetoothState, Never> {
@@ -96,6 +99,14 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
             return
         default:
             break
+        }
+        
+        // Check for scanning before checking the centralManager state. If the centralManager is scanning, it has
+        // to be in a poweredOn state. So scanning is the "higher" state.
+        if centralManager?.isScanning == true {
+            stateSubject.send(.scanning)
+            
+            return
         }
         
         switch centralManager?.state {
@@ -135,12 +146,100 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
         }
     }
     
+    // MARK: - Scanning
+    
+    /// Starts (or restarts) scanning for peripherals. If scanning is already in progress, this method will replace the
+    /// current scan with a new scan.
+    ///
+    /// - Parameter services: An array of CBUUID objects that the app is interested in scanning for. If the value is
+    /// `nil`, the app scans for all peripherals.
+    ///
+    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning.
+    func startScanning(services: [CBUUID]? = nil) {
+        guard let centralManager else {
+            log.warn(tags: [.category(.scanning)], "Attempted to start scan without a central manager")
+            
+            return
+        }
+        
+        guard centralManager.state == .poweredOn else {
+            log.warn(tags: [.category(.scanning)], "Attempted to start scan while central manager is not ready (poweredOn)")
+            
+            return
+        }
+        
+        centralManager.scanForPeripherals(withServices: services, options: nil)
+        
+        if centralManager.isScanning {
+            log.info(tags: [.category(.scanning)], "Scanning started with services: \(services ?? [])")
+            updateState()
+        } else {
+            log.warn(tags: [.category(.scanning)], "Failed to start scanning")
+        }
+    }
+    
+    /// Stops scanning for peripherals.
+    func stopScanning() {
+        guard let centralManager else {
+            log.warn(tags: [.category(.scanning)], "Attempted to stop scan without a central manager")
+            
+            return
+        }
+        
+        centralManager.stopScan()
+        
+        if !centralManager.isScanning {
+            log.info(tags: [.category(.scanning)], "Scanning stopped")
+            updateState()
+        } else {
+            log.warn(tags: [.category(.scanning)], "Failed to stop scanning")
+        }
+    }
+
+    // MARK: - Peripheral Discovery
+    
+    private let discoverySubject = PassthroughSubject<PeripheralDiscoveryEvent, Never>()
+    
+    /// Publisher that emits peripheral discovery events during scanning.
+    public var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
+        discoverySubject.eraseToAnyPublisher()
+    }
+    
     // MARK: - CBCentralManagerDelegate
     
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         log.debug("centralManagerDidUpdateState: \(central.state.rawValue)")
         
+        // Invalidate or refresh peripherals based on the new state
+        switch central.state {
+        case .poweredOn:
+            peripheralManager.refreshPeripherals(using: central)
+        case .poweredOff: fallthrough
+        case .unknown:
+            // This state does not invalidate peripherals.
+            break
+        case .resetting: fallthrough
+        case .unsupported: fallthrough
+        case .unauthorized:
+            peripheralManager.invalidatePeripherals()
+        @unknown default:
+            log.error("Unknown CBCentralManager state encountered: \(central.state.rawValue)")
+            assertionFailure("Unknown CBCentralManager state encountered: \(central.state.rawValue)")
+        }
+        
         updateState()
+    }
+    
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        let peripheralDiscoveryEvent = PeripheralDiscoveryEvent(peripheral: peripheral,
+                                                                advertisementData: advertisementData,
+                                                                rssi: RSSI.intValue)
+        // Log before sending event so logs are time ordered correctly
+        // TODO: Implement verbose log level
+//        log.debug("Discovered peripheral: \(peripheralDiscoveryEvent.name ?? "Unknown") (RSSI: \(RSSI.stringValue))")
+        discoverySubject.send(peripheralDiscoveryEvent)
+        
+        peripheralManager.discoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
     }
 }
 
@@ -155,6 +254,8 @@ public typealias AuthorizationStatus = CBManagerAuthorization
 /// This enumeration provides a thread-safe representation of possible Bluetooth states that can be used across
 /// concurrent environments.
 public enum BluetoothState: Sendable {
+    /// The `BluetoothManager` is currently scanning for peripherals.
+    case scanning
     /// Bluetooth is powered on and the `BluetoothManager` is ready to use.
     case ready
     /// Bluetooth is currently powered off on the device.
@@ -179,6 +280,8 @@ public enum BluetoothState: Sendable {
     /// - Returns: A string describing the `BluetoothState`.
     public var description: String {
         switch self {
+        case .scanning:
+            "Scanning"
         case .ready:
             "Ready"
         case .poweredOff:
@@ -211,6 +314,8 @@ public enum BluetoothState: Sendable {
 /// This type conforms to Swift's `Error` protocol and encapsulates various authorization failures that may occur
 /// during Bluetooth operations.
 public enum AuthorizationError: Error {
+    /// The user has not yet been asked for Bluetooth permissions.
+    case unauthorized
     /// The user explicitly denied Bluetooth access for this app.
     case denied
     /// Indicates this app isn’t authorized to use Bluetooth.

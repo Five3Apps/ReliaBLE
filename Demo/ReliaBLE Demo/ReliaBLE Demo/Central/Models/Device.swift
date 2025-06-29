@@ -1,5 +1,5 @@
 //
-//  ContentView.swift
+//  Device.swift
 //  ReliaBLE Demo
 //
 //  Created by Justin Bergen on 11/18/24.
@@ -10,10 +10,10 @@
 //  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 //  copies of the Software, and to permit persons to whom the Software is
 //  furnished to do so, subject to the following conditions:
-//
+//  
 //  The above copyright notice and this permission notice shall be included in all
 //  copies or substantial portions of the Software.
-//
+//  
 //  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 //  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 //  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -22,29 +22,18 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import SwiftUI
+import Foundation
+import SwiftData
 
-struct ContentView: View {
-    var body: some View {
-        TabView {
-            CentralView()
-                .tabItem {
-                    Label("Central", systemImage: "antenna.radiowaves.left.and.right")
-                }
-            
-            PeripheralView()
-                .tabItem {
-                    Label("Peripheral", systemImage: "dot.radiowaves.left.and.right")
-                }
-            
-            SettingsView()
-                .tabItem {
-                    Label("Settings", systemImage: "gear")
-                }
-        }
+@Model
+final class Device {
+    var id: String
+    var name: String?
+    var lastSeen: Date?
+
+    init(id: String, name: String?, lastSeen: Date?) {
+        self.id = id
+        self.name = name
+        self.lastSeen = lastSeen
     }
-}
-
-#Preview {
-    ContentView()
 }

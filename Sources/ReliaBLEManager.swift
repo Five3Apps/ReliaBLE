@@ -26,6 +26,7 @@
 
 import Combine
 import Foundation
+import CoreBluetooth
 
 @preconcurrency import Willow
 
@@ -35,12 +36,13 @@ public class ReliaBLEManager {
     
     private let log: LoggingService
     private let bluetoothManager: BluetoothManager
+    private let peripheralManager: PeripheralManager
     
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
-    /// Initializing a ReliaBLEManager does not start the CBCentralManager or trigger an authorization alert. This
-    /// allows the integrating app to control when and how Bluetooth autorization is presented to the user. When the
-    /// integrating app desires to request Bluetooth authorization from iOS it can call ``authorizeBluetooth()``.
+    /// Initializing a ReliaBLEManager does not start the `CBCentralManager` unless the user has already authorized
+    /// Bluetooth. This allows the integrating app to control when and how Bluetooth authorization is presented to the
+    /// user. When the integrating app desires to request Bluetooth authorization from iOS it can call ``authorizeBluetooth()``.
     ///
     /// - Parameter config: A ReliaBLEConfig with the desired configurations set. If the value is `nil`, a default
     /// configuration is used. See ``ReliaBLEConfig`` for details on the default configuration.
@@ -49,7 +51,8 @@ public class ReliaBLEManager {
         loggingService.enabled = config.loggingEnabled
         
         log = loggingService
-        bluetoothManager = BluetoothManager(loggingService: loggingService)
+        peripheralManager = PeripheralManager(loggingService: loggingService)
+        bluetoothManager = BluetoothManager(loggingService: loggingService, peripheralManager: peripheralManager)
     }
     
     // MARK: - State
@@ -70,5 +73,34 @@ public class ReliaBLEManager {
     /// - Throws: An ``AuthorizationError`` error if the user has denied or restricted Bluetooth access.
     public func authorizeBluetooth() throws {
         try bluetoothManager.authorize()
+    }
+    
+    // MARK: - Scanning
+
+    /// Publisher that emits peripheral discovery events during scanning. It is meant to be a lightweight
+    /// advertisements feed for cases where the integrating app needs to process individual advertisements.
+    public var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
+        bluetoothManager.peripheralDiscoveries
+    }
+    
+    /// Publisher that emits the current list of discovered peripherals.
+    public var discoveredPeripherals: AnyPublisher<[Peripheral], Never> {
+        peripheralManager.discoveredPeripheralsPublisher
+    }
+    
+    /// Starts scanning for peripheral devices, optionally filtering by specific services.
+    ///
+    /// - Parameter services: An optional array of `CBUUID` objects representing the services to scan for. If provided,
+    /// only peripherals advertising these services will be discovered. If `nil`, scans for all peripheral devices.
+    ///
+    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
+    /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
+    public func startScanning(services: [CBUUID]? = nil) {
+        bluetoothManager.startScanning(services: services)
+    }
+    
+    /// Stops scanning for peripheral devices.
+    public func stopScanning() {
+        bluetoothManager.stopScanning()
     }
 }

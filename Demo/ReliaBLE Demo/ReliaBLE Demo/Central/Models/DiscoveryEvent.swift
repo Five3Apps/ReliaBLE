@@ -1,8 +1,10 @@
 //
-//  ContentView.swift
+//  DiscoveryEvent.swift
 //  ReliaBLE Demo
 //
-//  Created by Justin Bergen on 11/18/24.
+//  Created by Justin Bergen on 3/6/25.
+//
+//  Copyright (c) 2025 Five3 Apps, LLC <justin@five3apps.com>
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -22,29 +24,22 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import SwiftUI
+import Foundation
+import SwiftData
 
-struct ContentView: View {
-    var body: some View {
-        TabView {
-            CentralView()
-                .tabItem {
-                    Label("Central", systemImage: "antenna.radiowaves.left.and.right")
-                }
-            
-            PeripheralView()
-                .tabItem {
-                    Label("Peripheral", systemImage: "dot.radiowaves.left.and.right")
-                }
-            
-            SettingsView()
-                .tabItem {
-                    Label("Settings", systemImage: "gear")
-                }
-        }
+@Model
+final class DiscoveryEvent {
+    var peripheralIdentifier: String
+    var name: String
+    var rssi: Int
+    
+    var timestamp: Date
+    
+    init(peripheralIdentifier: String, name: String, rssi: Int, timestamp: Date) {
+        self.peripheralIdentifier = peripheralIdentifier
+        self.name = name
+        self.rssi = rssi
+        
+        self.timestamp = timestamp
     }
-}
-
-#Preview {
-    ContentView()
 }

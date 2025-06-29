@@ -1,8 +1,10 @@
 //
-//  Device.swift
+//  SettingsView.swift
 //  ReliaBLE Demo
 //
-//  Created by Justin Bergen on 11/18/24.
+//  Created by Justin Bergen on 3/8/24.
+//
+//  Copyright (c) 2025 Five3 Apps, LLC <justin@five3apps.com>
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -22,14 +24,30 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Foundation
-import SwiftData
+import SwiftUI
 
-@Model
-final class Device {
-    var timestamp: Date
-    
-    init(timestamp: Date) {
-        self.timestamp = timestamp
+import ReliaBLE
+
+struct SettingsView: View {
+    @Environment(\.bleManager) private var reliaBLE
+    @State private var isLoggingEnabled: Bool = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Toggle("Enable Logging", isOn: $isLoggingEnabled)
+            }
+            .navigationTitle("Settings")
+        }
+        .onAppear {
+            isLoggingEnabled = reliaBLE.loggingService.enabled
+        }
+        .onChange(of: isLoggingEnabled) { _, newValue in
+            reliaBLE.loggingService.enabled = newValue
+        }
     }
+}
+
+#Preview {
+    SettingsView()
 }
