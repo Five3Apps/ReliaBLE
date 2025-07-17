@@ -32,7 +32,7 @@ import Foundation
 /// This peripheral is a wrapper around the CoreBluetooth `CBPeripheral` object and provides additional metadata
 /// and functionality.
 ///
-/// A `Peripheral` can exist without a `CBPeripheral` but all `CBPeripherals` will have a coresponding `Peripheral`.
+/// A `Peripheral` can exist without a `CBPeripheral` but all `CBPeripherals` will have a corresponding `Peripheral`.
 /// This allows the integrating app to request communiication with a peripheral prior to it having been discovered
 /// by CoreBluetooth, or if CoreBluetooth has invalidated all of its `CBPeripherals`.
 public class Peripheral: Identifiable, Hashable {

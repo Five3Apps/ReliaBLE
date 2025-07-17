@@ -103,4 +103,8 @@ public class ReliaBLEManager {
     public func stopScanning() {
         bluetoothManager.stopScanning()
     }
+    
+    func testFunction() -> String {
+        return "Hello, this is ReliaBLE!"
+    }
 }

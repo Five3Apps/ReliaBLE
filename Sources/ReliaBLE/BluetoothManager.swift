@@ -66,7 +66,9 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
         }
         
         log.info("Initializing CBCentralManager")
-        centralManager = CBCentralManager(delegate: self, queue: queue, options: nil)
+        
+        // Use CBCentralManagerFactory for consistency between normal and test targets
+        centralManager = CBCentralManagerFactory.instance(delegate: self, queue: queue, options: nil, forceMock: true)
     }
     
     // MARK: - State
@@ -243,6 +245,8 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     }
 }
 
+// MARK: - Public Types
+
 /// A typealias for the authorization status of the Core Bluetooth manager.
 /// 
 /// This typealias maps `CBManagerAuthorization` to `AuthorizationStatus`, providing a more readable and convenient
@@ -307,7 +311,7 @@ public enum BluetoothState: Sendable {
     }
 }
 
-// MARK - Errors
+// MARK: Errors
 
 /// A Swift error enumeration representing authorization-related errors in Bluetooth operations.
 ///

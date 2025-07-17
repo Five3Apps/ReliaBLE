@@ -1,10 +1,10 @@
 //
-//  ReliaBLEManagerTests.swift
-//  ReliaBLETests
+//  CBCentralManagerFactory.swift
+//  ReliaBLE
 //
-//  Created by Justin Bergen on 11/18/24.
+//  Created by Justin Bergen on 6/30/25.
 //
-//  Copyright (c) 2024 Five3 Apps, LLC <justin@five3apps.com>
+//  Copyright (c) 2025 Five3 Apps, LLC <justin@five3apps.com>
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -12,10 +12,10 @@
 //  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 //  copies of the Software, and to permit persons to whom the Software is
 //  furnished to do so, subject to the following conditions:
-//
+//  
 //  The above copyright notice and this permission notice shall be included in all
 //  copies or substantial portions of the Software.
-//
+//  
 //  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 //  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 //  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -24,11 +24,14 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Testing
-@testable import ReliaBLE
 
-@Test func correctFunction() async throws {
-    // Write your test here and use APIs like `#expect(...)` to check expected conditions.
-    let package = ReliaBLEManager()
-    #expect(package.testFunction() == "Hello, this is ReliaBLE!", "Incorrect response string")
+import Foundation
+import CoreBluetooth
+
+// This is used to match CoreBluetoothMocks factory.
+// This file is ignored by the Package.swift when SwiftBluetoothMock is used.
+enum CBCentralManagerFactory {
+    static func instance(delegate: CBCentralManagerDelegate? = nil, queue: DispatchQueue? = nil, options: [String: Any]? = nil, forceMock: Bool) -> CBCentralManager {
+        return CBCentralManager(delegate: delegate, queue: queue, options: options)
+    }
 }
