@@ -29,6 +29,9 @@ import os
 
 import Willow
 
+
+/// A LogSource represents the position in the source code where a message is logged.
+public typealias LogSource = Willow.LogSource
 /// The LogModifier protocol defines a single method for modifying a log message after it has been constructed.
 /// This is very flexible allowing any object that conforms to modify messages in any way it wants.
 public typealias LogModifier = Willow.LogModifier
