@@ -31,9 +31,9 @@ import SwiftUI
 
 import ReliaBLE
 
-class CentralViewModel: ObservableObject {
-    @Published var currentState: BluetoothState = .unknown
-    @Published var servicesInput = ""
+@Observable class CentralViewModel {
+    var currentState: BluetoothState = .unknown
+    var servicesInput = ""
     
     var cancellables = Set<AnyCancellable>()
     
