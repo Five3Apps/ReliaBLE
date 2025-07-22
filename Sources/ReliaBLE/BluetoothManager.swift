@@ -35,7 +35,7 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     private let peripheralManager: PeripheralManager
     
     private var centralManager: CBCentralManager?
-    private let queue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated, attributes: [.concurrent])
+    private let queue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated)
     
     // MARK: - Initialization
 
