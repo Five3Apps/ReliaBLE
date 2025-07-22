@@ -38,7 +38,7 @@ struct CentralView: View {
     @Query private var discoveries: [DiscoveryEvent]
     @Query private var devices: [Device]
     
-    @StateObject private var viewModel = CentralViewModel()
+    @State private var viewModel = CentralViewModel()
     @State private var selectedView: String = "Devices"
     
     var body: some View {
