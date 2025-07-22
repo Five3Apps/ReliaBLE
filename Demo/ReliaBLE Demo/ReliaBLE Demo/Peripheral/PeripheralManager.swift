@@ -27,9 +27,9 @@
 import CoreBluetooth
 import SwiftUI
 
-class PeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDelegate {
-    @Published var state: CBManagerState = .unknown
-    @Published var isAdvertising: Bool = false
+@Observable class PeripheralManager: NSObject, CBPeripheralManagerDelegate {
+    var state: CBManagerState = .unknown
+    var isAdvertising: Bool = false
     private var peripheralManager: CBPeripheralManager!
     private var peripheralName: String = ""
     private var serviceUUID: CBUUID?

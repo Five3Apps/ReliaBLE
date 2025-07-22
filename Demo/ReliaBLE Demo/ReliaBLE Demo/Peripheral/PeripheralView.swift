@@ -30,7 +30,7 @@ private let defaultPeripheralName = "ReliaBLE Demo"
 private let defaultServiceUUID = "12345678-90AB-CDEF-1234-567890ABCDEF"
 
 struct PeripheralView: View {
-    @StateObject private var peripheralManager = PeripheralManager()
+    @State private var peripheralManager = PeripheralManager()
     @State private var peripheralName: String = defaultPeripheralName
     @State private var serviceUUIDString: String = defaultServiceUUID
 
