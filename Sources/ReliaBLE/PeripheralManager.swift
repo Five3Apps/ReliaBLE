@@ -32,7 +32,7 @@ class PeripheralManager {
     
     private var discoveredPeripherals = [Peripheral]()
     private let discoveredPeripheralsSubject = PassthroughSubject<[Peripheral], Never>()
-    private let queue = DispatchQueue(label: "com.five3apps.relia-ble.peripheralmanager", qos: .userInitiated, attributes: [.concurrent])
+    private let queue = DispatchQueue(label: "com.five3apps.relia-ble.peripheralmanager", qos: .userInitiated)
     
     public var discoveredPeripheralsPublisher: AnyPublisher<[Peripheral], Never> {
         discoveredPeripheralsSubject.eraseToAnyPublisher()
