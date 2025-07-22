@@ -1,11 +1,11 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 
 import PackageDescription
 
 let package = Package(
     name: "ReliaBLE",
     platforms: [
-        .iOS(.v16),
+        .iOS(.v18),
         .macOS(.v10_15)
     ],
     products: [
