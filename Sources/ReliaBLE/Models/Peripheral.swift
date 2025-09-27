@@ -35,36 +35,72 @@ import Foundation
 /// A `Peripheral` can exist without a `CBPeripheral` but all `CBPeripherals` will have a corresponding `Peripheral`.
 /// This allows the integrating app to request communiication with a peripheral prior to it having been discovered
 /// by CoreBluetooth, or if CoreBluetooth has invalidated all of its `CBPeripherals`.
-public class Peripheral: Identifiable, Hashable {
+public final class Peripheral: Identifiable, Hashable, @unchecked Sendable {
+    private let mutationLock = NSLock()
+    
     /// Unique identifier for the peripheral as set by the integrating app.
     public let id: String
     
     /// The CoreBluetooth peripheral identifier, used to retrieve the peripheral after invalidation.
-    var peripheralIdentifier: UUID?
+    var peripheralIdentifier: UUID? {
+        // No lock needed here since this is a computed property that accesses `peripheral`
+        // which already handles its own synchronization.
+        
+        // If we have a valid CBPeripheral, return its identifier.
+        return peripheral?.identifier
+    }
     
+    private var _peripheral: CBPeripheral?
     /// Reference to the CoreBluetooth peripheral object
     ///
     /// - Warning: Intgrating app should not hold a strong reference!
-    var peripheral: CBPeripheral?
+    var peripheral: CBPeripheral? {
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        
+        return _peripheral
+    }
     
     /// The name advertised by the peripheral, if available
     public var name: String? {
-        peripheral?.name ?? advertisementData?[CBAdvertisementDataLocalNameKey] as? String
+        // No lock needed here since this is a computed property that accesses `peripheral` and `advertisementData`
+        // which already handle their own synchronization.
+        return peripheral?.name ?? advertisementData?[CBAdvertisementDataLocalNameKey] as? String
     }
     
     /// Advertised service UUIDs
     public var serviceUUIDs: [CBUUID]? {
+        // No lock needed here since this is a computed property that accesses `advertisementData`
+        // which already handles its own synchronization.
         advertisementData?[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]
     }
     
+    private var _rssi: Int?
     /// Signal strength indicator (RSSI) of the most recent advertisement
-    public internal(set) var rssi: Int?
+    public var rssi: Int? {
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        
+        // Return the cached RSSI value if available.
+        return _rssi
+    }
     
+    private var _advertisementData: [String: Any]?
     /// Complete advertisement data dictionary from the most recent discovery
-    public internal(set) var advertisementData: [String: Any]?
+    public var advertisementData: [String: Any]? {
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        
+        // Return the cached advertisement data if available.
+        return _advertisementData
+
+    }
     
+    private var _lastSeen: Date?
     /// The timestamp when the peripheral was last seen
-    public internal(set) var lastSeen: Date?
+    public var lastSeen: Date? {
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        
+        // Return the cached last seen date if available.
+        return _lastSeen
+    }
     
     /// Creates a peripheral with a unique identifier and optional CoreBluetooth discovery data.
     ///
@@ -77,45 +113,48 @@ public class Peripheral: Identifiable, Hashable {
     ///  - rssi: Signal strength indicator (RSSI) of the most recent advertisement
     public init(id: String, peripheral: CBPeripheral? = nil, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
         self.id = id
-        self.peripheralIdentifier = peripheral?.identifier
-        self.peripheral = peripheral
-        self.rssi = rssi
-        self.advertisementData = advertisementData
+        
+        mutationLock.name = "Peripheral-\(id)-MutationLock"
+        
+        _peripheral = peripheral
+        _rssi = rssi
+        _advertisementData = advertisementData
         
         if peripheral != nil && rssi != nil {
             // Only set the last seen date if we have a valid CBPeripheral and RSSI value.
             // This indicates that we have received an advertisement from the peripheral.
-            self.lastSeen = Date()
+            _lastSeen = Date()
         }
     }
     
     func update(cbPeripheral: CBPeripheral, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
-        self.peripheralIdentifier = cbPeripheral.identifier
-        self.peripheral = cbPeripheral
-        self.advertisementData = advertisementData
-        self.rssi = rssi
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        
+        _peripheral = cbPeripheral
+        _advertisementData = advertisementData
+        _rssi = rssi
         
         if rssi != nil {
             // Only set the last seen date if we have a valid RSSI value.
             // This indicates that we have received an advertisement from the peripheral.
-            self.lastSeen = Date()
+            _lastSeen = Date()
         }
     }
     
-    public func hash(into hasher: inout Hasher) {
+    /// Invalidates the CoreBluetooth peripheral reference
+    func invalidateCBPeripheral() {
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        
+        _peripheral = nil
+    }
+    
+    nonisolated public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
     
     public static func == (lhs: Peripheral, rhs: Peripheral) -> Bool {
-        // Original implementation: lhs.id == rhs.id
-        
-        // Two peripherals should be considered equal if they have the same identifier. However,
-        // I have seen edge cases where the identifier did not change for a new CBPeripheral instance.
-        // https://developer.apple.com/forums/thread/742497
-        if lhs.id != rhs.id {
-            return false
-        }
-        
-        return lhs.peripheral === rhs.peripheral
+        // No need to compare `CBPeripheral` objects or identifiers, since the `id` is unique and matching between
+        // `Peripheral` and `CBPeriphal` instances are handled internally.
+        return lhs.id == rhs.id
     }
 }
