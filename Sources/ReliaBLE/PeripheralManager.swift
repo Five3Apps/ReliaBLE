@@ -27,7 +27,7 @@
 import Combine
 import CoreBluetooth
 
-class PeripheralManager {
+final class PeripheralManager: @unchecked Sendable {
     private let log: LoggingService
     
     private var discoveredPeripherals = [Peripheral]()
@@ -48,7 +48,7 @@ class PeripheralManager {
         let identifier = cbPeripheral.name ?? advertisementData?[CBAdvertisementDataLocalNameKey] as? String ?? cbPeripheral.identifier.uuidString
         
         queue.sync {
-            // First check if the peripheral has already been discovered by identifier
+            // First check if the peripheral has already been discovered by app-provided identifier
             if let existingPeripheral = discoveredPeripherals.first(where: { $0.id == identifier }) {
                 existingPeripheral.update(cbPeripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
                 discoveredPeripheralsSubject.send(discoveredPeripherals)
@@ -72,7 +72,7 @@ class PeripheralManager {
     func invalidatePeripherals() {
         queue.sync {
             for peripheral in discoveredPeripherals {
-                peripheral.peripheral = nil
+                peripheral.invalidateCBPeripheral()
             }
             discoveredPeripheralsSubject.send(discoveredPeripherals)
             log.debug("Invalidated all peripheral references")
