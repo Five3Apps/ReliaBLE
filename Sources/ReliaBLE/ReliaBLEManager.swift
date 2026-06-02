@@ -28,7 +28,7 @@ import Combine
 import Foundation
 import CoreBluetooth
 
-@preconcurrency import Willow
+import Willow
 
 /// The main entry point for the ReliaBLE library.
 public class ReliaBLEManager {

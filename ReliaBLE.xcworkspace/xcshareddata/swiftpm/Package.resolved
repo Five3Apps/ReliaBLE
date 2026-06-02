@@ -1,13 +1,13 @@
 {
-  "originHash" : "53a66b41b9d6fb3dd74aa6489373804c3995b488c51536a7681d6a00779be14a",
+  "originHash" : "379c094ef4c3a923a4a2c21c4e25ed1058c6b3865059734470458f26ec9827d3",
   "pins" : [
     {
       "identity" : "ios-corebluetooth-mock",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/NordicSemiconductor/IOS-CoreBluetooth-Mock.git",
       "state" : {
-        "revision" : "d1e0321027728da6edf5b974cf113524bad2034a",
-        "version" : "1.0.1"
+        "revision" : "5748c9e8b1750e0d7bc09243c099ff618f211cdf",
+        "version" : "1.0.6"
       }
     },
     {
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-docc-plugin",
       "state" : {
-        "revision" : "85e4bb4e1cd62cec64a4b8e769dcefdf0c5b9d64",
-        "version" : "1.4.3"
+        "revision" : "647c708be89f834fa6a6d4945442793a77ddf5b6",
+        "version" : "1.5.0"
       }
     },
     {
@@ -34,7 +34,7 @@
       "location" : "https://github.com/itsniper/Willow",
       "state" : {
         "branch" : "main",
-        "revision" : "8952bb792c9206caa3b69fcf7432d2b5280c3db5"
+        "revision" : "beeaf007a6566ced5f3f2c9842d760f97c9300f6"
       }
     }
   ],
