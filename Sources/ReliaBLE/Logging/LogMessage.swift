@@ -24,11 +24,11 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-@preconcurrency import Willow
+import Willow
 
 /// An enumeration representing defined tags that can be associated with log messages. These are used
 /// to categorize log messages for better organization and filtering.
-public enum LogTag {
+public enum LogTag: Sendable {
     /// A tag representing a specific category the log message relates to. See ``Category`` for more details.
     case category(Category)
     /// A tag representing a specific peripheral device, identified by its unique identifier.
@@ -36,7 +36,7 @@ public enum LogTag {
     
     /// A special tag representing a specific category of log messages, such as "scanning" or "connection".
     /// Log messages can have multiple category tags but that should be the exception rather than the rule.
-    public enum Category: String {
+    public enum Category: String, Sendable {
         case scanning
         case connection
     }
@@ -70,12 +70,12 @@ public struct LogMessage: Willow.LogMessage {
     /// comma-separated list of all category tags and other keys contain their respective tag
     ///  values.
     /// - Returns: A dictionary containing tag attributes.
-    public var attributes: [String : Any] {
+    public var attributes: [String: any Sendable] {
         guard let tags else {
             return [:]
         }
 
-        var result: [String: Any] = [:]
+        var result: [String: any Sendable] = [:]
         var categories: [String] = []
 
         for tag in tags {

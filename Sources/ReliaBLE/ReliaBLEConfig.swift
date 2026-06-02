@@ -24,7 +24,7 @@
 
 import Foundation
 
-@preconcurrency import Willow
+import Willow
 
 /// The `LogLevel` struct defines all the default log levels for ReliaBLE. Each default log level has a defined bitmask
 /// that is used to satisfy the raw value backing the log level.
