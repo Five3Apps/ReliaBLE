@@ -24,7 +24,7 @@
 
 import Foundation
 
-@preconcurrency import Willow
+import Willow
 
 /// Service for managing all logging within ReliaBLE.
 public class LoggingService {
