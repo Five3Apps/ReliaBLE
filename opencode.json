@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "XcodeBuildMCP": {
+      "type": "local",
+      "command": ["xcodebuildmcp", "mcp"],
+      "environment": {
+        "MCP_TIMEOUT": "180000",
+        "MCP_TOOL_TIMEOUT": "10800000",
+        "MAX_MCP_OUTPUT_TOKENS": "50000"
+      }
+    }
+  }
+}
