@@ -102,10 +102,10 @@ public final class Peripheral: Identifiable, Hashable, @unchecked Sendable {
         return _lastSeen
     }
     
-    /// Creates a peripheral with a unique identifier and optional CoreBluetooth discovery data.
-    ///
-    /// Prefer observing ``ReliaBLEManager/discoveredPeripherals`` for devices discovered during scanning.
-    /// ReliaBLE updates only the ``Peripheral`` instances it manages internally and emits through that publisher.
+    /// Create a peripheral with a unique identifier and optional CoreBluetooth peripheral data. The integrating app
+    /// should use this initializer to create a `Peripheral` instance when it has a unique identifier for a peripheral
+    /// but has not yet discovered the peripheral with CoreBluetooth. ``BluetoothActor`` will update the instance
+    /// with CoreBluetooth data when the peripheral is discovered.
     /// - Parameters:
     ///  - id: Unique identifier for the peripheral as set by the integrating app.
     ///  - peripheral: Reference to the CoreBluetooth `CBPeripheral` object
