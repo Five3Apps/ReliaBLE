@@ -28,15 +28,14 @@ import Combine
 import CoreBluetooth
 import Foundation
 
-/// High-level manager for all Bluetooth operations. Manages the CBCentralManager and provides a single point of access
-/// for all Bluetooth operations.
-class BluetoothManager: NSObject, CBCentralManagerDelegate {
+/// Internal intermediary that forwards BLE operations to ``BluetoothActor`` and exposes
+/// synchronous `AnyPublisher` properties for consumption by ``ReliaBLEManager``.
+///
+/// This class is removed in Step 4 when `ReliaBLEManager` collapses the indirection and
+/// becomes `nonisolated Sendable`.
+class BluetoothManager {
     private let log: LoggingService
-    private let peripheralManager: PeripheralManager
-    
-    private var centralManager: CBCentralManager?
-    private let queue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated)
-    
+
     // MARK: - Initialization
 
     /// Initializes the BluetoothManager with the provided LoggingService. Initializing a BluetoothManager does not
@@ -47,201 +46,79 @@ class BluetoothManager: NSObject, CBCentralManagerDelegate {
     ///
     /// - Parameter loggingService: The LoggingService to use for logging.
     /// - Returns: A new instance of BluetoothManager.
-    init(loggingService: LoggingService, peripheralManager: PeripheralManager) {
+    init(loggingService: LoggingService) {
         self.log = loggingService
-        self.peripheralManager = peripheralManager
-        
-        super.init()
-        
-        if CBCentralManager.authorization == .allowedAlways {
-            setupCentralManager()
-        }
-        
-        updateState()
+
+        // `init` stays synchronous and dispatches actor setup via a fire-and-forget `Task`
+        // rather than awaiting it. The initial `setupCentralManager()` (if already
+        // `.allowedAlways`) and `updateState()` land on the actor's queue on the next
+        // run-loop turn, which is indistinguishable from prior behavior for callers that
+        // observe `state`/`currentState` after init.
+        //
+        // This does mean a caller that immediately awaits `startScanning()`/`stopScanning()`
+        // could in theory have that call's actor job ordered ahead of `initialize`'s, since
+        // Swift actors don't guarantee FIFO ordering across jobs enqueued from separate
+        // top-level Tasks. Both methods already guard on `centralManager == nil` and no-op
+        // with a log warning in that case, so the worst case is a missed scan start rather
+        // than a crash. Revisit if this race proves observable in practice — e.g. by making
+        // `init` `async` or exposing an explicit `await manager.ready()`.
+        Task { await BluetoothActor.shared.initialize(log: loggingService) }
     }
-    
-    private func setupCentralManager() {
-        guard centralManager == nil else {
-            return
-        }
-        
-        log.info("Initializing CBCentralManager")
-        
-        // Use CBCentralManagerFactory for consistency between normal and test targets
-        centralManager = CBCentralManagerFactory.instance(delegate: self, queue: queue, options: nil, forceMock: true)
-    }
-    
+
     // MARK: - State
-    
-    private let stateSubject = CurrentValueSubject<BluetoothState, Never>(.unknown)
-    
+
     /// Publisher for the real-time state of the underlying Core Bluetooth system.
+    /// Reads the `nonisolated(unsafe)` publisher on ``BluetoothActor``. TODO: removed in Step 3.
     var state: AnyPublisher<BluetoothState, Never> {
-        stateSubject.eraseToAnyPublisher()
+        BluetoothActor.shared.statePublisher
     }
-    
+
     /// Synchronous access to the current state of the underlying Core Bluetooth system.
+    /// Reads the `nonisolated(unsafe)` property on ``BluetoothActor``. TODO: removed in Step 3.
     var currentState: BluetoothState {
-        stateSubject.value
+        BluetoothActor.shared.currentBluetoothState
     }
 
-    private func updateState() {
-        switch CBCentralManager.authorization {
-        case .notDetermined:
-            stateSubject.send(.unauthorized(.notDetermined))
-            
-            return
-        case .denied:
-            stateSubject.send(.unauthorized(.denied))
-            
-            return
-        case .restricted:
-            stateSubject.send(.unauthorized(.restricted))
-            
-            return
-        default:
-            break
-        }
-        
-        // Check for scanning before checking the centralManager state. If the centralManager is scanning, it has
-        // to be in a poweredOn state. So scanning is the "higher" state.
-        if centralManager?.isScanning == true {
-            stateSubject.send(.scanning)
-            
-            return
-        }
-        
-        switch centralManager?.state {
-        case .poweredOn:
-            stateSubject.send(.ready)
-        case .poweredOff:
-            stateSubject.send(.poweredOff)
-        case .resetting:
-            stateSubject.send(.resetting)
-        case .unsupported:
-            stateSubject.send(.unsupported)
-        case .unknown:
-            stateSubject.send(.unknown)
-        default:
-            stateSubject.send(.unknown)
-        }
-    }
-    
-    /// Requests authorization to use Bluetooth. This method will throw an error if the user has denied or restricted
-    /// Bluetooth access.
+    // MARK: - Authorization
+
+    /// Requests authorization to use Bluetooth. This method will throw an error if the user
+    /// has denied or restricted Bluetooth access.
     ///
-    /// - Throws: An ``AuthorizationError`` error if the user has denied or restricted Bluetooth access.
-    func authorize() throws {
-        log.info("Authorizing bluetooth")
-        
-        switch CBCentralManager.authorization {
-        case .notDetermined:
-            setupCentralManager()
-        case .denied:
-            throw AuthorizationError.denied
-        case .restricted:
-            throw AuthorizationError.restricted
-        case .allowedAlways:
-            setupCentralManager()
-        @unknown default:
-            throw AuthorizationError.unknown
-        }
+    /// - Throws: An ``AuthorizationError`` error if the user has denied or restricted Bluetooth
+    ///   access.
+    func authorize() async throws {
+        try await BluetoothActor.shared.authorize()
     }
-    
+
     // MARK: - Scanning
-    
-    /// Starts (or restarts) scanning for peripherals. If scanning is already in progress, this method will replace the
-    /// current scan with a new scan.
-    ///
-    /// - Parameter services: An array of CBUUID objects that the app is interested in scanning for. If the value is
-    /// `nil`, the app scans for all peripherals.
-    ///
-    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning.
-    func startScanning(services: [CBUUID]? = nil) {
-        guard let centralManager else {
-            log.warn(tags: [.category(.scanning)], "Attempted to start scan without a central manager")
-            
-            return
-        }
-        
-        guard centralManager.state == .poweredOn else {
-            log.warn(tags: [.category(.scanning)], "Attempted to start scan while central manager is not ready (poweredOn)")
-            
-            return
-        }
-        
-        centralManager.scanForPeripherals(withServices: services, options: nil)
-        
-        if centralManager.isScanning {
-            log.info(tags: [.category(.scanning)], "Scanning started with services: \(services ?? [])")
-            updateState()
-        } else {
-            log.warn(tags: [.category(.scanning)], "Failed to start scanning")
-        }
-    }
-    
-    /// Stops scanning for peripherals.
-    func stopScanning() {
-        guard let centralManager else {
-            log.warn(tags: [.category(.scanning)], "Attempted to stop scan without a central manager")
-            
-            return
-        }
-        
-        centralManager.stopScan()
-        
-        if !centralManager.isScanning {
-            log.info(tags: [.category(.scanning)], "Scanning stopped")
-            updateState()
-        } else {
-            log.warn(tags: [.category(.scanning)], "Failed to stop scanning")
-        }
+
+    /// Publisher that emits peripheral discovery events during scanning. It is meant to be a
+    /// lightweight advertisements feed for cases where the integrating app needs to process
+    /// individual advertisements.
+    var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
+        BluetoothActor.shared.discoveryPublisher
     }
 
-    // MARK: - Peripheral Discovery
-    
-    private let discoverySubject = PassthroughSubject<PeripheralDiscoveryEvent, Never>()
-    
-    /// Publisher that emits peripheral discovery events during scanning.
-    public var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
-        discoverySubject.eraseToAnyPublisher()
+    /// Publisher that emits the current list of discovered peripherals.
+    var discoveredPeripherals: AnyPublisher<[Peripheral], Never> {
+        BluetoothActor.shared.discoveredPeripheralsPublisher
     }
-    
-    // MARK: - CBCentralManagerDelegate
-    
-    func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        log.debug("centralManagerDidUpdateState: \(central.state.rawValue)")
-        
-        // Invalidate or refresh peripherals based on the new state
-        switch central.state {
-        case .poweredOn:
-            peripheralManager.refreshPeripherals(using: central)
-        case .poweredOff: fallthrough
-        case .unknown:
-            // This state does not invalidate peripherals.
-            break
-        case .resetting: fallthrough
-        case .unsupported: fallthrough
-        case .unauthorized:
-            peripheralManager.invalidatePeripherals()
-        @unknown default:
-            log.error("Unknown CBCentralManager state encountered: \(central.state.rawValue)")
-            assertionFailure("Unknown CBCentralManager state encountered: \(central.state.rawValue)")
-        }
-        
-        updateState()
+
+    /// Starts (or restarts) scanning for peripherals. If scanning is already in progress,
+    /// this method will replace the current scan with a new scan.
+    ///
+    /// - Parameter services: An array of CBUUID objects that the app is interested in scanning
+    ///   for. If the value is `nil`, the app scans for all peripherals.
+    ///
+    /// - Note: If Bluetooth is not authorized or powered on, this method will not start
+    ///   scanning.
+    func startScanning(services: sending [CBUUID]? = nil) async {
+        await BluetoothActor.shared.startScanning(services: services)
     }
-    
-    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        let peripheralDiscoveryEvent = PeripheralDiscoveryEvent(peripheral: peripheral,
-                                                                advertisementData: advertisementData,
-                                                                rssi: RSSI.intValue)
-        // Log before sending event so logs are time ordered correctly
-        // TODO: Implement verbose log level
-//        log.debug("Discovered peripheral: \(peripheralDiscoveryEvent.name ?? "Unknown") (RSSI: \(RSSI.stringValue))")
-        discoverySubject.send(peripheralDiscoveryEvent)
-        
-        peripheralManager.discoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
+
+    /// Stops scanning for peripherals.
+    func stopScanning() async {
+        await BluetoothActor.shared.stopScanning()
     }
 }
 

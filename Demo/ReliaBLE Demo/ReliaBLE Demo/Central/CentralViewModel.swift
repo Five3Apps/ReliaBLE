@@ -92,16 +92,16 @@ import ReliaBLE
     }
     
     func authorizeBluetooth() {
-        try? reliaBLE?.authorizeBluetooth()
+        Task { try? await reliaBLE?.authorizeBluetooth() }
     }
     
     func startScanning() {
         let services = parseServices(from: servicesInput)
-        reliaBLE?.startScanning(services: services)
+        Task { await reliaBLE?.startScanning(services: services) }
     }
     
     func stopScanning() {
-        reliaBLE?.stopScanning()
+        Task { await reliaBLE?.stopScanning() }
     }
     
     func clearAllData() {

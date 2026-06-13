@@ -42,7 +42,7 @@ iOS requires permission from the user for BLE access. To set this up in your pro
    ReliaBLE does not automatically request authorization so that you are in control of when the user is prompted. To request Bluetooth permission from the user:
    ```swift
    do {
-       try bleManager.authorizeBluetooth()
+       try await bleManager.authorizeBluetooth()
    } catch AuthorizationError.denied {
        // Handle denied authorization
    } catch AuthorizationError.restricted {
@@ -87,12 +87,11 @@ Example of starting and stopping a scan for all peripherals:
 ```swift
 // Check if Bluetooth is ready
 if bleManager.currentState == .ready {
-    bleManager.startScanning()
+    await bleManager.startScanning()
 
     // Stop scanning after 10 seconds
-    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-        bleManager.stopScanning()
-    }
+    try? await Task.sleep(for: .seconds(10))
+    await bleManager.stopScanning()
 } else {
     // Handle Bluetooth not ready (e.g., prompt user to enable Bluetooth)
     print("Bluetooth is not ready for scanning")
@@ -107,12 +106,11 @@ import CoreBluetooth
 // Check if Bluetooth is ready
 if bleManager.currentState == .ready {
     let serviceUUIDs = [CBUUID(string: "180D"), CBUUID(string: "180F")] // Heart Rate and Battery services
-    bleManager.startScanning(services: serviceUUIDs)
+    await bleManager.startScanning(services: serviceUUIDs)
 
     // Stop scanning after 10 seconds
-    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-        bleManager.stopScanning()
-    }
+    try? await Task.sleep(for: .seconds(10))
+    await bleManager.stopScanning()
 } else {
     // Handle Bluetooth not ready (e.g., prompt user to enable Bluetooth)
     print("Bluetooth is not ready for scanning")
