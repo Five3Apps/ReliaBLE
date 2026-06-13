@@ -42,12 +42,10 @@ public final class Peripheral: Identifiable, Hashable, @unchecked Sendable {
     public let id: String
     
     /// The CoreBluetooth peripheral identifier, used to retrieve the peripheral after invalidation.
+    private var _peripheralIdentifier: UUID?
     var peripheralIdentifier: UUID? {
-        // No lock needed here since this is a computed property that accesses `peripheral`
-        // which already handles its own synchronization.
-        
-        // If we have a valid CBPeripheral, return its identifier.
-        return peripheral?.identifier
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        return _peripheralIdentifier
     }
     
     private var _peripheral: CBPeripheral?
@@ -117,6 +115,7 @@ public final class Peripheral: Identifiable, Hashable, @unchecked Sendable {
         mutationLock.name = "Peripheral-\(id)-MutationLock"
         
         _peripheral = peripheral
+        _peripheralIdentifier = peripheral?.identifier
         _rssi = rssi
         _advertisementData = advertisementData
         
@@ -131,6 +130,7 @@ public final class Peripheral: Identifiable, Hashable, @unchecked Sendable {
         mutationLock.lock(); defer { mutationLock.unlock() }
         
         _peripheral = cbPeripheral
+        _peripheralIdentifier = cbPeripheral.identifier
         _advertisementData = advertisementData
         _rssi = rssi
         
@@ -148,13 +148,13 @@ public final class Peripheral: Identifiable, Hashable, @unchecked Sendable {
         _peripheral = nil
     }
     
-    nonisolated public func hash(into hasher: inout Hasher) {
+    public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
     
     public static func == (lhs: Peripheral, rhs: Peripheral) -> Bool {
         // No need to compare `CBPeripheral` objects or identifiers, since the `id` is unique and matching between
-        // `Peripheral` and `CBPeriphal` instances are handled internally.
+        // `Peripheral` and `CBPeripheral` instances are handled internally.
         return lhs.id == rhs.id
     }
 }
