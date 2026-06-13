@@ -13,6 +13,10 @@ This is a temporary overview.
 - <doc:GettingStarted>
 - <doc:Logging>
 
+### Concurrency
+
+- ``BluetoothActor``
+
 ### Advanced Usage
 
 - <doc:Logging>

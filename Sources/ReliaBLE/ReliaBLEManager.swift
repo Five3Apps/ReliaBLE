@@ -25,8 +25,8 @@
 //  SOFTWARE.
 
 import Combine
-import Foundation
 import CoreBluetooth
+import Foundation
 
 import Willow
 
@@ -36,7 +36,6 @@ public class ReliaBLEManager {
     
     private let log: LoggingService
     private let bluetoothManager: BluetoothManager
-    private let peripheralManager: PeripheralManager
     
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
@@ -51,8 +50,7 @@ public class ReliaBLEManager {
         loggingService.enabled = config.loggingEnabled
         
         log = loggingService
-        peripheralManager = PeripheralManager(loggingService: loggingService)
-        bluetoothManager = BluetoothManager(loggingService: loggingService, peripheralManager: peripheralManager)
+        bluetoothManager = BluetoothManager(loggingService: loggingService)
     }
     
     // MARK: - State
@@ -71,8 +69,8 @@ public class ReliaBLEManager {
     /// Bluetooth access.
     ///
     /// - Throws: An ``AuthorizationError`` error if the user has denied or restricted Bluetooth access.
-    public func authorizeBluetooth() throws {
-        try bluetoothManager.authorize()
+    public func authorizeBluetooth() async throws {
+        try await bluetoothManager.authorize()
     }
     
     // MARK: - Scanning
@@ -85,7 +83,7 @@ public class ReliaBLEManager {
     
     /// Publisher that emits the current list of discovered peripherals.
     public var discoveredPeripherals: AnyPublisher<[Peripheral], Never> {
-        peripheralManager.discoveredPeripheralsPublisher
+        bluetoothManager.discoveredPeripherals
     }
     
     /// Starts scanning for peripheral devices, optionally filtering by specific services.
@@ -95,13 +93,13 @@ public class ReliaBLEManager {
     ///
     /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
     /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
-    public func startScanning(services: [CBUUID]? = nil) {
-        bluetoothManager.startScanning(services: services)
+    public func startScanning(services: sending [CBUUID]? = nil) async {
+        await bluetoothManager.startScanning(services: services)
     }
     
     /// Stops scanning for peripheral devices.
-    public func stopScanning() {
-        bluetoothManager.stopScanning()
+    public func stopScanning() async {
+        await bluetoothManager.stopScanning()
     }
     
     func testFunction() -> String {
