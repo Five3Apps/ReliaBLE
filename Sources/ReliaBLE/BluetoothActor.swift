@@ -61,6 +61,8 @@ public actor BluetoothActor {
 
     // MARK: - Actor-Isolated State
 
+    private let centralManagerQueue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated)
+
     var centralManager: CBCentralManager?
     private var delegateShim: BluetoothDelegateShim?
 
@@ -132,7 +134,7 @@ public actor BluetoothActor {
         delegateShim = shim
         // Use CBCentralManagerFactory for consistency between normal and test targets.
         // `forceMock: true` is load-bearing for the ReliaBLEMock test target — do not remove.
-        centralManager = CBCentralManagerFactory.instance(delegate: shim, queue: nil, options: nil, forceMock: true)
+        centralManager = CBCentralManagerFactory.instance(delegate: shim, queue: centralManagerQueue, options: nil, forceMock: true)
     }
 
     // MARK: - Authorization
@@ -342,7 +344,7 @@ public actor BluetoothActor {
 final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        Task { await BluetoothActor.shared.handleCentralManagerStateUpdate() }
+        Task { @BluetoothActor in await BluetoothActor.shared.handleCentralManagerStateUpdate() }
     }
 
     func centralManager(
@@ -356,6 +358,6 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
         let p = SendableWrapper(value: peripheral)
         let ad = SendableWrapper(value: advertisementData)
         let rssi = RSSI.intValue
-        Task { await BluetoothActor.shared.handlePeripheralDiscovered(p.value, advertisementData: ad.value, rssi: rssi) }
+        Task { @BluetoothActor in await BluetoothActor.shared.handlePeripheralDiscovered(p.value, advertisementData: ad.value, rssi: rssi) }
     }
 }
