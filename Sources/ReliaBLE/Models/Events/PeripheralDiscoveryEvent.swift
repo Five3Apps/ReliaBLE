@@ -27,31 +27,26 @@
 import Foundation
 import CoreBluetooth
 
-/// A representation of a discovered Bluetooth peripheral with metadata.
-public struct PeripheralDiscoveryEvent: Identifiable, Hashable {
+/// A lightweight, `Sendable` event emitted for each advertisement received while scanning.
+public struct PeripheralDiscoveryEvent: Identifiable, Hashable, Sendable {
     /// Unique identifier for the peripheral as set by CoreBluetooth
     public let id: UUID
     
     /// The name advertised by the peripheral, if available
     public let name: String?
     
-    /// Advertised service UUIDs
-    public var serviceUUIDs: [CBUUID]? {
-        advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]
-    }
-    
     /// Signal strength indicator (RSSI)
     public let rssi: Int
     
-    /// Complete advertisement data dictionary from the most recent discovery
-    public let advertisementData: [String: Any]
+    /// The typed advertisement data from this discovery.
+    public let advertisement: AdvertisementData
     
-    /// Create a discovered peripheral from CoreBluetooth information
-    init(peripheral: CBPeripheral, advertisementData: [String: Any], rssi: Int) {
-        self.id = peripheral.identifier
-        self.name = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
+    /// Create a discovered peripheral event from CoreBluetooth information.
+    init(cbPeripheral: CBPeripheral, advertisement: AdvertisementData, rssi: Int) {
+        self.id = cbPeripheral.identifier
+        self.name = cbPeripheral.name ?? advertisement.localName
         self.rssi = rssi
-        self.advertisementData = advertisementData
+        self.advertisement = advertisement
     }
     
     public func hash(into hasher: inout Hasher) {

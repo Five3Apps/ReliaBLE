@@ -32,3 +32,22 @@ import Testing
     let package = ReliaBLEManager()
     #expect(package.testFunction() == "Hello, this is ReliaBLE!", "Incorrect response string")
 }
+
+@Test func peripheralIsSendable() async throws {
+    let peripheral = Peripheral(id: "sendable-id")
+
+    // Capturing the value in a `Task.detached` closure is a compile-time proof that
+    // `Peripheral` is `Sendable` — the closure crosses an isolation boundary.
+    let capturedId = await Task.detached { peripheral.id }.value
+
+    #expect(capturedId == "sendable-id")
+}
+
+@Test func connectToUnknownPeripheralThrowsNotFound() async throws {
+    let manager = ReliaBLEManager()
+    let staleSnapshot = Peripheral(id: "never-discovered")
+
+    await #expect(throws: PeripheralError.self) {
+        try await manager.connect(to: staleSnapshot)
+    }
+}
