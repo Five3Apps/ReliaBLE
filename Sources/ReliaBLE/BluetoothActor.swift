@@ -30,17 +30,20 @@ import Foundation
 
 // MARK: - Sendable Bridging Helper
 
-/// Wraps a non-`Sendable` value for safe transfer across actor isolation boundaries.
+/// Carries one discovery callback's raw CoreBluetooth payload across the nonisolated
+/// delegate-queue → ``BluetoothActor`` hop.
 ///
-/// The caller must ensure the wrapped value is not mutated concurrently from multiple
-/// isolation domains. This wrapper is used only for the transitional hop between
-/// CoreBluetooth's delegate queue and ``BluetoothActor``.
+/// The `CBPeripheral` and `[String: Any]` advertisement dictionary delivered by the delegate are non-`Sendable`, but
+/// the payload is read exactly once—on the delegate queue, before the hop—and never mutated, so ferrying it into the
+/// actor is safe. ``Peripheral`` and ``AdvertisementData`` (the `Sendable` value types the app sees) are not
+/// extracted until inside the actor, preserving the invariant that the raw payload is touched only there.
 ///
-/// Still required: the raw `CBPeripheral` and `[String: Any]` advertisement dictionary delivered by the delegate
-/// are non-`Sendable` and must cross into the actor. ``Peripheral`` itself is now a `Sendable` value type, but the
-/// CoreBluetooth payload it is built from is not extracted until inside the actor.
-private struct SendableWrapper<T>: @unchecked Sendable {
-    let value: T
+/// This is a single-purpose `@unchecked Sendable` boundary rather than a general-purpose wrapper, so the unchecked
+/// assertion stays scoped to exactly this transfer.
+private struct DiscoveryPayload: @unchecked Sendable {
+    let peripheral: CBPeripheral
+    let advertisementData: [String: Any]
+    let rssi: Int
 }
 
 // MARK: - BluetoothActor
@@ -410,11 +413,16 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
-        // Wrap the non-Sendable CBPeripheral and advertisement dictionary for the actor isolation hop.
-        // They are extracted into Sendable types (Peripheral / AdvertisementData) inside the actor.
-        let p = SendableWrapper(value: peripheral)
-        let ad = SendableWrapper(value: advertisementData)
-        let rssi = RSSI.intValue
-        Task { @BluetoothActor in await BluetoothActor.shared.handlePeripheralDiscovered(p.value, advertisementData: ad.value, rssi: rssi) }
+        // Ferry the non-Sendable CBPeripheral and advertisement dictionary across the actor isolation hop in a
+        // single-purpose payload. They are extracted into Sendable types (Peripheral / AdvertisementData) inside
+        // the actor.
+        let payload = DiscoveryPayload(peripheral: peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
+        Task { @BluetoothActor in
+            await BluetoothActor.shared.handlePeripheralDiscovered(
+                payload.peripheral,
+                advertisementData: payload.advertisementData,
+                rssi: payload.rssi
+            )
+        }
     }
 }

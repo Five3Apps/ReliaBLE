@@ -158,6 +158,8 @@ Considered, then rejected, adding `serviceUUIDs` (or an `advertisedServiceUUIDs`
 
 The plan's Background implied the `SendableWrapper` hop might go away once `Peripheral` is a value type. It was **kept**: the raw `CBPeripheral` and `[String: Any]` advertisement dictionary delivered by the delegate are still non-`Sendable` and must cross the delegate-queue → actor hop before extraction into `Peripheral`/`AdvertisementData` *inside* the actor. The doc comments were updated to reflect this.
 
+**Why the Step 1 expectation was wrong.** The Step 1 plan (and the original `SendableWrapper` TODO comments) assumed the wrapper existed to ferry the non-`Sendable` `Peripheral` *class*, so making `Peripheral` a value type would remove it. That was a misattribution: the wrapper never carried a `Peripheral` — it carries the raw `CBPeripheral` and `[String: Any]` advertisement dictionary delivered on CoreBluetooth's nonisolated delegate queue. Those framework types stay non-`Sendable`, the architecture deliberately defers extraction into value types until *inside* the actor, and Step 2's new actor-owned `cbPeripherals: [String: CBPeripheral]` registry actually *requires* the live reference to reach the actor. So the hop survives regardless of `Peripheral`'s Sendability. An oracle review confirmed this and validated keeping the hop (do **not** extract in the shim or pass only a `UUID` — that would violate the invariant and trade a live reference for a racy `retrievePeripherals(withIdentifiers:)` lookup).
+
 ### 5. `CBUUID: @retroactive @unchecked Sendable` — no mock-target collision
 
 The Open Question risk (redundant-conformance error if `CoreBluetoothMock` already declares `CBMUUID: Sendable`) did **not** materialize. Both `ReliaBLE` and `ReliaBLEMock` compile the shared extension cleanly; no per-target guard was needed.
@@ -169,3 +171,11 @@ In addition to the `PeripheralError.notFound` registry-lookup throw, `connect(id
 ### 7. Tests
 
 Shipped as planned: a `Task.detached`-capture `Sendable` proof (`peripheralIsSendable`) and a stale-snapshot `connect` test (`connectToUnknownPeripheralThrowsNotFound`, asserting `PeripheralError.self`). Both use the new `public init(id:)`. A broader actor/registry test harness (driving the mock central to emit discoveries) was noted as a possible follow-up, out of scope here.
+
+### 8. `SendableWrapper<T>` → `DiscoveryPayload`: keep the unchecked scope small (post-merge refinement, 2026-06-19)
+
+The same oracle review from item #4 recommended narrowing the unchecked assertion. The generic `private struct SendableWrapper<T>: @unchecked Sendable` was replaced with a single-purpose `private struct DiscoveryPayload: @unchecked Sendable { let peripheral: CBPeripheral; let advertisementData: [String: Any]; let rssi: Int }` in `BluetoothActor.swift`. The shim now ferries one `DiscoveryPayload` across the hop instead of two generic wrappers.
+
+- **Decision — keep the solution scope small.** A generic `@unchecked Sendable` wrapper reads as a reusable escape hatch: it invites future call sites to bypass concurrency checking for *any* type, which muddies the waters over time and erodes the value of complete concurrency checking. The real invariant is narrow — "this one discovery payload is safe to ferry once into the actor." A single-purpose type names exactly that boundary, makes the unchecked assertion self-documenting, and keeps the unsafe surface confined to the one hop that genuinely needs it rather than normalizing a general-purpose unchecked tool.
+- **No behavior change:** still a `@unchecked Sendable` ferry of the raw, read-once CoreBluetooth payload; extraction into `Peripheral`/`AdvertisementData` still happens inside the actor. Builds clean under `ReliaBLE` and `ReliaBLEMock`.
+- **Not a Step 3 obligation:** the oracle confirmed AsyncStream cleanup (Step 3) removes the Combine `nonisolated(unsafe)` bridging, but does not inherently solve the non-`Sendable` CoreBluetooth payload hop. A future switch to `sending` parameters would be a targeted, compiler-verified refactor rather than a required goal.
