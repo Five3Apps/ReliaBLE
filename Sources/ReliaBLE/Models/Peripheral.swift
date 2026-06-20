@@ -24,7 +24,6 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import CoreBluetooth
 import Foundation
 
 /// An immutable, `Sendable` value snapshot of a Bluetooth peripheral and its metadata.
