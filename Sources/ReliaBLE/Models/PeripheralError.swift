@@ -24,7 +24,6 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Foundation
 
 /// Errors thrown by peripheral operations such as ``ReliaBLEManager/connect(to:)``.
 public enum PeripheralError: Error, Sendable {

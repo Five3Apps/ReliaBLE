@@ -33,10 +33,10 @@ import Foundation
 /// Carries one discovery callback's raw CoreBluetooth payload across the nonisolated
 /// delegate-queue → ``BluetoothActor`` hop.
 ///
-/// The `CBPeripheral` and `[String: Any]` advertisement dictionary delivered by the delegate are non-`Sendable`, but
-/// the payload is read exactly once—on the delegate queue, before the hop—and never mutated, so ferrying it into the
-/// actor is safe. ``Peripheral`` and ``AdvertisementData`` (the `Sendable` value types the app sees) are not
-/// extracted until inside the actor, preserving the invariant that the raw payload is touched only there.
+/// The `CBPeripheral` and `[String: Any]` advertisement dictionary delivered by the delegate are non-`Sendable`.
+/// They are treated as immutable payload and are only accessed inside ``BluetoothActor`` after the hop, where they are
+/// immediately converted into `Sendable` value snapshots (``Peripheral`` / ``AdvertisementData``). The raw payload is
+/// never stored outside the actor.
 ///
 /// This is a single-purpose `@unchecked Sendable` boundary rather than a general-purpose wrapper, so the unchecked
 /// assertion stays scoped to exactly this transfer.

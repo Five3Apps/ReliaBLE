@@ -47,7 +47,12 @@ import Testing
     let manager = ReliaBLEManager()
     let staleSnapshot = Peripheral(id: "never-discovered")
 
-    await #expect(throws: PeripheralError.self) {
+    do {
         try await manager.connect(to: staleSnapshot)
+        #expect(false, "Expected PeripheralError.notFound")
+    } catch PeripheralError.notFound {
+        // expected
+    } catch {
+        #expect(false, "Expected PeripheralError.notFound, got \(error)")
     }
 }
