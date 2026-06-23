@@ -11,6 +11,14 @@ Two related projects share this repo:
 
 Open `ReliaBLE.xcworkspace` at the root to work on both together.
 
+### Working on the Demo app
+
+The Demo is a **separate project** with its own conventions and build tooling, kept out of the library's context on purpose:
+
+- Before performing ANY Demo build/run/test task, **read `Demo/CLAUDE.md` first** — it documents the Demo's conventions and its required build tooling (XcodeBuildMCP, not raw `xcodebuild`).
+- For substantial Demo work, **delegate to a sub-agent** and instruct it to read `Demo/CLAUDE.md` first. This keeps Demo conventions in an isolated context so they don't pollute the main library session. (A sub-agent does not auto-load `Demo/CLAUDE.md` — tell it to read that file explicitly.)
+- Do not carry Demo patterns back into the library.
+
 ## Build, test
 
 ```sh
