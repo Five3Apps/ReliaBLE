@@ -24,137 +24,93 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import CoreBluetooth
 import Foundation
 
-/// A representation of a discovered Bluetooth peripheral with metadata.
+/// An immutable, `Sendable` value snapshot of a Bluetooth peripheral and its metadata.
 ///
-/// This peripheral is a wrapper around the CoreBluetooth `CBPeripheral` object and provides additional metadata
-/// and functionality.
+/// A `Peripheral` carries no reference to the underlying CoreBluetooth `CBPeripheral`. The live `CBPeripheral` is
+/// owned exclusively by ``BluetoothActor`` in an `id`-keyed registry that never escapes the actor. Operations that
+/// need the live peripheral (such as ``ReliaBLEManager/connect(to:)``) forward the snapshot's ``id``; the actor looks
+/// up the live reference and throws ``PeripheralError/notFound`` if the snapshot has since gone stale.
 ///
-/// A `Peripheral` can exist without a `CBPeripheral` but all `CBPeripherals` will have a corresponding `Peripheral`.
-/// This allows the integrating app to request communiication with a peripheral prior to it having been discovered
-/// by CoreBluetooth, or if CoreBluetooth has invalidated all of its `CBPeripherals`.
-public final class Peripheral: Identifiable, Hashable, @unchecked Sendable {
-    private let mutationLock = NSLock()
-    
-    /// Unique identifier for the peripheral as set by the integrating app.
-    public let id: String
-    
-    /// The CoreBluetooth peripheral identifier, used to retrieve the peripheral after invalidation.
-    private var _peripheralIdentifier: UUID?
-    var peripheralIdentifier: UUID? {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        return _peripheralIdentifier
-    }
-    
-    private var _peripheral: CBPeripheral?
-    /// Reference to the CoreBluetooth peripheral object
+/// The integrating app can also construct a `Peripheral` from a known identifier *before* it has been discovered —
+/// for example, a wearable bound to the user's account — using ``init(id:)``. Such a snapshot has no
+/// ``advertisement`` (and no live reference) until ``BluetoothActor`` matches it against a discovered `CBPeripheral`.
+///
+/// Because it is a pure value type, a `Peripheral` is freely sendable across isolation domains and safe to hand to
+/// the integrating app for UI display.
+public struct Peripheral: Sendable, Identifiable, Hashable {
+    /// Unique identifier for the peripheral.
     ///
-    /// - Warning: Intgrating app should not hold a strong reference!
-    var peripheral: CBPeripheral? {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        
-        return _peripheral
-    }
-    
-    /// The name advertised by the peripheral, if available
-    public var name: String? {
-        // No lock needed here since this is a computed property that accesses `peripheral` and `advertisementData`
-        // which already handle their own synchronization.
-        return peripheral?.name ?? advertisementData?[CBAdvertisementDataLocalNameKey] as? String
-    }
-    
-    /// Advertised service UUIDs
-    public var serviceUUIDs: [CBUUID]? {
-        // No lock needed here since this is a computed property that accesses `advertisementData`
-        // which already handles its own synchronization.
-        advertisementData?[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]
-    }
-    
-    private var _rssi: Int?
-    /// Signal strength indicator (RSSI) of the most recent advertisement
-    public var rssi: Int? {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        
-        // Return the cached RSSI value if available.
-        return _rssi
-    }
-    
-    private var _advertisementData: [String: Any]?
-    /// Complete advertisement data dictionary from the most recent discovery
-    public var advertisementData: [String: Any]? {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        
-        // Return the cached advertisement data if available.
-        return _advertisementData
+    /// When provided by the integrating app via ``init(id:)`` this is the app's own identifier. When resolved at
+    /// discovery time it is the peripheral's advertised name, its local name, or — as a fallback — the CoreBluetooth
+    /// identifier string.
+    public let id: String
 
+    /// The CoreBluetooth identifier for the peripheral, used to retrieve it after invalidation.
+    ///
+    /// `nil` for an app-constructed peripheral that has not yet been discovered.
+    public let cbIdentifier: UUID?
+
+    /// The name advertised by the peripheral, if available.
+    public let name: String?
+
+    /// Signal strength indicator (RSSI) of the most recent advertisement.
+    public let rssi: Int?
+
+    /// The timestamp when the peripheral was last seen.
+    public let lastSeen: Date?
+
+    /// The typed advertisement data from the most recent discovery.
+    ///
+    /// `nil` until the peripheral has been discovered. Advertisement data is transient, per-discovery information; it
+    /// is not the peripheral's connected GATT service catalog.
+    public let advertisement: AdvertisementData?
+
+    /// Registers a known peripheral before it has been discovered.
+    ///
+    /// Use this when the integrating app already has a stable identifier for a peripheral — such as a device bound to
+    /// the user's account — and wants ReliaBLE to match it against the corresponding `CBPeripheral` once discovered.
+    /// The resulting snapshot has no ``cbIdentifier``, ``name``, ``rssi``, ``lastSeen``, or ``advertisement`` until
+    /// discovery populates them.
+    ///
+    /// - Parameter id: The integrating app's unique identifier for the peripheral.
+    public init(id: String) {
+        self.init(id: id, cbIdentifier: nil, name: nil, rssi: nil, lastSeen: nil, advertisement: nil)
     }
-    
-    private var _lastSeen: Date?
-    /// The timestamp when the peripheral was last seen
-    public var lastSeen: Date? {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        
-        // Return the cached last seen date if available.
-        return _lastSeen
-    }
-    
-    /// Create a peripheral with a unique identifier and optional CoreBluetooth peripheral data. The integrating app
-    /// should use this initializer to create a `Peripheral` instance when it has a unique identifier for a peripheral
-    /// but has not yet discovered the peripheral with CoreBluetooth. ``BluetoothActor`` will update the instance
-    /// with CoreBluetooth data when the peripheral is discovered.
+
+    /// Creates a fully-specified peripheral snapshot. Used internally by ``BluetoothActor`` at discovery time.
+    ///
     /// - Parameters:
-    ///  - id: Unique identifier for the peripheral as set by the integrating app.
-    ///  - peripheral: Reference to the CoreBluetooth `CBPeripheral` object
-    ///  - advertisementData: Complete advertisement data dictionary from the most recent discovery
-    ///  - rssi: Signal strength indicator (RSSI) of the most recent advertisement
-    public init(id: String, peripheral: CBPeripheral? = nil, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
+    ///   - id: Unique identifier for the peripheral.
+    ///   - cbIdentifier: The CoreBluetooth identifier, used to re-resolve the live peripheral after invalidation.
+    ///   - name: The name advertised by the peripheral, if available.
+    ///   - rssi: Signal strength indicator (RSSI) of the most recent advertisement.
+    ///   - lastSeen: The timestamp when the peripheral was last seen.
+    ///   - advertisement: The typed advertisement data from the most recent discovery.
+    init(
+        id: String,
+        cbIdentifier: UUID? = nil,
+        name: String? = nil,
+        rssi: Int? = nil,
+        lastSeen: Date? = nil,
+        advertisement: AdvertisementData? = nil
+    ) {
         self.id = id
-        
-        mutationLock.name = "Peripheral-\(id)-MutationLock"
-        
-        _peripheral = peripheral
-        _peripheralIdentifier = peripheral?.identifier
-        _rssi = rssi
-        _advertisementData = advertisementData
-        
-        if peripheral != nil && rssi != nil {
-            // Only set the last seen date if we have a valid CBPeripheral and RSSI value.
-            // This indicates that we have received an advertisement from the peripheral.
-            _lastSeen = Date()
-        }
+        self.cbIdentifier = cbIdentifier
+        self.name = name
+        self.rssi = rssi
+        self.lastSeen = lastSeen
+        self.advertisement = advertisement
     }
-    
-    func update(cbPeripheral: CBPeripheral, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        
-        _peripheral = cbPeripheral
-        _peripheralIdentifier = cbPeripheral.identifier
-        _advertisementData = advertisementData
-        _rssi = rssi
-        
-        if rssi != nil {
-            // Only set the last seen date if we have a valid RSSI value.
-            // This indicates that we have received an advertisement from the peripheral.
-            _lastSeen = Date()
-        }
-    }
-    
-    /// Invalidates the CoreBluetooth peripheral reference
-    func invalidateCBPeripheral() {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        
-        _peripheral = nil
-    }
-    
+
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
-    
+
     public static func == (lhs: Peripheral, rhs: Peripheral) -> Bool {
-        // No need to compare `CBPeripheral` objects or identifiers, since the `id` is unique and matching between
-        // `Peripheral` and `CBPeripheral` instances are handled internally.
+        // Equality keys on `id` only: the identifier is unique and the matching between `Peripheral` snapshots and
+        // their live `CBPeripheral` is handled internally by ``BluetoothActor``.
         return lhs.id == rhs.id
     }
 }

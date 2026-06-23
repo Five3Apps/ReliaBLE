@@ -102,6 +102,23 @@ public class ReliaBLEManager {
         await bluetoothManager.stopScanning()
     }
     
+    // MARK: - Connection
+
+    /// Initiates a connection to a previously discovered peripheral.
+    ///
+    /// The ``Peripheral`` is a value snapshot captured at discovery time. This method forwards its ``Peripheral/id``
+    /// to the live CoreBluetooth peripheral held internally and requests a connection.
+    ///
+    /// - Parameter peripheral: A peripheral previously delivered via ``discoveredPeripherals``.
+    /// - Throws: ``PeripheralError/notFound`` if the peripheral's live reference has been invalidated (a stale
+    ///   snapshot).
+    ///
+    /// - Note: This currently only initiates the connection request. The full connection lifecycle is deferred to a
+    ///   later release.
+    public func connect(to peripheral: Peripheral) async throws {
+        try await bluetoothManager.connect(to: peripheral)
+    }
+    
     func testFunction() -> String {
         return "Hello, this is ReliaBLE!"
     }

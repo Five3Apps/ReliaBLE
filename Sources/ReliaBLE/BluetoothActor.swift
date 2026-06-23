@@ -30,15 +30,20 @@ import Foundation
 
 // MARK: - Sendable Bridging Helper
 
-/// Wraps a non-`Sendable` value for safe transfer across actor isolation boundaries.
+/// Carries one discovery callback's raw CoreBluetooth payload across the nonisolated
+/// delegate-queue → ``BluetoothActor`` hop.
 ///
-/// The caller must ensure the wrapped value is not mutated concurrently from multiple
-/// isolation domains. This wrapper is used only for the transitional hop between
-/// CoreBluetooth's delegate queue and ``BluetoothActor``.
+/// The `CBPeripheral` and `[String: Any]` advertisement dictionary delivered by the delegate are non-`Sendable`.
+/// They are treated as immutable payload and are only accessed inside ``BluetoothActor`` after the hop, where they are
+/// immediately converted into `Sendable` value snapshots (``Peripheral`` / ``AdvertisementData``). The raw payload is
+/// never stored outside the actor.
 ///
-/// **TODO: removed in Step 2** when `Peripheral` becomes a `Sendable` value type.
-private struct SendableWrapper<T>: @unchecked Sendable {
-    let value: T
+/// This is a single-purpose `@unchecked Sendable` boundary rather than a general-purpose wrapper, so the unchecked
+/// assertion stays scoped to exactly this transfer.
+private struct DiscoveryPayload: @unchecked Sendable {
+    let peripheral: CBPeripheral
+    let advertisementData: [String: Any]
+    let rssi: Int
 }
 
 // MARK: - BluetoothActor
@@ -68,7 +73,14 @@ public actor BluetoothActor {
 
     var log: LoggingService?
 
+    /// Value snapshots of all discovered peripherals, keyed implicitly by ``Peripheral/id``.
     var discoveredPeripherals: [Peripheral] = []
+
+    /// Live `CBPeripheral` references keyed by ``Peripheral/id``.
+    ///
+    /// This mutable, non-`Sendable` reference map never escapes the actor. ``Peripheral`` snapshots carry only an
+    /// `id`; operations that need the live peripheral look it up here.
+    private var cbPeripherals: [String: CBPeripheral] = [:]
 
     // Combine subjects — written only from actor-isolated context.
     let stateSubject = CurrentValueSubject<BluetoothState, Never>(.unknown)
@@ -267,48 +279,72 @@ public actor BluetoothActor {
         advertisementData: [String: Any],
         rssi: Int
     ) {
-        // Inlined rather than calling private helpers so that the non-Sendable
-        // CBPeripheral reference never appears at an actor method call site.
-        // The Swift 6 region-based isolation checker reports a false positive
-        // ("please file a bug") when a non-Sendable value is passed to an
-        // actor-isolated method, even from within the same actor.
-        // TODO: Step 2 — refactor once Peripheral is a Sendable value type.
+        // Extract the untyped advertisement dictionary into a typed, Sendable snapshot exactly once. The raw
+        // `[String: Any]` does not leave this actor; the same `AdvertisementData` feeds both the discovery event
+        // and the stored `Peripheral` snapshot.
+        let advertisement = AdvertisementData(rawAdvertisementData: advertisementData)
 
         // Emit lightweight discovery feed.
         // TODO: Implement verbose log level
         discoverySubject.send(
-            PeripheralDiscoveryEvent(peripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
+            PeripheralDiscoveryEvent(cbPeripheral: cbPeripheral, advertisement: advertisement, rssi: rssi)
         )
 
         // TODO: FR-8.5: Unique Identifier from Manufacturing Data — connect to id once implemented
         let identifier = cbPeripheral.name
-            ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
+            ?? advertisement.localName
             ?? cbPeripheral.identifier.uuidString
 
-        // Check if already discovered by app-provided identifier
-        if let existing = discoveredPeripherals.first(where: { $0.id == identifier }) {
-            existing.update(cbPeripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
-            discoveredPeripheralsSubject.send(discoveredPeripherals)
-            return
+        let cbIdentifier = cbPeripheral.identifier
+        let name = cbPeripheral.name ?? advertisement.localName
+        let now = Date()
+
+        // Resolve the id to store under. Prefer an existing entry matching the app-facing `identifier`; otherwise
+        // fall back to an existing entry for the same `CBPeripheral` (whose resolved `id` may differ if the name has
+        // since changed), preserving that entry's original `id`. Otherwise this is a brand-new peripheral.
+        let resolvedId: String
+        if let idx = discoveredPeripherals.firstIndex(where: { $0.id == identifier }) {
+            resolvedId = identifier
+            discoveredPeripherals[idx] = Peripheral(
+                id: resolvedId,
+                cbIdentifier: cbIdentifier,
+                name: name,
+                rssi: rssi,
+                lastSeen: now,
+                advertisement: advertisement
+            )
+        } else if let idx = discoveredPeripherals.firstIndex(where: { $0.cbIdentifier == cbIdentifier }) {
+            resolvedId = discoveredPeripherals[idx].id
+            discoveredPeripherals[idx] = Peripheral(
+                id: resolvedId,
+                cbIdentifier: cbIdentifier,
+                name: name,
+                rssi: rssi,
+                lastSeen: now,
+                advertisement: advertisement
+            )
+        } else {
+            resolvedId = identifier
+            let new = Peripheral(
+                id: resolvedId,
+                cbIdentifier: cbIdentifier,
+                name: name,
+                rssi: rssi,
+                lastSeen: now,
+                advertisement: advertisement
+            )
+            log?.debug(tags: [.category(.scanning), .peripheral(new.id)], "Adding newly discovered peripheral")
+            discoveredPeripherals.append(new)
         }
 
-        // Check if already discovered by CBPeripheral identifier
-        if let existing = discoveredPeripherals.first(where: { $0.peripheralIdentifier == cbPeripheral.identifier }) {
-            existing.update(cbPeripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
-            discoveredPeripheralsSubject.send(discoveredPeripherals)
-            return
-        }
-
-        let new = Peripheral(id: identifier, peripheral: cbPeripheral, advertisementData: advertisementData, rssi: rssi)
-        log?.debug(tags: [.category(.scanning), .peripheral(new.id)], "Adding newly discovered peripheral")
-        discoveredPeripherals.append(new)
+        // Stash the live reference under the resolved id. Never escapes the actor.
+        cbPeripherals[resolvedId] = cbPeripheral
         discoveredPeripheralsSubject.send(discoveredPeripherals)
     }
 
     private func invalidatePeripherals() {
-        for peripheral in discoveredPeripherals {
-            peripheral.invalidateCBPeripheral()
-        }
+        // The value snapshots hold no CoreBluetooth reference to clear; drop the live registry instead.
+        cbPeripherals.removeAll()
         discoveredPeripheralsSubject.send(discoveredPeripherals)
         log?.debug("Invalidated all peripheral references")
     }
@@ -316,7 +352,7 @@ public actor BluetoothActor {
     private func refreshPeripherals() {
         guard let centralManager else { return }
 
-        let identifiers = discoveredPeripherals.compactMap { $0.peripheralIdentifier }
+        let identifiers = discoveredPeripherals.compactMap { $0.cbIdentifier }
         guard !identifiers.isEmpty else {
             log?.debug("No peripheral identifiers to refresh")
             return
@@ -324,12 +360,36 @@ public actor BluetoothActor {
 
         let retrieved = centralManager.retrievePeripherals(withIdentifiers: identifiers)
         for cbPeripheral in retrieved {
-            if let p = discoveredPeripherals.first(where: { $0.peripheralIdentifier == cbPeripheral.identifier }) {
-                p.update(cbPeripheral: cbPeripheral)
+            if let p = discoveredPeripherals.first(where: { $0.cbIdentifier == cbPeripheral.identifier }) {
+                cbPeripherals[p.id] = cbPeripheral
             }
         }
         discoveredPeripheralsSubject.send(discoveredPeripherals)
         log?.debug("Refreshed \(retrieved.count) peripherals from CBCentralManager")
+    }
+
+    // MARK: - Connection
+
+    /// Initiates a connection to the live peripheral backing the given snapshot `id`.
+    ///
+    /// - Parameter id: The ``Peripheral/id`` of a previously discovered peripheral.
+    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id` (a stale snapshot).
+    ///
+    /// - Note: This currently only fires the connection request. The full connection lifecycle
+    ///   (didConnect/didDisconnect handling and a connection-state surface) is deferred to a later release.
+    func connect(id: String) throws {
+        guard let cbPeripheral = cbPeripherals[id] else {
+            throw PeripheralError.notFound
+        }
+
+        guard let centralManager else {
+            // Mirrors the start/stopScanning convention: no central manager means there is nothing to act on.
+            // In practice unreachable — the registry is only populated while a central manager exists.
+            log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
+            return
+        }
+
+        centralManager.connect(cbPeripheral, options: nil)
     }
 }
 
@@ -353,11 +413,16 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
-        // Wrap non-Sendable values for the actor isolation hop.
-        // TODO: Step 2 — remove SendableWrapper when Peripheral becomes a Sendable value type.
-        let p = SendableWrapper(value: peripheral)
-        let ad = SendableWrapper(value: advertisementData)
-        let rssi = RSSI.intValue
-        Task { @BluetoothActor in await BluetoothActor.shared.handlePeripheralDiscovered(p.value, advertisementData: ad.value, rssi: rssi) }
+        // Ferry the non-Sendable CBPeripheral and advertisement dictionary across the actor isolation hop in a
+        // single-purpose payload. They are extracted into Sendable types (Peripheral / AdvertisementData) inside
+        // the actor.
+        let payload = DiscoveryPayload(peripheral: peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
+        Task { @BluetoothActor in
+            await BluetoothActor.shared.handlePeripheralDiscovered(
+                payload.peripheral,
+                advertisementData: payload.advertisementData,
+                rssi: payload.rssi
+            )
+        }
     }
 }
