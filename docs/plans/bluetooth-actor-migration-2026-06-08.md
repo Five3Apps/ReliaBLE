@@ -19,6 +19,8 @@ This is **Step 1 of 5**. The public `AnyPublisher` surface and the `Peripheral` 
 **Step handoffs (do not implement here):**
 - Step 2 (#17): `Peripheral` → `Sendable` value struct; `CBPeripheral` registry fully actor-owned
 - Step 3 (#12): Replace `AnyPublisher` with `AsyncStream`; remove all `@unchecked Sendable`/`nonisolated(unsafe)` Combine workarounds from this step
+
+> **Note (added 2026-06-19):** This plan elsewhere assumes the `SendableWrapper` delegate-hop is removed in Step 2. That turned out to be a misattribution — see the as-built addendum in `docs/plans/peripheral-sendable-struct-2026-06-13.md` (items #4 and #8) for why the hop is still required. This plan is left otherwise intact as the original Step 1 intent.
 - Step 4 (#18): `ReliaBLEManager` → `nonisolated Sendable`; collapse `BluetoothManager` into the actor
 - Step 5 (#19): `-strict-concurrency=complete` flag flip + logging polish + DocC
 

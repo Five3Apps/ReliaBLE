@@ -120,6 +120,16 @@ class BluetoothManager {
     func stopScanning() async {
         await BluetoothActor.shared.stopScanning()
     }
+
+    // MARK: - Connection
+
+    /// Initiates a connection to the given peripheral.
+    ///
+    /// - Parameter peripheral: A peripheral previously delivered via ``discoveredPeripherals``.
+    /// - Throws: ``PeripheralError/notFound`` if the peripheral is no longer known to the library.
+    func connect(to peripheral: Peripheral) async throws {
+        try await BluetoothActor.shared.connect(id: peripheral.id)
+    }
 }
 
 // MARK: - Public Types
