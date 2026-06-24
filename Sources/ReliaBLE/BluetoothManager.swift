@@ -24,12 +24,11 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Combine
 import CoreBluetooth
 import Foundation
 
 /// Internal intermediary that forwards BLE operations to ``BluetoothActor`` and exposes
-/// synchronous `AnyPublisher` properties for consumption by ``ReliaBLEManager``.
+/// synchronous `AsyncStream` properties for consumption by ``ReliaBLEManager``.
 ///
 /// This class is removed in Step 4 when `ReliaBLEManager` collapses the indirection and
 /// becomes `nonisolated Sendable`.
@@ -67,14 +66,14 @@ class BluetoothManager {
 
     // MARK: - State
 
-    /// Publisher for the real-time state of the underlying Core Bluetooth system.
-    /// Reads the `nonisolated(unsafe)` publisher on ``BluetoothActor``. TODO: removed in Step 3.
-    var state: AnyPublisher<BluetoothState, Never> {
-        BluetoothActor.shared.statePublisher
+    /// A fresh `AsyncStream` of real-time state changes of the underlying Core Bluetooth system.
+    /// Each access mints an independent stream via the ``BluetoothActor`` broadcaster.
+    var state: AsyncStream<BluetoothState> {
+        BluetoothActor.shared.stateStream()
     }
 
     /// Synchronous access to the current state of the underlying Core Bluetooth system.
-    /// Reads the `nonisolated(unsafe)` property on ``BluetoothActor``. TODO: removed in Step 3.
+    /// Reads the `nonisolated(unsafe)` snapshot on ``BluetoothActor``.
     var currentState: BluetoothState {
         BluetoothActor.shared.currentBluetoothState
     }
@@ -92,16 +91,17 @@ class BluetoothManager {
 
     // MARK: - Scanning
 
-    /// Publisher that emits peripheral discovery events during scanning. It is meant to be a
-    /// lightweight advertisements feed for cases where the integrating app needs to process
-    /// individual advertisements.
-    var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
-        BluetoothActor.shared.discoveryPublisher
+    /// A fresh `AsyncStream` that emits peripheral discovery events during scanning. It is meant to
+    /// be a lightweight advertisements feed for cases where the integrating app needs to process
+    /// individual advertisements. This stream does not replay; subscribe before scanning.
+    var peripheralDiscoveries: AsyncStream<PeripheralDiscoveryEvent> {
+        BluetoothActor.shared.peripheralDiscoveriesStream()
     }
 
-    /// Publisher that emits the current list of discovered peripherals.
-    var discoveredPeripherals: AnyPublisher<[Peripheral], Never> {
-        BluetoothActor.shared.discoveredPeripheralsPublisher
+    /// A fresh `AsyncStream` that emits the current list of discovered peripherals, replaying the
+    /// latest list on subscription.
+    var discoveredPeripherals: AsyncStream<[Peripheral]> {
+        BluetoothActor.shared.discoveredPeripheralsStream()
     }
 
     /// Starts (or restarts) scanning for peripherals. If scanning is already in progress,

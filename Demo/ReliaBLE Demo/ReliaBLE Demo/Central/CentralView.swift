@@ -24,7 +24,6 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Combine
 import CoreBluetooth
 import SwiftUI
 import SwiftData
@@ -98,8 +97,20 @@ struct CentralView: View {
         .onAppear {
             viewModel.setDependencies(modelContext: modelContext, reliaBLE: reliaBLE)
         }
-        .onDisappear {
-            viewModel.cancellables.removeAll()
+        .task {
+            for await state in reliaBLE.state {
+                viewModel.updateState(state)
+            }
+        }
+        .task {
+            for await discoveryEvent in reliaBLE.peripheralDiscoveries {
+                viewModel.insertDiscovery(discoveryEvent, into: modelContext)
+            }
+        }
+        .task {
+            for await peripherals in reliaBLE.discoveredPeripherals {
+                viewModel.syncDevices(peripherals, into: modelContext)
+            }
         }
     }
     
