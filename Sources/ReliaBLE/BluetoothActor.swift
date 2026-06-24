@@ -24,7 +24,6 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Combine
 import CoreBluetooth
 import Foundation
 
@@ -50,8 +49,8 @@ private struct DiscoveryPayload: @unchecked Sendable {
 
 /// Process-wide global actor that serializes all CoreBluetooth interactions.
 ///
-/// All mutable BLE state—`CBCentralManager`, Combine subjects, and discovered
-/// peripherals—are owned exclusively by this actor. Two `ReliaBLEManager` instances
+/// All mutable BLE state—`CBCentralManager`, per-subscriber `AsyncStream` continuations, and
+/// discovered peripherals—are owned exclusively by this actor. Two `ReliaBLEManager` instances
 /// share the same isolation domain; this is acceptable because CoreBluetooth already
 /// enforces a single central manager per process.
 ///
@@ -82,40 +81,114 @@ public actor BluetoothActor {
     /// `id`; operations that need the live peripheral look it up here.
     private var cbPeripherals: [String: CBPeripheral] = [:]
 
-    // Combine subjects — written only from actor-isolated context.
-    let stateSubject = CurrentValueSubject<BluetoothState, Never>(.unknown)
-    let discoverySubject = PassthroughSubject<PeripheralDiscoveryEvent, Never>()
-    let discoveredPeripheralsSubject = PassthroughSubject<[Peripheral], Never>()
-
-    // MARK: - nonisolated(unsafe) Bridging Properties
+    // MARK: - AsyncStream Broadcaster State
     //
-    // Publishers are extracted once in `init` and never reassigned — safe for concurrent reads.
-    // `currentBluetoothState` is written only by the serial actor executor via
-    // `broadcastState(_:)` — safe for concurrent reads (value semantics, no partial writes).
-    //
-    // TODO: All removed in Step 3 when AnyPublisher is replaced by AsyncStream.
+    // One continuation per active subscriber, keyed by a per-subscription UUID. Mutated only on
+    // the actor's serial executor: the stream factories register on a `@BluetoothActor` hop, the
+    // broadcast sites iterate to `yield`, and each `onTermination` handler prunes its own entry.
 
-    /// Publisher for the real-time Bluetooth state. **TODO: removed in Step 3.**
-    nonisolated(unsafe) let statePublisher: AnyPublisher<BluetoothState, Never>
+    private var stateContinuations: [UUID: AsyncStream<BluetoothState>.Continuation] = [:]
+    private var discoveryContinuations: [UUID: AsyncStream<PeripheralDiscoveryEvent>.Continuation] = [:]
+    private var peripheralsContinuations: [UUID: AsyncStream<[Peripheral]>.Continuation] = [:]
 
-    /// Publisher for peripheral discovery events. **TODO: removed in Step 3.**
-    nonisolated(unsafe) let discoveryPublisher: AnyPublisher<PeripheralDiscoveryEvent, Never>
-
-    /// Publisher for the current list of discovered peripherals. **TODO: removed in Step 3.**
-    nonisolated(unsafe) let discoveredPeripheralsPublisher: AnyPublisher<[Peripheral], Never>
+    // MARK: - nonisolated(unsafe) Bridging Property
 
     /// Synchronous snapshot of the current Bluetooth state.
     ///
-    /// Written only from `broadcastState(_:)` on the actor's serial executor.
-    /// **TODO: removed in Step 3.**
+    /// Written only from `broadcastState(_:)` on the actor's serial executor — safe for concurrent
+    /// reads (value semantics, no partial writes). Retained as the backing store for the
+    /// synchronous `currentState` accessor and as the replay value handed to each new
+    /// `stateStream()` subscriber.
     nonisolated(unsafe) var currentBluetoothState: BluetoothState = .unknown
 
     // MARK: - Initialization
 
-    private init() {
-        statePublisher = stateSubject.eraseToAnyPublisher()
-        discoveryPublisher = discoverySubject.eraseToAnyPublisher()
-        discoveredPeripheralsPublisher = discoveredPeripheralsSubject.eraseToAnyPublisher()
+    private init() {}
+
+    // MARK: - Event Streams
+
+    /// Returns a fresh `AsyncStream` of Bluetooth state changes for a single subscriber.
+    ///
+    /// Each call mints an independent stream; multiple subscribers are supported by design. The
+    /// current state is replayed as the first element (`.bufferingNewest(1)`, latest-wins), so a
+    /// new subscriber always observes the current state without waiting for the next broadcast.
+    nonisolated func stateStream() -> AsyncStream<BluetoothState> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            Task { await BluetoothActor.shared.register(stateContinuation: continuation) }
+        }
+    }
+
+    /// Returns a fresh `AsyncStream` of peripheral discovery events for a single subscriber.
+    ///
+    /// Unlike ``stateStream()`` and ``discoveredPeripheralsStream()`` this feed does **not** replay
+    /// a value on subscription; a subscriber only receives advertisements observed after it
+    /// registers. An advertisement that arrives in the narrow window between stream creation and
+    /// continuation registration is missed — accepted for a lightweight advertisements feed.
+    nonisolated func peripheralDiscoveriesStream() -> AsyncStream<PeripheralDiscoveryEvent> {
+        AsyncStream { continuation in
+            Task { await BluetoothActor.shared.register(discoveryContinuation: continuation) }
+        }
+    }
+
+    /// Returns a fresh `AsyncStream` of the current discovered-peripherals list for a single
+    /// subscriber.
+    ///
+    /// The current list is replayed as the first element (`.bufferingNewest(1)`, latest-wins), so
+    /// a new subscriber immediately observes the peripherals already discovered.
+    nonisolated func discoveredPeripheralsStream() -> AsyncStream<[Peripheral]> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            Task { await BluetoothActor.shared.register(peripheralsContinuation: continuation) }
+        }
+    }
+
+    // MARK: - Continuation Registration
+    //
+    // Registration runs as a single, indivisible actor job: the replay-yield, dictionary insert,
+    // and `onTermination` assignment cannot interleave with a broadcast. The only residual gap is
+    // the window between `AsyncStream` creation and this job starting — an event emitted then is
+    // missed by a *new* (replay-less) `peripheralDiscoveries` subscriber. Accepted and documented.
+
+    private func register(stateContinuation continuation: AsyncStream<BluetoothState>.Continuation) {
+        let id = UUID()
+        continuation.yield(currentBluetoothState)
+        stateContinuations[id] = continuation
+        continuation.onTermination = { _ in
+            Task { await BluetoothActor.shared.removeStateContinuation(id) }
+        }
+    }
+
+    private func register(discoveryContinuation continuation: AsyncStream<PeripheralDiscoveryEvent>.Continuation) {
+        let id = UUID()
+        discoveryContinuations[id] = continuation
+        continuation.onTermination = { _ in
+            Task { await BluetoothActor.shared.removeDiscoveryContinuation(id) }
+        }
+    }
+
+    private func register(peripheralsContinuation continuation: AsyncStream<[Peripheral]>.Continuation) {
+        let id = UUID()
+        continuation.yield(discoveredPeripherals)
+        peripheralsContinuations[id] = continuation
+        continuation.onTermination = { _ in
+            Task { await BluetoothActor.shared.removePeripheralsContinuation(id) }
+        }
+    }
+
+    private func removeStateContinuation(_ id: UUID) { stateContinuations[id] = nil }
+    private func removeDiscoveryContinuation(_ id: UUID) { discoveryContinuations[id] = nil }
+    private func removePeripheralsContinuation(_ id: UUID) { peripheralsContinuations[id] = nil }
+
+    /// Yields a value to every registered continuation in `continuations`.
+    ///
+    /// Yielding to an already-finished continuation is a harmless no-op, so this never prunes —
+    /// dead continuations remove themselves via their `onTermination` handler.
+    private func broadcast<Element: Sendable>(
+        _ value: Element,
+        to continuations: [UUID: AsyncStream<Element>.Continuation]
+    ) {
+        for continuation in continuations.values {
+            continuation.yield(value)
+        }
     }
 
     // MARK: - Configuration
@@ -245,10 +318,10 @@ public actor BluetoothActor {
     }
 
     private func broadcastState(_ state: BluetoothState) {
-        stateSubject.send(state)
-        // nonisolated(unsafe) write — safe: written only from the actor's serial executor.
-        // TODO: removed in Step 3
+        // nonisolated(unsafe) write — safe: written only from the actor's serial executor. Also
+        // serves as the replay value handed to each new `stateStream()` subscriber.
         currentBluetoothState = state
+        broadcast(state, to: stateContinuations)
     }
 
     // MARK: - Delegate Entry Points (called by BluetoothDelegateShim)
@@ -286,8 +359,9 @@ public actor BluetoothActor {
 
         // Emit lightweight discovery feed.
         // TODO: Implement verbose log level
-        discoverySubject.send(
-            PeripheralDiscoveryEvent(cbPeripheral: cbPeripheral, advertisement: advertisement, rssi: rssi)
+        broadcast(
+            PeripheralDiscoveryEvent(cbPeripheral: cbPeripheral, advertisement: advertisement, rssi: rssi),
+            to: discoveryContinuations
         )
 
         // TODO: FR-8.5: Unique Identifier from Manufacturing Data — connect to id once implemented
@@ -339,13 +413,13 @@ public actor BluetoothActor {
 
         // Stash the live reference under the resolved id. Never escapes the actor.
         cbPeripherals[resolvedId] = cbPeripheral
-        discoveredPeripheralsSubject.send(discoveredPeripherals)
+        broadcast(discoveredPeripherals, to: peripheralsContinuations)
     }
 
     private func invalidatePeripherals() {
         // The value snapshots hold no CoreBluetooth reference to clear; drop the live registry instead.
         cbPeripherals.removeAll()
-        discoveredPeripheralsSubject.send(discoveredPeripherals)
+        broadcast(discoveredPeripherals, to: peripheralsContinuations)
         log?.debug("Invalidated all peripheral references")
     }
 
@@ -364,7 +438,7 @@ public actor BluetoothActor {
                 cbPeripherals[p.id] = cbPeripheral
             }
         }
-        discoveredPeripheralsSubject.send(discoveredPeripherals)
+        broadcast(discoveredPeripherals, to: peripheralsContinuations)
         log?.debug("Refreshed \(retrieved.count) peripherals from CBCentralManager")
     }
 
