@@ -52,23 +52,22 @@ iOS requires permission from the user for BLE access. To set this up in your pro
    }
    ```
 
-3. (Optional) Monitor Bluetooth state changes by subscribing to the ``ReliaBLEManager/state`` publisher:
+3. (Optional) Monitor Bluetooth state changes by iterating the ``ReliaBLEManager/state`` stream. It is an `AsyncStream`, so consume it with `for await` — typically inside a SwiftUI `.task { … }`, which cancels the loop when the view disappears:
    ```swift
-   bleManager.state
-       .sink { state in
-           switch state {
-           case .ready:
-               // Bluetooth is ready to use
-           case .unauthorized(let authStatus):
-               // Handle unauthorized state
-           case .poweredOff:
-               // Prompt user to enable Bluetooth
-           default:
-               break
-           }
+   for await state in bleManager.state {
+       switch state {
+       case .ready:
+           // Bluetooth is ready to use
+       case .unauthorized(let authStatus):
+           // Handle unauthorized state
+       case .poweredOff:
+           // Prompt user to enable Bluetooth
+       default:
+           break
        }
-       .store(in: &cancellables)
+   }
    ```
+   The current state is replayed as the stream's first element, so a new subscriber immediately observes the latest state.
 
 Note: The authorization prompt will only appear once. It is safe to call `ReliaBLEManager.authorizeBluetooth()` multiple times. If the user already granted permission it will be a no-op. If the user denies permission, they'll need to enable it manually through the Settings app.
 
@@ -117,7 +116,7 @@ if bleManager.currentState == .ready {
 }
 ```
 
-You can monitor the ``ReliaBLEManager/state`` publisher (as shown in the Authorizing Bluetooth section) to ensure Bluetooth is in the `.ready` state before calling `startScanning()`. Scanning will continue until you explicitly call `stopScanning()` or if Bluetooth becomes unavailable.
+You can monitor the ``ReliaBLEManager/state`` stream (as shown in the Authorizing Bluetooth section) to ensure Bluetooth is in the `.ready` state before calling `startScanning()`. Scanning will continue until you explicitly call `stopScanning()` or if Bluetooth becomes unavailable.
 
 ## Observing Discovered Peripherals
 
@@ -126,17 +125,16 @@ While scanning, ReliaBLE surfaces results two ways:
 - ``ReliaBLEManager/peripheralDiscoveries`` emits a lightweight ``PeripheralDiscoveryEvent`` for every advertisement received — useful when you need to process individual advertisement packets.
 - ``ReliaBLEManager/discoveredPeripherals`` emits the current de-duplicated list of ``Peripheral`` values each time it changes.
 
+Both are `AsyncStream`s. Each property access returns a *fresh, independent* stream, so multiple subscribers are supported by design — consume each with `for await`, typically inside a SwiftUI `.task { … }` (which cancels the loop automatically when the view disappears). ``ReliaBLEManager/state`` and ``ReliaBLEManager/discoveredPeripherals`` replay their latest value to every new subscriber; ``ReliaBLEManager/peripheralDiscoveries`` does **not** replay, so subscribe before you start scanning to avoid missing early advertisements.
+
 A ``Peripheral`` is an immutable, `Sendable` value snapshot: it carries the peripheral's ``Peripheral/id``, ``Peripheral/name``, ``Peripheral/rssi``, ``Peripheral/lastSeen``, and a strongly-typed ``AdvertisementData`` rather than a raw `[String: Any]` dictionary. Because it is a value type, it is safe to hand directly to your UI.
 
 ```swift
-bleManager.discoveredPeripherals
-    .receive(on: DispatchQueue.main)
-    .sink { peripherals in
-        for peripheral in peripherals {
-            print(peripheral.name ?? peripheral.id, peripheral.advertisement?.serviceUUIDs ?? [])
-        }
+for await peripherals in bleManager.discoveredPeripherals {
+    for peripheral in peripherals {
+        print(peripheral.name ?? peripheral.id, peripheral.advertisement?.serviceUUIDs ?? [])
     }
-    .store(in: &cancellables)
+}
 ```
 
 If your app already knows a peripheral's identity ahead of time — for example, a wearable bound to the user's account — you can construct a ``Peripheral`` directly with ``Peripheral/init(id:)``. Such a snapshot has no ``Peripheral/advertisement`` until ReliaBLE matches it against the corresponding device during discovery.

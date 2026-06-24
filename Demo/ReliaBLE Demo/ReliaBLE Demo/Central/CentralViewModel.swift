@@ -24,7 +24,6 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Combine
 import CoreBluetooth
 import SwiftData
 import SwiftUI
@@ -35,60 +34,53 @@ import ReliaBLE
     var currentState: BluetoothState = .unknown
     var servicesInput = ""
     
-    var cancellables = Set<AnyCancellable>()
-    
     private var modelContext: ModelContext?
     private var reliaBLE: ReliaBLEManager?
     
     func setDependencies(modelContext: ModelContext, reliaBLE: ReliaBLEManager) {
         self.modelContext = modelContext
         self.reliaBLE = reliaBLE
-        
-        setupSubscriptions()
     }
     
-    private func setupSubscriptions() {
-        guard let reliaBLE = reliaBLE, let modelContext = modelContext else { return }
-        
-        reliaBLE.state
-            .receive(on: DispatchQueue.main)
-            .assign(to: \.currentState, on: self)
-            .store(in: &cancellables)
-        
-        reliaBLE.peripheralDiscoveries
-            .receive(on: DispatchQueue.main)
-            .sink { discoveryEvent in
-                let event = DiscoveryEvent(
-                    peripheralIdentifier: discoveryEvent.id.uuidString,
-                    name: discoveryEvent.name ?? "Unknown",
-                    rssi: discoveryEvent.rssi,
-                    timestamp: Date()
-                )
-                modelContext.insert(event)
-                try? modelContext.save()
-            }
-            .store(in: &cancellables)
-
-        reliaBLE.discoveredPeripherals
-            .receive(on: DispatchQueue.main)
-            .sink { peripherals in
-                do {
-                    let allDevices = try modelContext.fetch(FetchDescriptor<Device>())
-                    for peripheral in peripherals {
-                        if let existingDevice = allDevices.first(where: { $0.id == peripheral.id }) {
-                            existingDevice.name = peripheral.name
-                            existingDevice.lastSeen = peripheral.lastSeen
-                        } else {
-                            let newDevice = Device(id: peripheral.id, name: peripheral.name, lastSeen: Date())
-                            modelContext.insert(newDevice)
-                        }
-                    }
-                    try modelContext.save()
-                } catch {
-                    print("Error fetching devices: \(error)")
+    // MARK: - Stream Handlers
+    //
+    // Fed by the `.task { for await … }` loops in `CentralView`. Each handler runs on the main
+    // actor before touching `@Observable` state or SwiftData.
+    
+    @MainActor
+    func updateState(_ state: BluetoothState) {
+        currentState = state
+    }
+    
+    @MainActor
+    func insertDiscovery(_ discoveryEvent: PeripheralDiscoveryEvent, into modelContext: ModelContext) {
+        let event = DiscoveryEvent(
+            peripheralIdentifier: discoveryEvent.id.uuidString,
+            name: discoveryEvent.name ?? "Unknown",
+            rssi: discoveryEvent.rssi,
+            timestamp: Date()
+        )
+        modelContext.insert(event)
+        try? modelContext.save()
+    }
+    
+    @MainActor
+    func syncDevices(_ peripherals: [Peripheral], into modelContext: ModelContext) {
+        do {
+            let allDevices = try modelContext.fetch(FetchDescriptor<Device>())
+            for peripheral in peripherals {
+                if let existingDevice = allDevices.first(where: { $0.id == peripheral.id }) {
+                    existingDevice.name = peripheral.name
+                    existingDevice.lastSeen = peripheral.lastSeen
+                } else {
+                    let newDevice = Device(id: peripheral.id, name: peripheral.name, lastSeen: Date())
+                    modelContext.insert(newDevice)
                 }
             }
-            .store(in: &cancellables)
+            try modelContext.save()
+        } catch {
+            print("Error fetching devices: \(error)")
+        }
     }
     
     func authorizeBluetooth() {

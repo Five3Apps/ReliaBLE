@@ -24,7 +24,6 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import Combine
 import CoreBluetooth
 import Foundation
 
@@ -55,8 +54,17 @@ public class ReliaBLEManager {
     
     // MARK: - State
 
-    /// Publisher for the real-time state of the underlying Core Bluetooth system.
-    public var state: AnyPublisher<BluetoothState, Never> {
+    /// A multi-subscriber `AsyncStream` of real-time state changes of the underlying Core Bluetooth
+    /// system. Each property access returns a fresh, independent stream; the current state is
+    /// replayed as the first element, so a new subscriber immediately observes the latest state.
+    ///
+    /// Consume it with `for await`:
+    /// ```swift
+    /// for await state in bleManager.state {
+    ///     // react to state
+    /// }
+    /// ```
+    public var state: AsyncStream<BluetoothState> {
         bluetoothManager.state
     }
     
@@ -75,14 +83,21 @@ public class ReliaBLEManager {
     
     // MARK: - Scanning
 
-    /// Publisher that emits peripheral discovery events during scanning. It is meant to be a lightweight
-    /// advertisements feed for cases where the integrating app needs to process individual advertisements.
-    public var peripheralDiscoveries: AnyPublisher<PeripheralDiscoveryEvent, Never> {
+    /// A multi-subscriber `AsyncStream` that emits peripheral discovery events during scanning. It
+    /// is meant to be a lightweight advertisements feed for cases where the integrating app needs to
+    /// process individual advertisements.
+    ///
+    /// Each property access returns a fresh, independent stream. Unlike ``state`` and
+    /// ``discoveredPeripherals`` this stream does **not** replay a value on subscription — subscribe
+    /// before you start scanning to avoid missing early advertisements.
+    public var peripheralDiscoveries: AsyncStream<PeripheralDiscoveryEvent> {
         bluetoothManager.peripheralDiscoveries
     }
-    
-    /// Publisher that emits the current list of discovered peripherals.
-    public var discoveredPeripherals: AnyPublisher<[Peripheral], Never> {
+
+    /// A multi-subscriber `AsyncStream` that emits the current de-duplicated list of discovered
+    /// peripherals each time it changes. Each property access returns a fresh, independent stream;
+    /// the current list is replayed as the first element on subscription.
+    public var discoveredPeripherals: AsyncStream<[Peripheral]> {
         bluetoothManager.discoveredPeripherals
     }
     
