@@ -18,20 +18,29 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+        run: |
+          if [ ! -d /Applications/Xcode_16.4.app ]; then
+            echo "Xcode 16.4 not found. Installed Xcode versions:"
+            ls /Applications | grep Xcode || true
+            exit 1
+          fi
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
 
       - name: Verify Swift version
         run: swift --version
 
       - name: Build DocC catalog
-        run: swift package generate-documentation --target ReliaBLE --warnings-as-errors
+        run: |
+          swift package --allow-writing-to-directory ./docc-output \
+            generate-documentation --target ReliaBLE --warnings-as-errors \
+            --output-path ./docc-output
 
       - name: Archive DocC output
-        run: ditto -c -k --sequesterRsrc --keepParent .build/plugins/Swift-DocC/outputs/ReliaBLE.doccarchive ReliaBLE.doccarchive.zip
+        run: ditto -c -k --sequesterRsrc --keepParent docc-output ReliaBLE-docs.zip
 
       - name: Upload DocC archive
         uses: actions/upload-artifact@v4
         with:
-          name: ReliaBLE.doccarchive
-          path: ReliaBLE.doccarchive.zip
+          name: ReliaBLE-docs
+          path: ReliaBLE-docs.zip
           if-no-files-found: error

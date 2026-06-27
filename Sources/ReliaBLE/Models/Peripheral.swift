@@ -66,10 +66,10 @@ public class Peripheral: Identifiable, Hashable {
     /// The timestamp when the peripheral was last seen
     public internal(set) var lastSeen: Date?
     
-    /// Create a peripheral with a unique identifier and optional CoreBluetooth peripheral data. The integrating app
-    /// should use this initializer to create a `Peripheral` instance when it has a unique identifier for a peripheral
-    /// but has not yet discovered the peripheral with CoreBluetooth. ReliaBLE will update the instance
-    /// with CoreBluetooth data when the peripheral is discovered.
+    /// Creates a peripheral with a unique identifier and optional CoreBluetooth discovery data.
+    ///
+    /// Prefer observing ``ReliaBLEManager/discoveredPeripherals`` for devices discovered during scanning.
+    /// ReliaBLE updates only the ``Peripheral`` instances it manages internally and emits through that publisher.
     /// - Parameters:
     ///  - id: Unique identifier for the peripheral as set by the integrating app.
     ///  - peripheral: Reference to the CoreBluetooth `CBPeripheral` object
