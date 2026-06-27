@@ -26,9 +26,12 @@ jobs:
       - name: Build DocC catalog
         run: swift package generate-documentation --target ReliaBLE --warnings-as-errors
 
+      - name: Archive DocC output
+        run: ditto -c -k --sequesterRsrc --keepParent .build/plugins/Swift-DocC/outputs/ReliaBLE.doccarchive ReliaBLE.doccarchive.zip
+
       - name: Upload DocC archive
         uses: actions/upload-artifact@v4
         with:
           name: ReliaBLE.doccarchive
-          path: .build/plugins/Swift-DocC/outputs/ReliaBLE.doccarchive
+          path: ReliaBLE.doccarchive.zip
           if-no-files-found: error
