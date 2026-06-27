@@ -27,10 +27,25 @@
 import Testing
 @testable import ReliaBLEMock
 
-@Test func correctFunction() async throws {
-    // Write your test here and use APIs like `#expect(...)` to check expected conditions.
-    let package = ReliaBLEManager()
-    #expect(package.testFunction() == "Hello, this is ReliaBLE!", "Incorrect response string")
+@Test func reliaBLEManagerIsSendable() async throws {
+    let manager = ReliaBLEManager()
+
+    // Capturing the manager in a `Task.detached` closure and exercising every public member is a
+    // compile-time proof that `ReliaBLEManager` is `Sendable` — the closure crosses an isolation
+    // boundary. The calls run against the mock with no central manager, so they safely no-op or
+    // throw, which is irrelevant: this test asserts compilation, not behavior.
+    await Task.detached {
+        _ = manager.loggingService
+        _ = await manager.currentState
+        _ = manager.state
+        _ = manager.peripheralDiscoveries
+        _ = manager.discoveredPeripherals
+        try? await manager.authorizeBluetooth()
+        await manager.startScanning()
+        await manager.startScanning(services: [])
+        await manager.stopScanning()
+        try? await manager.connect(to: Peripheral(id: "unused"))
+    }.value
 }
 
 @Test func peripheralIsSendable() async throws {

@@ -31,7 +31,7 @@ import Foundation
 ///
 /// CoreBluetooth surfaces advertisement data as a loosely-typed `[String: Any]` dictionary keyed by
 /// `CBAdvertisementData*` constants. ``AdvertisementData`` extracts those values once, at discovery time and inside
-/// ``BluetoothActor``, so the untyped dictionary never crosses the actor boundary into the public surface.
+/// the library's internal concurrency domain, so the untyped dictionary never crosses into the public surface.
 ///
 /// - Note: This is a typed-only representation. Vendor-specific or otherwise non-standard advertisement keys are not
 ///   currently surfaced; a raw escape hatch may be added in a future release if needed.
@@ -63,7 +63,7 @@ public struct AdvertisementData: Sendable, Hashable {
     /// Extracts a typed snapshot from CoreBluetooth's raw advertisement dictionary.
     ///
     /// This initializer is intentionally internal: the untyped `[String: Any]` should be extracted exactly once,
-    /// inside ``BluetoothActor``, and never exposed to consumers.
+    /// inside the library, and never exposed to consumers.
     ///
     /// - Parameter rawAdvertisementData: The advertisement dictionary delivered by
     ///   `centralManager(_:didDiscover:advertisementData:rssi:)`.

@@ -30,11 +30,15 @@ import Foundation
 import Willow
 
 /// The main entry point for the ReliaBLE library.
-public class ReliaBLEManager {
+///
+/// `ReliaBLEManager` is a `nonisolated`, `Sendable` value-like façade: it owns no mutable state and
+/// forwards every operation to a process-wide internal actor that serializes all Core Bluetooth
+/// interactions. Because it is not bound to any actor, it is callable directly from `@MainActor`
+/// SwiftUI code *and* from background actors without forcing a main-actor hop on background callers.
+public final class ReliaBLEManager: Sendable {
     public let loggingService: LoggingService
     
     private let log: LoggingService
-    private let bluetoothManager: BluetoothManager
     
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
@@ -49,7 +53,20 @@ public class ReliaBLEManager {
         loggingService.enabled = config.loggingEnabled
         
         log = loggingService
-        bluetoothManager = BluetoothManager(loggingService: loggingService)
+        
+        // `init` stays synchronous and dispatches actor setup via a fire-and-forget `Task`
+        // rather than awaiting it. The initial `setupCentralManager()` (if already
+        // `.allowedAlways`) and `updateState()` land on the actor's queue on the next
+        // run-loop turn.
+        //
+        // This does mean a caller that immediately awaits `startScanning()`/`stopScanning()`
+        // could in theory have that call's actor job ordered ahead of `initialize`'s, since
+        // Swift actors don't guarantee FIFO ordering across jobs enqueued from separate
+        // top-level Tasks. Both methods already guard on `centralManager == nil` and no-op
+        // with a log warning in that case, so the worst case is a missed scan start rather
+        // than a crash. Revisit if this race proves observable in practice — e.g. by making
+        // `init` `async` or exposing an explicit `await manager.ready()`.
+        Task { await BluetoothActor.shared.initialize(log: loggingService) }
     }
     
     // MARK: - State
@@ -65,12 +82,14 @@ public class ReliaBLEManager {
     /// }
     /// ```
     public var state: AsyncStream<BluetoothState> {
-        bluetoothManager.state
+        BluetoothActor.shared.stateStream()
     }
     
-    /// Synchronous, thread-safe access to the current state of the underlying Core Bluetooth system.
+    /// Asynchronous, thread-safe access to the current state of the underlying Core Bluetooth
+    /// system. The read is serialized on the library's internal concurrency domain, so the access
+    /// is `await`-ed.
     public var currentState: BluetoothState {
-        bluetoothManager.currentState
+        get async { await BluetoothActor.shared.currentBluetoothState }
     }
     
     /// Requests authorization to use Bluetooth. This method will throw an error if the user has denied or restricted
@@ -78,7 +97,7 @@ public class ReliaBLEManager {
     ///
     /// - Throws: An ``AuthorizationError`` error if the user has denied or restricted Bluetooth access.
     public func authorizeBluetooth() async throws {
-        try await bluetoothManager.authorize()
+        try await BluetoothActor.shared.authorize()
     }
     
     // MARK: - Scanning
@@ -91,14 +110,14 @@ public class ReliaBLEManager {
     /// ``discoveredPeripherals`` this stream does **not** replay a value on subscription — subscribe
     /// before you start scanning to avoid missing early advertisements.
     public var peripheralDiscoveries: AsyncStream<PeripheralDiscoveryEvent> {
-        bluetoothManager.peripheralDiscoveries
+        BluetoothActor.shared.peripheralDiscoveriesStream()
     }
 
     /// A multi-subscriber `AsyncStream` that emits the current de-duplicated list of discovered
     /// peripherals each time it changes. Each property access returns a fresh, independent stream;
     /// the current list is replayed as the first element on subscription.
     public var discoveredPeripherals: AsyncStream<[Peripheral]> {
-        bluetoothManager.discoveredPeripherals
+        BluetoothActor.shared.discoveredPeripheralsStream()
     }
     
     /// Starts scanning for peripheral devices, optionally filtering by specific services.
@@ -109,12 +128,12 @@ public class ReliaBLEManager {
     /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
     /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
     public func startScanning(services: sending [CBUUID]? = nil) async {
-        await bluetoothManager.startScanning(services: services)
+        await BluetoothActor.shared.startScanning(services: services)
     }
     
     /// Stops scanning for peripheral devices.
     public func stopScanning() async {
-        await bluetoothManager.stopScanning()
+        await BluetoothActor.shared.stopScanning()
     }
     
     // MARK: - Connection
@@ -131,10 +150,87 @@ public class ReliaBLEManager {
     /// - Note: This currently only initiates the connection request. The full connection lifecycle is deferred to a
     ///   later release.
     public func connect(to peripheral: Peripheral) async throws {
-        try await bluetoothManager.connect(to: peripheral)
+        try await BluetoothActor.shared.connect(id: peripheral.id)
     }
+}
+
+// MARK: - Public Types
+
+/// A typealias for the authorization status of the Core Bluetooth manager.
+///
+/// This typealias maps `CBManagerAuthorization` to `AuthorizationStatus`, providing a more readable and convenient
+/// way to refer to the authorization status of the Bluetooth manager in the code.
+public typealias AuthorizationStatus = CBManagerAuthorization
+
+/// Represents the various states of the underlying Core Bluetooth system, as surfaced by ReliaBLE.
+///
+/// This enumeration provides a thread-safe representation of possible Bluetooth states that can be used across
+/// concurrent environments.
+public enum BluetoothState: Sendable {
+    /// ReliaBLE is currently scanning for peripherals.
+    case scanning
+    /// Bluetooth is powered on and ReliaBLE is ready to use.
+    case ready
+    /// Bluetooth is currently powered off on the device.
+    case poweredOff
+    /// Indicates the connection with the system service was momentarily lost.
+    ///
+    /// This state indicates that Bluetooth is trying to reconnect. After it reconnects, ReliaBLE updates the
+    /// state value.
+    case resetting
+    /// The app is not authorized to use Bluetooth. Associated value provides specific authorization status.
+    case unauthorized(AuthorizationStatus)
+    /// The platform doesn't support Bluetooth Low Energy.
+    case unsupported
+    /// The state of the underlying Core Bluetooth system is unknown.
+    ///
+    /// This is a temporary state. After Core Bluetooth initializes or resets, ReliaBLE updates the
+    /// state value.
+    case unknown
     
-    func testFunction() -> String {
-        return "Hello, this is ReliaBLE!"
+    /// A user-friendly string representation of the `BluetoothState`.
+    ///
+    /// - Returns: A string describing the `BluetoothState`.
+    public var description: String {
+        switch self {
+        case .scanning:
+            "Scanning"
+        case .ready:
+            "Ready"
+        case .poweredOff:
+            "Powered Off"
+        case .resetting:
+            "Resetting"
+        case .unauthorized(let authorizationStatus):
+            switch authorizationStatus {
+            case .notDetermined:
+                "Not Authorized"
+            case .restricted:
+                "Restricted"
+            case .denied:
+                "Denied"
+            default:
+                "Unauthorized"
+            }
+        case .unsupported:
+            "Unsupported"
+        case .unknown:
+            "Unknown"
+        }
     }
+}
+
+// MARK: Errors
+
+/// A Swift error enumeration representing authorization-related errors in Bluetooth operations.
+///
+/// This type conforms to Swift's `Error` protocol and encapsulates various authorization failures that may occur
+/// during Bluetooth operations.
+public enum AuthorizationError: Error {
+    /// The user explicitly denied Bluetooth access for this app.
+    case denied
+    /// Indicates this app isn’t authorized to use Bluetooth.
+    case restricted
+    /// The authorization status is unknown.
+    case unknown
 }

@@ -29,13 +29,13 @@ import Foundation
 /// An immutable, `Sendable` value snapshot of a Bluetooth peripheral and its metadata.
 ///
 /// A `Peripheral` carries no reference to the underlying CoreBluetooth `CBPeripheral`. The live `CBPeripheral` is
-/// owned exclusively by ``BluetoothActor`` in an `id`-keyed registry that never escapes the actor. Operations that
-/// need the live peripheral (such as ``ReliaBLEManager/connect(to:)``) forward the snapshot's ``id``; the actor looks
-/// up the live reference and throws ``PeripheralError/notFound`` if the snapshot has since gone stale.
+/// owned exclusively by the library in an `id`-keyed registry that never escapes its internal concurrency domain.
+/// Operations that need the live peripheral (such as ``ReliaBLEManager/connect(to:)``) forward the snapshot's ``id``;
+/// the actor looks up the live reference and throws ``PeripheralError/notFound`` if the snapshot has since gone stale.
 ///
 /// The integrating app can also construct a `Peripheral` from a known identifier *before* it has been discovered —
 /// for example, a wearable bound to the user's account — using ``init(id:)``. Such a snapshot has no
-/// ``advertisement`` (and no live reference) until ``BluetoothActor`` matches it against a discovered `CBPeripheral`.
+/// ``advertisement`` (and no live reference) until ReliaBLE matches it against a discovered `CBPeripheral`.
 ///
 /// Because it is a pure value type, a `Peripheral` is freely sendable across isolation domains and safe to hand to
 /// the integrating app for UI display.
@@ -79,7 +79,7 @@ public struct Peripheral: Sendable, Identifiable, Hashable {
         self.init(id: id, cbIdentifier: nil, name: nil, rssi: nil, lastSeen: nil, advertisement: nil)
     }
 
-    /// Creates a fully-specified peripheral snapshot. Used internally by ``BluetoothActor`` at discovery time.
+    /// Creates a fully-specified peripheral snapshot. Used internally at discovery time.
     ///
     /// - Parameters:
     ///   - id: Unique identifier for the peripheral.
@@ -110,7 +110,7 @@ public struct Peripheral: Sendable, Identifiable, Hashable {
 
     public static func == (lhs: Peripheral, rhs: Peripheral) -> Bool {
         // Equality keys on `id` only: the identifier is unique and the matching between `Peripheral` snapshots and
-        // their live `CBPeripheral` is handled internally by ``BluetoothActor``.
+        // their live `CBPeripheral` is handled internally by the library.
         return lhs.id == rhs.id
     }
 }
