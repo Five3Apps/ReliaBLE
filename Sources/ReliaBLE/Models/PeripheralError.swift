@@ -30,7 +30,7 @@ public enum PeripheralError: Error, Sendable {
     /// The peripheral is no longer known to the library.
     ///
     /// A ``Peripheral`` is a value snapshot captured at discovery time. The live CoreBluetooth peripheral it refers to
-    /// is held inside ``BluetoothActor`` keyed by ``Peripheral/id``. If that reference has since been invalidated (for
+    /// is held internally by the library keyed by ``Peripheral/id``. If that reference has since been invalidated (for
     /// example, after Bluetooth reset) the snapshot is stale and operations that require the live peripheral throw
     /// this error.
     case notFound

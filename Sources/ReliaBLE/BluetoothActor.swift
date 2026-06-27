@@ -58,10 +58,9 @@ private struct DiscoveryPayload: @unchecked Sendable {
 /// actor's isolation via `Task { @BluetoothActor in … }` inside the nonisolated
 /// ``BluetoothDelegateShim``.
 @globalActor
-public actor BluetoothActor {
-
+actor BluetoothActor {
     /// The process-lifetime shared instance.
-    public static let shared = BluetoothActor()
+    static let shared = BluetoothActor()
 
     // MARK: - Actor-Isolated State
 
@@ -69,6 +68,9 @@ public actor BluetoothActor {
 
     var centralManager: CBCentralManager?
     private var delegateShim: BluetoothDelegateShim?
+    
+    /// The current Bluetooth state.
+    var currentBluetoothState: BluetoothState = .unknown
 
     var log: LoggingService?
 
@@ -90,16 +92,6 @@ public actor BluetoothActor {
     private var stateContinuations: [UUID: AsyncStream<BluetoothState>.Continuation] = [:]
     private var discoveryContinuations: [UUID: AsyncStream<PeripheralDiscoveryEvent>.Continuation] = [:]
     private var peripheralsContinuations: [UUID: AsyncStream<[Peripheral]>.Continuation] = [:]
-
-    // MARK: - nonisolated(unsafe) Bridging Property
-
-    /// Synchronous snapshot of the current Bluetooth state.
-    ///
-    /// Written only from `broadcastState(_:)` on the actor's serial executor — safe for concurrent
-    /// reads (value semantics, no partial writes). Retained as the backing store for the
-    /// synchronous `currentState` accessor and as the replay value handed to each new
-    /// `stateStream()` subscriber.
-    nonisolated(unsafe) var currentBluetoothState: BluetoothState = .unknown
 
     // MARK: - Initialization
 
@@ -199,7 +191,7 @@ public actor BluetoothActor {
 
     /// Configures the actor with a logger, conditionally sets up the central manager if
     /// Bluetooth is already authorized, then broadcasts the initial state. Called once from
-    /// `BluetoothManager.init` via a fire-and-forget `Task`.
+    /// `ReliaBLEManager.init` via a fire-and-forget `Task`.
     func initialize(log: LoggingService) {
         configure(log: log)
         if CBCentralManager.authorization == .allowedAlways {
@@ -318,8 +310,8 @@ public actor BluetoothActor {
     }
 
     private func broadcastState(_ state: BluetoothState) {
-        // nonisolated(unsafe) write — safe: written only from the actor's serial executor. Also
-        // serves as the replay value handed to each new `stateStream()` subscriber.
+        // Update the actor-isolated snapshot first; it backs the async `currentState` accessor and
+        // is replayed to each new `stateStream()` subscriber during registration.
         currentBluetoothState = state
         broadcast(state, to: stateContinuations)
     }

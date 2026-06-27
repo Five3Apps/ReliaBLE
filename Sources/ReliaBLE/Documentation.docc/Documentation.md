@@ -22,7 +22,7 @@ This is a temporary overview.
 
 ### Concurrency
 
-- ``BluetoothActor``
+- ``ReliaBLEManager`` — a `nonisolated`, `Sendable` façade; all Core Bluetooth state is serialized internally
 
 ### Advanced Usage
 
