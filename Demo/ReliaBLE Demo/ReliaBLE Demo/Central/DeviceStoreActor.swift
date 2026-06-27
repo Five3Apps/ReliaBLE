@@ -44,10 +44,12 @@ actor DeviceStoreActor: ModelActor {
         self.modelContainer = modelContainer
     }
 
-    /// Creates a background-isolated store. Call from a nonisolated `async` context — not from
-    /// `@MainActor` — so `ModelActor` does not inherit main-thread execution.
+    /// Creates a background-isolated store. Safe to call from `@MainActor` (e.g. SwiftUI `.task`);
+    /// construction is explicitly detached so `ModelActor` does not inherit main-thread execution.
     static nonisolated func create(container: ModelContainer) async -> DeviceStoreActor {
-        DeviceStoreActor(modelContainer: container)
+        await Task.detached {
+            DeviceStoreActor(modelContainer: container)
+        }.value
     }
 
     func insertDiscovery(_ discoveryEvent: PeripheralDiscoveryEvent) {
@@ -73,7 +75,7 @@ actor DeviceStoreActor: ModelActor {
                     existingDevice.name = peripheral.name
                     existingDevice.lastSeen = peripheral.lastSeen
                 } else {
-                    let newDevice = Device(id: peripheral.id, name: peripheral.name, lastSeen: Date())
+                    let newDevice = Device(id: peripheral.id, name: peripheral.name, lastSeen: peripheral.lastSeen)
                     modelContext.insert(newDevice)
                 }
             }
