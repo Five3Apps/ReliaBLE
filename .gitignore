@@ -33,6 +33,7 @@ Packages/
 .swiftpm
 
 .build/
+docc-output/
 DerivedData/
 
 # CocoaPods
