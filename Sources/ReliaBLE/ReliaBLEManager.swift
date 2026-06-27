@@ -226,7 +226,7 @@ public enum BluetoothState: Sendable {
 ///
 /// This type conforms to Swift's `Error` protocol and encapsulates various authorization failures that may occur
 /// during Bluetooth operations.
-public enum AuthorizationError: Error {
+public enum AuthorizationError: Error, Sendable {
     /// The user explicitly denied Bluetooth access for this app.
     case denied
     /// Indicates this app isn’t authorized to use Bluetooth.
