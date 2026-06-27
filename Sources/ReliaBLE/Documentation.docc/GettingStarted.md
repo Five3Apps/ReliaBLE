@@ -85,7 +85,7 @@ Example of starting and stopping a scan for all peripherals:
 
 ```swift
 // Check if Bluetooth is ready
-if bleManager.currentState == .ready {
+if await bleManager.currentState == .ready {
     await bleManager.startScanning()
 
     // Stop scanning after 10 seconds
@@ -103,7 +103,7 @@ Example of scanning for peripherals with specific services (e.g., Heart Rate and
 import CoreBluetooth
 
 // Check if Bluetooth is ready
-if bleManager.currentState == .ready {
+if await bleManager.currentState == .ready {
     let serviceUUIDs = [CBUUID(string: "180D"), CBUUID(string: "180F")] // Heart Rate and Battery services
     await bleManager.startScanning(services: serviceUUIDs)
 
