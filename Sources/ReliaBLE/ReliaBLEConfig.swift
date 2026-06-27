@@ -32,7 +32,7 @@ public typealias LogLevel = Willow.LogLevel
 
 /// The `ReliaBLEConfig` struct defines the configuration options for the ReliaBLE library. This struct is used to
 /// configure the logging service used by ReliaBLE.
-public struct ReliaBLEConfig {
+public struct ReliaBLEConfig: Sendable {
     /// The log levels to that will be send to ``logWriters`` for logging. The default value is all log levels.
     public var logLevels = LogLevel.all
 
