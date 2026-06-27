@@ -33,17 +33,17 @@ import ReliaBLE
 struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.bleManager) private var reliaBLE
-    
+
     @Query private var discoveries: [DiscoveryEvent]
     @Query private var devices: [Device]
-    
+
     @State private var viewModel = CentralViewModel()
     @State private var selectedView: String = "Devices"
-    
+
     var body: some View {
         NavigationSplitView {
             Text("ReliaBLE state: \(viewModel.currentState.description)")
-            
+
             if case BluetoothState.unauthorized(let authState) = viewModel.currentState, authState == .notDetermined {
                 Button("Authorize Bluetooth") {
                     viewModel.authorizeBluetooth()
@@ -53,7 +53,7 @@ struct CentralView: View {
                 TextField("Enter service UUIDs (comma-separated)", text: $viewModel.servicesInput)
                     .textFieldStyle(.roundedBorder)
                     .padding()
-                
+
                 Button("Start Scanning") {
                     viewModel.startScanning()
                 }
@@ -64,14 +64,14 @@ struct CentralView: View {
                 }
                 .buttonStyle(.bordered)
             }
-            
+
             Picker("Select View", selection: $selectedView) {
                 Text("Devices").tag("Devices")
                 Text("Discoveries").tag("Discoveries")
             }
             .pickerStyle(SegmentedPickerStyle())
             .padding()
-            
+
             Group {
                 if selectedView == "Devices" {
                     deviceList
@@ -94,26 +94,31 @@ struct CentralView: View {
         } detail: {
             Text("Select a device")
         }
-        .onAppear {
-            viewModel.setDependencies(modelContext: modelContext, reliaBLE: reliaBLE)
-        }
         .task {
-            for await state in reliaBLE.state {
-                viewModel.updateState(state)
-            }
-        }
-        .task {
-            for await discoveryEvent in reliaBLE.peripheralDiscoveries {
-                viewModel.insertDiscovery(discoveryEvent, into: modelContext)
-            }
-        }
-        .task {
-            for await peripherals in reliaBLE.discoveredPeripherals {
-                viewModel.syncDevices(peripherals, into: modelContext)
+            let manager = reliaBLE
+            let store = await DeviceStoreActor.create(container: modelContext.container)
+            viewModel.setDependencies(deviceStore: store, reliaBLE: manager)
+
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    for await state in manager.state {
+                        await viewModel.updateState(state)
+                    }
+                }
+                group.addTask {
+                    for await discoveryEvent in manager.peripheralDiscoveries {
+                        await store.insertDiscovery(discoveryEvent)
+                    }
+                }
+                group.addTask {
+                    for await peripherals in manager.discoveredPeripherals {
+                        await store.syncDevices(peripherals)
+                    }
+                }
             }
         }
     }
-    
+
     private var deviceList: some View {
         List {
             ForEach(devices) { device in
@@ -126,12 +131,12 @@ struct CentralView: View {
                 }
             }
             .onDelete { offsets in
-                let itemsToDelete = offsets.map { devices[$0] }
-                viewModel.deleteDevices(itemsToDelete)
+                let ids = offsets.map { devices[$0].persistentModelID }
+                viewModel.deleteDevices(ids: ids)
             }
         }
     }
-    
+
     private var discoveriesList: some View {
         List {
             ForEach(discoveries) { discoveryEvent in
@@ -144,8 +149,8 @@ struct CentralView: View {
                 }
             }
             .onDelete { offsets in
-                let itemsToDelete = offsets.map { discoveries[$0] }
-                viewModel.deleteDiscoveries(itemsToDelete)
+                let ids = offsets.map { discoveries[$0].persistentModelID }
+                viewModel.deleteDiscoveries(ids: ids)
             }
         }
     }
