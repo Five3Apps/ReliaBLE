@@ -68,7 +68,7 @@ public class Peripheral: Identifiable, Hashable {
     
     /// Create a peripheral with a unique identifier and optional CoreBluetooth peripheral data. The integrating app
     /// should use this initializer to create a `Peripheral` instance when it has a unique identifier for a peripheral
-    /// but has not yet discovered the peripheral with CoreBluetooth. The ``PeripheralManager`` will update the instance
+    /// but has not yet discovered the peripheral with CoreBluetooth. ReliaBLE will update the instance
     /// with CoreBluetooth data when the peripheral is discovered.
     /// - Parameters:
     ///  - id: Unique identifier for the peripheral as set by the integrating app.
