@@ -20,9 +20,10 @@ This is a temporary overview.
 - ``PeripheralDiscoveryEvent``
 - ``PeripheralError``
 
-### Concurrency
+### Concurrency & Isolation
 
-- ``ReliaBLEManager`` — a `nonisolated`, `Sendable` façade; all Core Bluetooth state is serialized internally
+- <doc:Concurrency>
+- ``ReliaBLEManager``
 
 ### Advanced Usage
 

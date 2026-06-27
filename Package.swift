@@ -21,7 +21,8 @@ let package = Package(
     targets: [
         .target(
             name: "ReliaBLE",
-            dependencies: ["Willow"]
+            dependencies: ["Willow"],
+            swiftSettings: [.swiftLanguageMode(.v6), .enableExperimentalFeature("StrictConcurrency")]
         ),
         .target(
             name: "ReliaBLEMock",
@@ -29,11 +30,13 @@ let package = Package(
                 "Willow",
                 .product(name: "CoreBluetoothMock", package: "IOS-CoreBluetooth-Mock")
             ],
-            exclude: ["ReliaBLE/CBCentralManagerFactory.swift", "ReliaBLE/Documentation.docc"]
+            exclude: ["ReliaBLE/CBCentralManagerFactory.swift", "ReliaBLE/Documentation.docc"],
+            swiftSettings: [.swiftLanguageMode(.v6), .enableExperimentalFeature("StrictConcurrency")]
         ),
         .testTarget(
             name: "ReliaBLETests",
-            dependencies: ["ReliaBLEMock"]
+            dependencies: ["ReliaBLEMock"],
+            swiftSettings: [.swiftLanguageMode(.v6), .enableExperimentalFeature("StrictConcurrency")]
         ),
     ]
 )
