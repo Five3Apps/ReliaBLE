@@ -42,7 +42,7 @@ Scheme: **"ReliaBLE Demo"**.
 
 `ReliaBLE Demo.xcodeproj` lives at `Demo/ReliaBLE Demo/ReliaBLE Demo.xcodeproj`. The app is a 3-tab SwiftUI app:
 
-- **Central** (`Central/`) — uses `ReliaBLEManager` (the library) to scan, surfaces discoveries into a SwiftData store. `CentralViewModel` is the only place the library's Combine publishers are subscribed. State observed via `@Observable`.
+- **Central** (`Central/`) — uses `ReliaBLEManager` (the library) to scan, surfaces discoveries into a SwiftData store. `CentralView` subscribes to the library's `AsyncStream` surfaces in `.task { for await … }` loops; `CentralViewModel` holds UI state and BLE actions only. All SwiftData writes go through `DeviceStoreActor` (`@ModelActor`). State observed via `@Observable`.
 - **Peripheral** (`Peripheral/`) — uses raw `CBPeripheralManager` directly (not the library — the library doesn't yet expose peripheral mode). This is intentional; the demo shows both sides of BLE even though only the central side flows through ReliaBLE.
 - **Settings** (`Settings/`) — app-level toggles.
 
@@ -50,7 +50,7 @@ Scheme: **"ReliaBLE Demo"**.
 
 - `ReliaBLE_DemoApp.swift` constructs a single `ReliaBLEManager` with `loggingEnabled = true` and injects it via a custom `EnvironmentKey` (`@Environment(\.bleManager)`).
 - There's also a `BLEManagerKey.defaultValue` for previews — keep that working when changing the env injection.
-- A `ModelContainer` for `Device` and `DiscoveryEvent` is set on the root scene. `CentralViewModel` writes both kinds of records as the library emits events.
+- A `ModelContainer` for `Device` and `DiscoveryEvent` is set on the root scene. `CentralView` creates a `DeviceStoreActor` off the main thread via `DeviceStoreActor.create(container:)` and routes all SwiftData writes through it as the library emits events. Reads stay on `@MainActor` via `@Query`.
 
 ## Swift Concurrency
 
@@ -58,8 +58,12 @@ The library is built with Swift 6 and **complete concurrency checking**. Therefo
 
 ### SwiftData models
 
-- `Device` — one row per unique discovered peripheral (by `ReliaBLE.Peripheral.id`), updated on each `discoveredPeripherals` publisher tick.
-- `DiscoveryEvent` — one row per raw advertisement (every `peripheralDiscoveries` event). Grows quickly; "Clear All Data" in the Central view nukes both tables.
+- `Device` — one row per unique discovered peripheral (by `ReliaBLE.Peripheral.id`), updated on each `discoveredPeripherals` stream tick via `DeviceStoreActor.syncDevices`.
+- `DiscoveryEvent` — one row per raw advertisement (every `peripheralDiscoveries` event), inserted via `DeviceStoreActor.insertDiscovery`. Grows quickly; "Clear All Data" in the Central view nukes both tables.
+
+### Off-main persistence pattern
+
+`DeviceStoreActor` is the canonical pattern for library consumers: hold `ReliaBLEManager` on the main actor, consume `AsyncStream`s in `.task`, and `await` the store for every SwiftData write. See the file-level comment in `Central/DeviceStoreActor.swift`.
 
 ## Don't
 
