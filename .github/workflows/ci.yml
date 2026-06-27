@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docc:
+    name: DocC catalog
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Verify Swift version
+        run: swift --version
+
+      - name: Build DocC catalog
+        run: swift package generate-documentation --target ReliaBLE --warnings-as-errors
+
+      - name: Upload DocC archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReliaBLE.doccarchive
+          path: .build/plugins/Swift-DocC/outputs/ReliaBLE.doccarchive
+          if-no-files-found: error
