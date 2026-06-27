@@ -48,7 +48,7 @@ CentralView (@MainActor reads via @Query)
 
 **`DeviceStoreActor` design:**
 - Manual `ModelActor` conformance (not the `@ModelActor` macro) with an explicit `init(modelContainer:)` and `nonisolated let modelExecutor` / `modelContainer` — the macro's synthesized initializer is not accessible from outside the type, which blocked environment-key and preview construction.
-- `static nonisolated func create(container:) async -> DeviceStoreActor` — **critical**: SwiftData `ModelActor` inherits the thread of its creation context. Initializing on `@MainActor` (e.g. in `App.init` or a synchronous environment default) pins writes to the main thread despite the actor label. The factory must be called from a `nonisolated async` context so the actor actually runs in the background.
+- `static nonisolated func create(container:) async -> DeviceStoreActor` — **critical**: SwiftData `ModelActor` inherits the thread of its creation context. Initializing on `@MainActor` (e.g. in `App.init`, a SwiftUI `.task`, or a synchronous environment default) pins writes to the main thread despite the actor label. The factory wraps construction in `Task.detached` so callers can safely invoke it from any context.
 - Write methods: `insertDiscovery`, `syncDevices`, `clearAll`, `deleteDiscoveries(ids:)`, `deleteDevices(ids:)`. Swipe-delete passes `PersistentIdentifier` (Sendable) rather than `@Model` class instances.
 - `#if DEBUG` `assert(!Thread.isMainThread)` in every write method — acceptance-criteria guard.
 - File-level doc comment pointing consumers at this as the canonical off-main persistence pattern.

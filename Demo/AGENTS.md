@@ -42,7 +42,7 @@ Scheme: **"ReliaBLE Demo"**.
 
 `ReliaBLE Demo.xcodeproj` lives at `Demo/ReliaBLE Demo/ReliaBLE Demo.xcodeproj`. The app is a 3-tab SwiftUI app:
 
-- **Central** (`Central/`) — uses `ReliaBLEManager` (the library) to scan, surfaces discoveries into a SwiftData store. `CentralView` subscribes to the library's `AsyncStream` surfaces in `.task { for await … }` loops; `CentralViewModel` holds UI state and BLE actions only. All SwiftData writes go through `DeviceStoreActor` (`@ModelActor`). State observed via `@Observable`.
+- **Central** (`Central/`) — uses `ReliaBLEManager` (the library) to scan, surfaces discoveries into a SwiftData store. `CentralView` subscribes to the library's `AsyncStream` surfaces in `.task { for await … }` loops; `CentralViewModel` holds UI state and BLE actions only. All SwiftData writes go through `DeviceStoreActor` (manual `ModelActor` conformance). State observed via `@Observable`.
 - **Peripheral** (`Peripheral/`) — uses raw `CBPeripheralManager` directly (not the library — the library doesn't yet expose peripheral mode). This is intentional; the demo shows both sides of BLE even though only the central side flows through ReliaBLE.
 - **Settings** (`Settings/`) — app-level toggles.
 
