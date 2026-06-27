@@ -45,6 +45,11 @@ public typealias ConsoleWriter = Willow.ConsoleWriter
 
 /// The OSLogWriter class runs all modifiers in the order they were created and passes the resulting message
 /// off to an OSLog with the specified subsystem and category.
+///
+/// Sendable is synthesized for this `final class` from immutable `let` stored properties of Sendable types
+/// (`String`, `[LogModifier]`, `OSLog`). No explicit conformance is required under Swift 6 strict concurrency.
+/// If a future Willow or SDK change breaks synthesis, fall back to `: LogModifierWriter, @unchecked Sendable`
+/// (matching upstream `Willow.OSLogWriter`). Do not apply `@unchecked` unless a build actually fails.
 public final class OSLogWriter: LogModifierWriter {
     public let subsystem: String
     public let category: String
