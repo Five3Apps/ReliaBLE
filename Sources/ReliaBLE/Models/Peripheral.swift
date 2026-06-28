@@ -24,98 +24,93 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
-import CoreBluetooth
 import Foundation
 
-/// A representation of a discovered Bluetooth peripheral with metadata.
+/// An immutable, `Sendable` value snapshot of a Bluetooth peripheral and its metadata.
 ///
-/// This peripheral is a wrapper around the CoreBluetooth `CBPeripheral` object and provides additional metadata
-/// and functionality.
+/// A `Peripheral` carries no reference to the underlying CoreBluetooth `CBPeripheral`. The live `CBPeripheral` is
+/// owned exclusively by the library in an `id`-keyed registry that never escapes its internal concurrency domain.
+/// Operations that need the live peripheral (such as ``ReliaBLEManager/connect(to:)``) forward the snapshot's ``id``;
+/// the actor looks up the live reference and throws ``PeripheralError/notFound`` if the snapshot has since gone stale.
 ///
-/// A `Peripheral` can exist without a `CBPeripheral` but all `CBPeripherals` will have a corresponding `Peripheral`.
-/// This allows the integrating app to request communiication with a peripheral prior to it having been discovered
-/// by CoreBluetooth, or if CoreBluetooth has invalidated all of its `CBPeripherals`.
-public class Peripheral: Identifiable, Hashable {
-    /// Unique identifier for the peripheral as set by the integrating app.
+/// The integrating app can also construct a `Peripheral` from a known identifier *before* it has been discovered —
+/// for example, a wearable bound to the user's account — using ``init(id:)``. Such a snapshot has no
+/// ``advertisement`` (and no live reference) until ReliaBLE matches it against a discovered `CBPeripheral`.
+///
+/// Because it is a pure value type, a `Peripheral` is freely sendable across isolation domains and safe to hand to
+/// the integrating app for UI display.
+public struct Peripheral: Sendable, Identifiable, Hashable {
+    /// Unique identifier for the peripheral.
+    ///
+    /// When provided by the integrating app via ``init(id:)`` this is the app's own identifier. When resolved at
+    /// discovery time it is the peripheral's advertised name, its local name, or — as a fallback — the CoreBluetooth
+    /// identifier string.
     public let id: String
-    
-    /// The CoreBluetooth peripheral identifier, used to retrieve the peripheral after invalidation.
-    var peripheralIdentifier: UUID?
-    
-    /// Reference to the CoreBluetooth peripheral object
+
+    /// The CoreBluetooth identifier for the peripheral, used to retrieve it after invalidation.
     ///
-    /// - Warning: Intgrating app should not hold a strong reference!
-    var peripheral: CBPeripheral?
-    
-    /// The name advertised by the peripheral, if available
-    public var name: String? {
-        peripheral?.name ?? advertisementData?[CBAdvertisementDataLocalNameKey] as? String
-    }
-    
-    /// Advertised service UUIDs
-    public var serviceUUIDs: [CBUUID]? {
-        advertisementData?[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]
-    }
-    
-    /// Signal strength indicator (RSSI) of the most recent advertisement
-    public internal(set) var rssi: Int?
-    
-    /// Complete advertisement data dictionary from the most recent discovery
-    public internal(set) var advertisementData: [String: Any]?
-    
-    /// The timestamp when the peripheral was last seen
-    public internal(set) var lastSeen: Date?
-    
-    /// Creates a peripheral with a unique identifier and optional CoreBluetooth discovery data.
+    /// `nil` for an app-constructed peripheral that has not yet been discovered.
+    public let cbIdentifier: UUID?
+
+    /// The name advertised by the peripheral, if available.
+    public let name: String?
+
+    /// Signal strength indicator (RSSI) of the most recent advertisement.
+    public let rssi: Int?
+
+    /// The timestamp when the peripheral was last seen.
+    public let lastSeen: Date?
+
+    /// The typed advertisement data from the most recent discovery.
     ///
-    /// Prefer observing ``ReliaBLEManager/discoveredPeripherals`` for devices discovered during scanning.
-    /// ReliaBLE updates only the ``Peripheral`` instances it manages internally and emits through that publisher.
+    /// `nil` until the peripheral has been discovered. Advertisement data is transient, per-discovery information; it
+    /// is not the peripheral's connected GATT service catalog.
+    public let advertisement: AdvertisementData?
+
+    /// Registers a known peripheral before it has been discovered.
+    ///
+    /// Use this when the integrating app already has a stable identifier for a peripheral — such as a device bound to
+    /// the user's account — and wants ReliaBLE to match it against the corresponding `CBPeripheral` once discovered.
+    /// The resulting snapshot has no ``cbIdentifier``, ``name``, ``rssi``, ``lastSeen``, or ``advertisement`` until
+    /// discovery populates them.
+    ///
+    /// - Parameter id: The integrating app's unique identifier for the peripheral.
+    public init(id: String) {
+        self.init(id: id, cbIdentifier: nil, name: nil, rssi: nil, lastSeen: nil, advertisement: nil)
+    }
+
+    /// Creates a fully-specified peripheral snapshot. Used internally at discovery time.
+    ///
     /// - Parameters:
-    ///  - id: Unique identifier for the peripheral as set by the integrating app.
-    ///  - peripheral: Reference to the CoreBluetooth `CBPeripheral` object
-    ///  - advertisementData: Complete advertisement data dictionary from the most recent discovery
-    ///  - rssi: Signal strength indicator (RSSI) of the most recent advertisement
-    public init(id: String, peripheral: CBPeripheral? = nil, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
+    ///   - id: Unique identifier for the peripheral.
+    ///   - cbIdentifier: The CoreBluetooth identifier, used to re-resolve the live peripheral after invalidation.
+    ///   - name: The name advertised by the peripheral, if available.
+    ///   - rssi: Signal strength indicator (RSSI) of the most recent advertisement.
+    ///   - lastSeen: The timestamp when the peripheral was last seen.
+    ///   - advertisement: The typed advertisement data from the most recent discovery.
+    init(
+        id: String,
+        cbIdentifier: UUID? = nil,
+        name: String? = nil,
+        rssi: Int? = nil,
+        lastSeen: Date? = nil,
+        advertisement: AdvertisementData? = nil
+    ) {
         self.id = id
-        self.peripheralIdentifier = peripheral?.identifier
-        self.peripheral = peripheral
+        self.cbIdentifier = cbIdentifier
+        self.name = name
         self.rssi = rssi
-        self.advertisementData = advertisementData
-        
-        if peripheral != nil && rssi != nil {
-            // Only set the last seen date if we have a valid CBPeripheral and RSSI value.
-            // This indicates that we have received an advertisement from the peripheral.
-            self.lastSeen = Date()
-        }
+        self.lastSeen = lastSeen
+        self.advertisement = advertisement
     }
-    
-    func update(cbPeripheral: CBPeripheral, advertisementData: [String: Any]? = nil, rssi: Int? = nil) {
-        self.peripheralIdentifier = cbPeripheral.identifier
-        self.peripheral = cbPeripheral
-        self.advertisementData = advertisementData
-        self.rssi = rssi
-        
-        if rssi != nil {
-            // Only set the last seen date if we have a valid RSSI value.
-            // This indicates that we have received an advertisement from the peripheral.
-            self.lastSeen = Date()
-        }
-    }
-    
+
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
-    
+
     public static func == (lhs: Peripheral, rhs: Peripheral) -> Bool {
-        // Original implementation: lhs.id == rhs.id
-        
-        // Two peripherals should be considered equal if they have the same identifier. However,
-        // I have seen edge cases where the identifier did not change for a new CBPeripheral instance.
-        // https://developer.apple.com/forums/thread/742497
-        if lhs.id != rhs.id {
-            return false
-        }
-        
-        return lhs.peripheral === rhs.peripheral
+        // Equality keys on `id` only: the identifier is unique and the matching between `Peripheral` snapshots and
+        // their live `CBPeripheral` is handled internally by the library.
+        return lhs.id == rhs.id
     }
 }

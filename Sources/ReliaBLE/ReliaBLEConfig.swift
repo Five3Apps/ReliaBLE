@@ -24,7 +24,7 @@
 
 import Foundation
 
-@preconcurrency import Willow
+import Willow
 
 /// The `LogLevel` struct defines all the default log levels for ReliaBLE. Each default log level has a defined bitmask
 /// that is used to satisfy the raw value backing the log level.
@@ -32,7 +32,7 @@ public typealias LogLevel = Willow.LogLevel
 
 /// The `ReliaBLEConfig` struct defines the configuration options for the ReliaBLE library. This struct is used to
 /// configure the logging service used by ReliaBLE.
-public struct ReliaBLEConfig {
+public struct ReliaBLEConfig: Sendable {
     /// The log levels to that will be send to ``logWriters`` for logging. The default value is all log levels.
     public var logLevels = LogLevel.all
 

@@ -24,10 +24,10 @@
 
 import Foundation
 
-@preconcurrency import Willow
+import Willow
 
 /// Service for managing all logging within ReliaBLE.
-public class LoggingService {
+public final class LoggingService: Sendable {
     let willowLogger: Logger
     
     init(levels: LogLevel, writers: [LogWriter], queue: DispatchQueue) {

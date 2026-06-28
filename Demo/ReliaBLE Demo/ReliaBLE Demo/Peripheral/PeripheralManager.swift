@@ -27,28 +27,34 @@
 import CoreBluetooth
 import SwiftUI
 
-class PeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDelegate {
-    @Published var state: CBManagerState = .unknown
-    @Published var isAdvertising: Bool = false
-    private var peripheralManager: CBPeripheralManager!
+@Observable class PeripheralManager: NSObject, CBPeripheralManagerDelegate {
+    var state: CBManagerState = .unknown
+    var isAdvertising: Bool = false
+    private var peripheralManager: CBPeripheralManager?
     private var peripheralName: String = ""
     private var serviceUUID: CBUUID?
-
-    override init() {
-        super.init()
-        peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
-    }
 
     func startAdvertising(name: String, serviceUUID: CBUUID) {
         self.peripheralName = name
         self.serviceUUID = serviceUUID
-        peripheralManager.removeAllServices()
+
+        if peripheralManager == nil {
+            // Create the manager only at the point the user requests advertising.
+            // This avoids triggering a Bluetooth permission prompt on app launch.
+            // If authorization is notDetermined, this will prompt the user.
+            peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
+            // Actual advertising setup happens in peripheralManagerDidUpdateState once powered on.
+            return
+        }
+
+        guard peripheralManager?.state == .poweredOn else { return }
+        peripheralManager?.removeAllServices()
         let service = CBMutableService(type: serviceUUID, primary: true)
-        peripheralManager.add(service)
+        peripheralManager?.add(service)
     }
 
     func stopAdvertising() {
-        peripheralManager.stopAdvertising()
+        peripheralManager?.stopAdvertising()
         isAdvertising = false
     }
 
@@ -56,6 +62,15 @@ class PeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDelegate
         state = peripheral.state
         if state != .poweredOn {
             isAdvertising = false
+            return
+        }
+
+        // If the user requested advertising before or while the manager was initializing,
+        // proceed with adding the service now that we are powered on.
+        if let uuid = serviceUUID, !isAdvertising {
+            peripheral.removeAllServices()
+            let service = CBMutableService(type: uuid, primary: true)
+            peripheral.add(service)
         }
     }
 
@@ -68,7 +83,7 @@ class PeripheralManager: NSObject, ObservableObject, CBPeripheralManagerDelegate
             CBAdvertisementDataLocalNameKey: peripheralName,
             CBAdvertisementDataServiceUUIDsKey: [serviceUUID!]
         ]
-        peripheralManager.startAdvertising(advertisementData)
+        peripheralManager?.startAdvertising(advertisementData)
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {

@@ -1,0 +1,22 @@
+schemaVersion: 1
+enabledWorkflows:
+  - macos
+  - simulator
+  - coverage
+  - debugging
+  - device
+  - project-discovery
+  - swift-package
+  - xcode-ide
+debug: false
+sentryDisabled: false
+sessionDefaults:
+  scheme: ReliaBLE Demo
+  simulatorName: iPhone 17 Pro Max
+  simulatorId: C0B74568-2B47-4981-ACA8-389277E1BB02
+  deviceId: 3D0082F1-03D3-5FD1-8F46-55595E121B15
+  workspacePath: /Users/jus10sb/Documents/Five3Apps/Projects/OpenSource/ReliaBLE/ReliaBLE.xcworkspace
+setupPreferences:
+  platforms:
+    - iOS
+    - macOS

@@ -13,6 +13,18 @@ This is a temporary overview.
 - <doc:GettingStarted>
 - <doc:Logging>
 
+### Peripherals
+
+- ``Peripheral``
+- ``AdvertisementData``
+- ``PeripheralDiscoveryEvent``
+- ``PeripheralError``
+
+### Concurrency & Isolation
+
+- <doc:Concurrency>
+- ``ReliaBLEManager``
+
 ### Advanced Usage
 
 - <doc:Logging>
