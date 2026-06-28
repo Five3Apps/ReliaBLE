@@ -97,7 +97,7 @@ struct PeripheralView: View {
                         peripheralManager.startAdvertising(name: peripheralName, serviceUUID: uuid)
                     }
                 }
-                .disabled(!isValid || peripheralManager.state != .poweredOn || peripheralManager.isAdvertising)
+                .disabled(!isValid || peripheralManager.isAdvertising || (peripheralManager.state != .poweredOn && peripheralManager.state != .unknown))
                 Button("Stop Advertising") {
                     peripheralManager.stopAdvertising()
                 }
