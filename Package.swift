@@ -35,7 +35,11 @@ let package = Package(
         ),
         .testTarget(
             name: "ReliaBLETests",
-            dependencies: ["ReliaBLEMock"],
+            dependencies: [
+                "ReliaBLEMock",
+                "Willow",
+                .product(name: "CoreBluetoothMock", package: "IOS-CoreBluetooth-Mock")
+            ],
             swiftSettings: [.swiftLanguageMode(.v6), .enableExperimentalFeature("StrictConcurrency")]
         ),
     ]
