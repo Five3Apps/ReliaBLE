@@ -103,24 +103,34 @@ actor DeviceStoreActor: ModelActor {
 
     func deleteDiscoveries(ids: [PersistentIdentifier]) {
         assertWritesOffMainThread()
+        guard !ids.isEmpty else { return }
 
-        for id in ids {
-            if let event = modelContext.model(for: id) as? DiscoveryEvent {
+        let idSet = Set(ids)
+        do {
+            let events = try modelContext.fetch(FetchDescriptor<DiscoveryEvent>())
+            for event in events where idSet.contains(event.persistentModelID) {
                 modelContext.delete(event)
             }
+            try modelContext.save()
+        } catch {
+            print("Failed to delete discoveries: \(error)")
         }
-        try? modelContext.save()
     }
 
     func deleteDevices(ids: [PersistentIdentifier]) {
         assertWritesOffMainThread()
+        guard !ids.isEmpty else { return }
 
-        for id in ids {
-            if let device = modelContext.model(for: id) as? Device {
+        let idSet = Set(ids)
+        do {
+            let devices = try modelContext.fetch(FetchDescriptor<Device>())
+            for device in devices where idSet.contains(device.persistentModelID) {
                 modelContext.delete(device)
             }
+            try modelContext.save()
+        } catch {
+            print("Failed to delete devices: \(error)")
         }
-        try? modelContext.save()
     }
 
     private func assertWritesOffMainThread() {

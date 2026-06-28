@@ -66,15 +66,24 @@ import ReliaBLE
     }
 
     func clearAllData() {
-        Task { await deviceStore?.clearAll() }
+        guard let deviceStore else { return }
+        Task.detached {
+            await deviceStore.clearAll()
+        }
     }
 
     func deleteDiscoveries(ids: [PersistentIdentifier]) {
-        Task { await deviceStore?.deleteDiscoveries(ids: ids) }
+        guard let deviceStore else { return }
+        Task.detached {
+            await deviceStore.deleteDiscoveries(ids: ids)
+        }
     }
 
     func deleteDevices(ids: [PersistentIdentifier]) {
-        Task { await deviceStore?.deleteDevices(ids: ids) }
+        guard let deviceStore else { return }
+        Task.detached {
+            await deviceStore.deleteDevices(ids: ids)
+        }
     }
 
     private func parseServices(from input: String) -> [CBUUID]? {
