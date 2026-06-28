@@ -71,7 +71,9 @@ Replay semantics differ per stream:
 - ``ReliaBLEManager/discoveredPeripherals`` — replays the **latest** value to new
   subscribers (`.bufferingNewest(1)`).
 - ``ReliaBLEManager/peripheralDiscoveries`` — does **not** replay; a new
-  subscriber only receives discoveries that occur after it begins iterating.
+  subscriber only receives discoveries that occur after it begins iterating. Its
+  buffer is bounded (`.bufferingNewest`), so a slow subscriber drops the oldest
+  pending advertisements rather than growing memory without bound.
 
 Because each call returns an independent stream, multiple parts of your app can
 observe the same surface concurrently without interfering with one another.
