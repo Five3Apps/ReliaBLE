@@ -26,7 +26,7 @@
 
 
 /// Errors thrown by peripheral operations such as ``ReliaBLEManager/connect(to:)``.
-public enum PeripheralError: Error, Sendable {
+public enum PeripheralError: Error, Sendable, Equatable {
     /// The peripheral is no longer known to the library.
     ///
     /// A ``Peripheral`` is a value snapshot captured at discovery time. The live CoreBluetooth peripheral it refers to
@@ -34,4 +34,11 @@ public enum PeripheralError: Error, Sendable {
     /// example, after Bluetooth reset) the snapshot is stale and operations that require the live peripheral throw
     /// this error.
     case notFound
+
+    /// Bluetooth is unavailable, so the operation could not be performed.
+    ///
+    /// Thrown when a peripheral operation is attempted before the underlying `CBCentralManager` exists — for example,
+    /// because Bluetooth has not been authorized yet. Call ``ReliaBLEManager/authorizeBluetooth()`` and wait for a
+    /// ready state before retrying.
+    case bluetoothUnavailable
 }

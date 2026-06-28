@@ -45,6 +45,18 @@ private struct DiscoveryPayload: @unchecked Sendable {
     let rssi: Int
 }
 
+/// A single CoreBluetooth delegate callback, carried in delivery order across the nonisolated
+/// delegate-queue → ``BluetoothActor`` hop.
+///
+/// CoreBluetooth invokes delegate methods serially on its dispatch queue. ``BluetoothDelegateShim``
+/// yields one of these per callback into a single `AsyncStream`, and ``BluetoothActor`` drains them
+/// with a single consumer so the original callback ordering is preserved — independent per-callback
+/// `Task`s could be reordered before reaching the actor.
+private enum DelegateEvent: Sendable {
+    case stateUpdate
+    case discovered(DiscoveryPayload)
+}
+
 // MARK: - BluetoothActor
 
 /// Process-wide global actor that serializes all CoreBluetooth interactions.
@@ -68,7 +80,19 @@ actor BluetoothActor {
 
     var centralManager: CBCentralManager?
     private var delegateShim: BluetoothDelegateShim?
-    
+
+    /// Drains delegate callbacks in order. Lives for the process lifetime of the singleton actor.
+    private var delegateEventTask: Task<Void, Never>?
+
+    /// Tracks one-time actor setup so ``ensureInitialized(log:)`` is idempotent across the many
+    /// `ReliaBLEManager` façades that may share this process-wide actor.
+    private var isInitialized = false
+
+    /// Continuations for in-flight ``authorize()`` calls awaiting an authorization decision, keyed by a
+    /// per-call id so a cancelled call can resume just its own continuation. All pending continuations are
+    /// resumed together once `CBCentralManager.authorization` resolves away from `.notDetermined`.
+    private var authorizationContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+
     /// The current Bluetooth state.
     var currentBluetoothState: BluetoothState = .unknown
 
@@ -110,14 +134,26 @@ actor BluetoothActor {
         }
     }
 
+    /// Upper bound on the number of discovery events buffered for a single subscriber.
+    ///
+    /// A `PeripheralDiscoveryEvent` is small: a `UUID`, an optional name, an `Int` RSSI, and a typed
+    /// ``AdvertisementData`` snapshot whose backing advertisement payload is capped by the BLE spec at a few hundred
+    /// bytes — comfortably under ~1 KB per event including Swift/Foundation overhead. Bounding the buffer at 10,000
+    /// events caps a stalled or abandoned subscriber at roughly ~10 MB rather than letting it grow without limit,
+    /// while staying far above any realistic in-flight backlog.
+    static let discoveryBufferLimit = 10_000
+
     /// Returns a fresh `AsyncStream` of peripheral discovery events for a single subscriber.
     ///
     /// Unlike ``stateStream()`` and ``discoveredPeripheralsStream()`` this feed does **not** replay
     /// a value on subscription; a subscriber only receives advertisements observed after it
     /// registers. An advertisement that arrives in the narrow window between stream creation and
     /// continuation registration is missed — accepted for a lightweight advertisements feed.
+    ///
+    /// The buffer is bounded with `.bufferingNewest(`` discoveryBufferLimit ``)`: a slow or abandoned subscriber
+    /// drops the oldest pending advertisements rather than growing memory without bound.
     nonisolated func peripheralDiscoveriesStream() -> AsyncStream<PeripheralDiscoveryEvent> {
-        AsyncStream { continuation in
+        AsyncStream(bufferingPolicy: .bufferingNewest(BluetoothActor.discoveryBufferLimit)) { continuation in
             Task { await BluetoothActor.shared.register(discoveryContinuation: continuation) }
         }
     }
@@ -189,15 +225,36 @@ actor BluetoothActor {
         self.log = log
     }
 
-    /// Configures the actor with a logger, conditionally sets up the central manager if
-    /// Bluetooth is already authorized, then broadcasts the initial state. Called once from
-    /// `ReliaBLEManager.init` via a fire-and-forget `Task`.
-    func initialize(log: LoggingService) {
-        configure(log: log)
-        if CBCentralManager.authorization == .allowedAlways {
-            setupCentralManager()
+    /// Performs idempotent actor setup, funneled through by every public ``ReliaBLEManager`` entry point
+    /// before it acts — so an operation invoked immediately after `init` (whose setup runs in a
+    /// fire-and-forget `Task`) cannot race ahead of setup and silently no-op.
+    ///
+    /// The logger is configured exactly once. On *every* call this also creates the central manager if
+    /// Bluetooth is currently authorized (`.allowedAlways`) and one does not already exist — so an
+    /// operation issued after authorization is granted out-of-band (via Settings, app lifecycle, or
+    /// another owner) still finds a live manager instead of being permanently gated by the first call's
+    /// authorization status.
+    ///
+    /// Creating the central manager remains gated on existing `.allowedAlways` authorization, preserving
+    /// the lazy-permission contract: the iOS prompt only appears when the integrating app calls
+    /// ``ReliaBLEManager/authorizeBluetooth()``. The initial state is broadcast on first setup and
+    /// whenever the manager is created, but not on every redundant call.
+    func ensureInitialized(log: LoggingService) {
+        let firstInitialization = !isInitialized
+        if firstInitialization {
+            isInitialized = true
+            configure(log: log)
         }
-        updateState()
+
+        var createdManager = false
+        if centralManager == nil, CBCentralManager.authorization == .allowedAlways {
+            setupCentralManager()
+            createdManager = true
+        }
+
+        if firstInitialization || createdManager {
+            updateState()
+        }
     }
 
     // MARK: - Central Manager Setup
@@ -207,21 +264,61 @@ actor BluetoothActor {
 
         log?.info("Initializing CBCentralManager")
 
-        let shim = BluetoothDelegateShim()
+        // A single `AsyncStream` carries delegate callbacks in CoreBluetooth's delivery order; the lone
+        // consumer task below drains them so ordering is preserved end-to-end. The buffer is intentionally
+        // unbounded: state-change callbacks must never be dropped (unlike the public advertisements feed),
+        // and `process(_:)` is lightweight, so the actor keeps pace with CoreBluetooth's serial callback
+        // rate in practice.
+        let (events, continuation) = AsyncStream.makeStream(
+            of: DelegateEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let shim = BluetoothDelegateShim(eventContinuation: continuation)
         delegateShim = shim
         // Use CBCentralManagerFactory for consistency between normal and test targets.
         // `forceMock: true` is load-bearing for the ReliaBLEMock test target — do not remove.
         centralManager = CBCentralManagerFactory.instance(delegate: shim, queue: centralManagerQueue, options: nil, forceMock: true)
+
+        delegateEventTask = Task { [weak self] in
+            for await event in events {
+                await self?.process(event)
+            }
+        }
+    }
+
+    /// Drains a single delegate event on the actor, preserving CoreBluetooth's callback order.
+    private func process(_ event: DelegateEvent) {
+        switch event {
+        case .stateUpdate:
+            handleCentralManagerStateUpdate()
+        case .discovered(let payload):
+            handlePeripheralDiscovered(
+                payload.peripheral,
+                advertisementData: payload.advertisementData,
+                rssi: payload.rssi
+            )
+        }
     }
 
     // MARK: - Authorization
 
-    func authorize() throws {
+    /// Performs the authorization decision for a single ``ReliaBLEManager/authorizeBluetooth()`` call.
+    ///
+    /// For undetermined authorization this creates the central manager (triggering the iOS prompt) and
+    /// suspends until the decision arrives via `centralManagerDidUpdateState`, so a successful return
+    /// means Bluetooth is authorized. The caller-supplied `id` lets ``ReliaBLEManager`` cancel this
+    /// specific wait via ``cancelAuthorizationContinuation(_:)``.
+    ///
+    /// The `withTaskCancellationHandler` that wires cancellation lives in the nonisolated
+    /// ``ReliaBLEManager`` façade, not here, to keep this actor-isolated method free of a construct the
+    /// region-based isolation checker cannot yet analyze.
+    func authorize(id: UUID) async throws {
         log?.info("Authorizing bluetooth")
 
         switch CBCentralManager.authorization {
         case .notDetermined:
             setupCentralManager()
+            try await suspendForAuthorizationDecision(id: id)
         case .denied:
             throw AuthorizationError.denied
         case .restricted:
@@ -230,6 +327,55 @@ actor BluetoothActor {
             setupCentralManager()
         @unknown default:
             throw AuthorizationError.unknown
+        }
+    }
+
+    /// Suspends until the pending authorization decision resolves (or the calling task is cancelled),
+    /// storing the continuation under `id`. Kept as its own actor-isolated method so the surrounding
+    /// `withTaskCancellationHandler` operation closure stays simple for the region-isolation checker.
+    private func suspendForAuthorizationDecision(id: UUID) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            // The task may already be cancelled by the time this job runs on the actor.
+            guard !Task.isCancelled else {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            authorizationContinuations[id] = continuation
+        }
+    }
+
+    /// Resumes a single pending authorization continuation with a `CancellationError`, if still pending.
+    /// Invoked from ``ReliaBLEManager``'s cancellation handler.
+    func cancelAuthorizationContinuation(_ id: UUID) {
+        authorizationContinuations.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+
+    /// Resolves any ``authorize()`` calls suspended on an authorization decision.
+    ///
+    /// Called after every `centralManagerDidUpdateState`, since CoreBluetooth surfaces an
+    /// authorization change as a state update. While the decision is still pending
+    /// (`.notDetermined`) the continuations remain suspended.
+    private func resolvePendingAuthorization() {
+        guard !authorizationContinuations.isEmpty else { return }
+
+        let result: Result<Void, Error>
+        switch CBCentralManager.authorization {
+        case .notDetermined:
+            return // Still awaiting the user's decision.
+        case .allowedAlways:
+            result = .success(())
+        case .denied:
+            result = .failure(AuthorizationError.denied)
+        case .restricted:
+            result = .failure(AuthorizationError.restricted)
+        @unknown default:
+            result = .failure(AuthorizationError.unknown)
+        }
+
+        let pending = authorizationContinuations
+        authorizationContinuations.removeAll()
+        for continuation in pending.values {
+            continuation.resume(with: result)
         }
     }
 
@@ -337,6 +483,7 @@ actor BluetoothActor {
         }
 
         updateState()
+        resolvePendingAuthorization()
     }
 
     func handlePeripheralDiscovered(
@@ -356,7 +503,18 @@ actor BluetoothActor {
             to: discoveryContinuations
         )
 
-        // TODO: FR-8.5: Unique Identifier from Manufacturing Data — connect to id once implemented
+        // Derive the app-facing `id` from the advertised name, falling back to the local name and
+        // finally the CoreBluetooth identifier string.
+        //
+        // TODO: FR-8.5 — Unique Identifier from Manufacturing Data.
+        // KNOWN LIMITATION: advertised names are not unique. Two distinct physical devices that
+        // advertise the same name resolve to the same `identifier` here, so they collapse into a
+        // single `discoveredPeripherals` entry and a single `cbPeripherals` slot — the later
+        // discovery overwrites the earlier device's live `CBPeripheral`, so `connect(id:)` may target
+        // whichever was seen last. FR-8.5 will replace this with a stable identity derived from
+        // manufacturing data; until then the dedup key is best-effort. The `cbIdentifier` fallback
+        // below only rescues a *single* device whose advertised name changes, not the same-name
+        // collision between *different* devices.
         let identifier = cbPeripheral.name
             ?? advertisement.localName
             ?? cbPeripheral.identifier.uuidString
@@ -444,15 +602,15 @@ actor BluetoothActor {
     /// - Note: This currently only fires the connection request. The full connection lifecycle
     ///   (didConnect/didDisconnect handling and a connection-state surface) is deferred to a later release.
     func connect(id: String) throws {
-        guard let cbPeripheral = cbPeripherals[id] else {
-            throw PeripheralError.notFound
+        guard let centralManager else {
+            // No central manager means Bluetooth was never set up (e.g. not authorized). Surface this
+            // rather than silently succeeding, mirroring the throwing `notFound` path below.
+            log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
+            throw PeripheralError.bluetoothUnavailable
         }
 
-        guard let centralManager else {
-            // Mirrors the start/stopScanning convention: no central manager means there is nothing to act on.
-            // In practice unreachable — the registry is only populated while a central manager exists.
-            log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
-            return
+        guard let cbPeripheral = cbPeripherals[id] else {
+            throw PeripheralError.notFound
         }
 
         centralManager.connect(cbPeripheral, options: nil)
@@ -469,8 +627,18 @@ actor BluetoothActor {
 /// process-lifetime singleton.
 final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
 
+    /// Sink for delegate callbacks, drained in order by ``BluetoothActor``'s consumer task.
+    private let eventContinuation: AsyncStream<DelegateEvent>.Continuation
+
+    fileprivate init(eventContinuation: AsyncStream<DelegateEvent>.Continuation) {
+        self.eventContinuation = eventContinuation
+        super.init()
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        Task { @BluetoothActor in await BluetoothActor.shared.handleCentralManagerStateUpdate() }
+        // Yielding is synchronous and thread-safe; ordering is preserved because CoreBluetooth
+        // invokes delegate methods serially on its dispatch queue.
+        eventContinuation.yield(.stateUpdate)
     }
 
     func centralManager(
@@ -483,12 +651,6 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
         // single-purpose payload. They are extracted into Sendable types (Peripheral / AdvertisementData) inside
         // the actor.
         let payload = DiscoveryPayload(peripheral: peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
-        Task { @BluetoothActor in
-            await BluetoothActor.shared.handlePeripheralDiscovered(
-                payload.peripheral,
-                advertisementData: payload.advertisementData,
-                rssi: payload.rssi
-            )
-        }
+        eventContinuation.yield(.discovered(payload))
     }
 }

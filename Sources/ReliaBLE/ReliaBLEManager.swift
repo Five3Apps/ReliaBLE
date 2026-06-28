@@ -54,19 +54,12 @@ public final class ReliaBLEManager: Sendable {
         
         log = loggingService
         
-        // `init` stays synchronous and dispatches actor setup via a fire-and-forget `Task`
-        // rather than awaiting it. The initial `setupCentralManager()` (if already
-        // `.allowedAlways`) and `updateState()` land on the actor's queue on the next
-        // run-loop turn.
-        //
-        // This does mean a caller that immediately awaits `startScanning()`/`stopScanning()`
-        // could in theory have that call's actor job ordered ahead of `initialize`'s, since
-        // Swift actors don't guarantee FIFO ordering across jobs enqueued from separate
-        // top-level Tasks. Both methods already guard on `centralManager == nil` and no-op
-        // with a log warning in that case, so the worst case is a missed scan start rather
-        // than a crash. Revisit if this race proves observable in practice — e.g. by making
-        // `init` `async` or exposing an explicit `await manager.ready()`.
-        Task { await BluetoothActor.shared.initialize(log: loggingService) }
+        // `init` stays synchronous and kicks off one-time actor setup via a fire-and-forget `Task`
+        // rather than awaiting it, so the initializer never blocks. To prevent an operation invoked
+        // immediately after `init` from racing ahead of that setup, every public entry point funnels
+        // through `ensureInitialized(log:)` (which is idempotent) before acting — so this eager call
+        // is an optimization, not a correctness requirement.
+        Task { await BluetoothActor.shared.ensureInitialized(log: loggingService) }
     }
     
     // MARK: - State
@@ -92,12 +85,26 @@ public final class ReliaBLEManager: Sendable {
         get async { await BluetoothActor.shared.currentBluetoothState }
     }
     
-    /// Requests authorization to use Bluetooth. This method will throw an error if the user has denied or restricted
-    /// Bluetooth access.
+    /// Requests authorization to use Bluetooth, presenting the iOS permission prompt when authorization has not yet
+    /// been determined.
     ///
-    /// - Throws: An ``AuthorizationError`` error if the user has denied or restricted Bluetooth access.
+    /// When authorization is undetermined this call **suspends until the user responds**, returning normally only
+    /// once access is granted. If the user denies the prompt (or access is already denied/restricted) it throws. A
+    /// successful return can therefore be relied upon to mean Bluetooth is authorized.
+    ///
+    /// - Throws: An ``AuthorizationError`` if the user has denied or restricted Bluetooth access.
     public func authorizeBluetooth() async throws {
-        try await BluetoothActor.shared.authorize()
+        await BluetoothActor.shared.ensureInitialized(log: log)
+
+        // Own the cancellation wiring here, in the nonisolated façade. When authorization is
+        // undetermined the actor suspends until the decision resolves; cancelling the calling task
+        // unblocks that wait with a `CancellationError` rather than hanging indefinitely.
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await BluetoothActor.shared.authorize(id: id)
+        } onCancel: {
+            Task { await BluetoothActor.shared.cancelAuthorizationContinuation(id) }
+        }
     }
     
     // MARK: - Scanning
@@ -128,11 +135,13 @@ public final class ReliaBLEManager: Sendable {
     /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
     /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
     public func startScanning(services: sending [CBUUID]? = nil) async {
+        await BluetoothActor.shared.ensureInitialized(log: log)
         await BluetoothActor.shared.startScanning(services: services)
     }
     
     /// Stops scanning for peripheral devices.
     public func stopScanning() async {
+        await BluetoothActor.shared.ensureInitialized(log: log)
         await BluetoothActor.shared.stopScanning()
     }
     
@@ -145,11 +154,13 @@ public final class ReliaBLEManager: Sendable {
     ///
     /// - Parameter peripheral: A peripheral previously delivered via ``discoveredPeripherals``.
     /// - Throws: ``PeripheralError/notFound`` if the peripheral's live reference has been invalidated (a stale
-    ///   snapshot).
+    ///   snapshot), or ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up (for example, not
+    ///   yet authorized).
     ///
     /// - Note: This currently only initiates the connection request. The full connection lifecycle is deferred to a
     ///   later release.
     public func connect(to peripheral: Peripheral) async throws {
+        await BluetoothActor.shared.ensureInitialized(log: log)
         try await BluetoothActor.shared.connect(id: peripheral.id)
     }
 }
