@@ -490,6 +490,32 @@ struct ReliaBLEManagerTests {
         #expect(writer.logType(forLogLevel: .event) == .default)
     }
 
+    @Test func capturingWriterRecordsForwardedMessagesAndLevels() {
+        let queue = DispatchQueue(label: "com.five3apps.relia-ble.tests.capturing")
+        let writer = CapturingLogWriter()
+        let service = LoggingService(levels: .all, writers: [writer], queue: queue)
+        service.enabled = true
+
+        // Each entry point wraps its text in a `LogMessage`, so the structured overload fires for all four.
+        service.debug(tags: [.category(.scanning)], "debug message")
+        service.info(tags: [.peripheral("device-1")], "info message")
+        service.warn(tags: [.category(.connection)], "warn message")
+        service.error("error message")
+
+        // Writes are dispatched asynchronously onto the serial `queue`; a sync barrier flushes them.
+        queue.sync {}
+
+        let captured = writer.captured
+        #expect(captured.map(\.message) == ["debug message", "info message", "warn message", "error message"])
+        #expect(captured.map(\.level) == [.debug, .info, .warn, .error])
+
+        // Disabling the service stops forwarding to the writer entirely.
+        service.enabled = false
+        service.error("dropped message")
+        queue.sync {}
+        #expect(writer.captured.count == 4)
+    }
+
     // MARK: - Event Stream Broadcaster
 
     @Test func stateStreamReplaysToConcurrentSubscribers() async throws {
@@ -527,6 +553,44 @@ struct ReliaBLEManagerTests {
 
         #expect(broadcastA != nil)
         #expect(broadcastB != nil)
+    }
+}
+
+// MARK: - Logging Test Support
+
+/// A ``LogWriter`` that records every forwarded message so tests can assert on exactly what the
+/// ``LoggingService`` emitted — message text and level — at the writer boundary.
+///
+/// Thread-safe: writes land on the service's logging queue while assertions read from the test
+/// thread, so access to the backing store is guarded by a lock.
+final class CapturingLogWriter: LogWriter, @unchecked Sendable {
+    struct Entry {
+        let message: String
+        let level: LogLevel
+    }
+
+    private let lock = NSLock()
+    private var storage: [Entry] = []
+
+    /// A snapshot of everything captured so far, in the order it was written.
+    var captured: [Entry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func writeMessage(_ message: String, logLevel: LogLevel, logSource: LogSource) {
+        append(Entry(message: message, level: logLevel))
+    }
+
+    func writeMessage(_ message: any Willow.LogMessage, logLevel: LogLevel, logSource: LogSource) {
+        append(Entry(message: message.name, level: logLevel))
+    }
+
+    private func append(_ entry: Entry) {
+        lock.lock()
+        storage.append(entry)
+        lock.unlock()
     }
 }
 
