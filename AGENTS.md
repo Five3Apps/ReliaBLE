@@ -41,7 +41,7 @@ The package declares **three targets** that share a single source tree to make `
 
 ### Swift Concurrency
 
-The library is built with Swift 6 and **complete concurrency checking**. The `ReliaBLEManager` public API should be callable from `@MainActor`, but the library itself should avoid `@MainActor` and instead use `@BluetoothActor` (a custom actor defined in `BluetoothManager.swift`) to serialize all Bluetooth interactions. This keeps the library thread-safe and allows the integrating app to decide how to bridge to the main thread for UI updates.
+The library is built with Swift 6 and **complete concurrency checking**. The `ReliaBLEManager` public API should be callable from `@MainActor`, but the library itself should avoid `@MainActor` and instead use `@BluetoothActor` (a custom actor defined in `BluetoothActor.swift`) to serialize all Bluetooth interactions. This keeps the library thread-safe and allows the integrating app to decide how to bridge to the main thread for UI updates.
 
 ### Logging
 
@@ -49,10 +49,10 @@ The library is built with Swift 6 and **complete concurrency checking**. The `Re
 
 ### Authorization flow
 
-`ReliaBLEManager.init` does **not** instantiate `CBCentralManager` unless the user has already granted `.allowedAlways`. This is deliberate so the integrating app controls when the iOS permission prompt appears — callers invoke `authorizeBluetooth()` when they want the prompt. Preserve this lazy-init behavior when touching `BluetoothManager.setupCentralManager()`.
+`ReliaBLEManager.init` does **not** instantiate `CBCentralManager` unless the user has already granted `.allowedAlways`. This is deliberate so the integrating app controls when the iOS permission prompt appears — callers invoke `authorizeBluetooth()` when they want the prompt. Preserve this lazy-init behavior when touching `BluetoothActor.setupCentralManager()`.
 
 ## Notes for editing
 
 - Public API on `ReliaBLEManager` is the supported surface for external consumers. Adding/removing methods there is a breaking change.
-- `forceMock: true` is currently passed to `CBCentralManagerFactory.instance(...)` in `BluetoothManager`. The production factory ignores this parameter; the mock factory honors it. Don't "clean it up" — it's load-bearing for the test target.
+- `forceMock: true` is currently passed to `CBCentralManagerFactory.instance(...)` in `BluetoothActor`. The production factory ignores this parameter; the mock factory honors it. Don't "clean it up" — it's load-bearing for the test target.
 - DocC catalog lives at `Sources/ReliaBLE/Documentation.docc/`. The `swift-docc-plugin` is a package dep so `swift package generate-documentation` works. This documentation **must** be kept up to date with the public API on `ReliaBLEManager` and the overall architecture and usage patterns.
