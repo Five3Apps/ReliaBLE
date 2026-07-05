@@ -26,7 +26,7 @@
 ///
 /// ``ConnectionState`` is a finite, `Sendable` enumeration. Every non-terminal state change
 /// is emitted on ``ReliaBLEManager/connectionStateChanges``; the two terminal states carry an
-/// optional ``PeripheralError/reason`` that the integrating app can surface.
+/// optional ``PeripheralError`` reason that the integrating app can surface.
 public enum ConnectionState: Sendable, Equatable, Hashable {
     /// A connection request has been issued and is in flight.
     case connecting
