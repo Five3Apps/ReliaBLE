@@ -147,22 +147,30 @@ Use ``ReliaBLEManager/connect(to:)`` to initiate a connection to a discovered ``
 
 ```swift
 do {
-    try await bleManager.connect(to: peripheral)
-
-    for await change in bleManager.connectionStateChanges
-        where change.peripheralId == peripheral.id {
-        switch change.state {
-        case .connected:
-            print("Connected to \(peripheral.id)")
-        case .disconnected(let reason):
-            print("Disconnected", reason ?? "clean")
-        case .failed(let reason):
+    let changes = bleManager.connectionStateChanges
+    
+    let observer = Task {
+        for await change in changes where change.peripheralId == peripheral.id {
+            switch change.state {
+            case .connected:
+                print("Connected to \(peripheral.id)")
+                return
+            case .disconnected(let reason):
+                print("Disconnected", reason ?? "clean")
+                return
+            case .failed(let reason):
             print("Failed", reason ?? "")
-        default:
-            break
+                return
+            default:
+                break
+            }
         }
     }
-
+    defer { observer.cancel() }
+    
+    try await bleManager.connect(to: peripheral)
+    
+    // Later, when you're done with the session:
     try await bleManager.disconnect(from: peripheral)
 } catch PeripheralError.notFound {
     // The snapshot is stale — its underlying peripheral reference was invalidated

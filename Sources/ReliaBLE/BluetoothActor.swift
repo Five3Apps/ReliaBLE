@@ -668,7 +668,7 @@ actor BluetoothActor {
             log?.warn(tags: [.category(.connection)], "didDisconnect for unknown peripheral — dropped")
             return
         }
-        let mappedError: PeripheralError? = payload.error.flatMap { ($0 as? CBError).map { PeripheralError.fromCBError($0) } }
+        let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
         let state: ConnectionState = .disconnected(reason: mappedError)
         connectionStates[id] = state
         if let error = mappedError {
@@ -684,7 +684,7 @@ actor BluetoothActor {
             log?.warn(tags: [.category(.connection)], "didFailToConnect for unknown peripheral — dropped")
             return
         }
-        let mappedError: PeripheralError? = payload.error.flatMap { ($0 as? CBError).map { PeripheralError.fromCBError($0) } }
+        let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
         let state: ConnectionState = .failed(reason: mappedError)
         connectionStates[id] = state
         log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral connection failed with error: \(mappedError ?? .unknown)")
@@ -780,14 +780,14 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
         let payload = ConnectionPayload(peripheral: peripheral, error: nil)
         eventContinuation.yield(.connected(payload))
     }
+    
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        let payload = ConnectionPayload(peripheral: peripheral, error: error)
+        eventContinuation.yield(.connectFailed(payload))
+    }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: Error?) {
         let payload = ConnectionPayload(peripheral: peripheral, error: error)
         eventContinuation.yield(.disconnected(payload))
-    }
-
-    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        let payload = ConnectionPayload(peripheral: peripheral, error: error)
-        eventContinuation.yield(.connectFailed(payload))
     }
 }

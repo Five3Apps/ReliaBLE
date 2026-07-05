@@ -776,10 +776,6 @@ enum Mock {
     ///
     /// The actor resolves a peripheral's id as `name ?? advertisement.localName ?? identifier`. Our spec advertises
     /// this exact local name, so the discovered snapshot's `id` is deterministic.
-    /// The resolved ``Peripheral/id`` of the simulated test peripheral.
-    ///
-    /// The actor resolves a peripheral's id as `name ?? advertisement.localName ?? identifier`. Our spec advertises
-    /// this exact local name, so the discovered snapshot's `id` is deterministic.
     static let testPeripheralID = "ReliaBLE-Test-Peripheral"
 
     /// The resolved ``Peripheral/id`` of the connectable test peripheral.

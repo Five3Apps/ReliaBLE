@@ -138,7 +138,7 @@ struct CentralView: View {
 
     private var deviceList: some View {
         List {
-            ForEach(Array(devices.enumerated()), id: \.element.persistentModelID) { index, device in
+            ForEach(devices, id: \.persistentModelID) { device in
                 NavigationLink {
                     Group {
                         let currentState = viewModel.connectionStates[device.id]
