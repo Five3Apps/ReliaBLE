@@ -45,6 +45,11 @@ private struct DiscoveryPayload: @unchecked Sendable {
     let rssi: Int
 }
 
+private struct ConnectionPayload: @unchecked Sendable {
+    let peripheral: CBPeripheral
+    let error: Error?
+}
+
 /// A single CoreBluetooth delegate callback, carried in delivery order across the nonisolated
 /// delegate-queue → ``BluetoothActor`` hop.
 ///
@@ -55,6 +60,9 @@ private struct DiscoveryPayload: @unchecked Sendable {
 private enum DelegateEvent: Sendable {
     case stateUpdate
     case discovered(DiscoveryPayload)
+    case connected(ConnectionPayload)
+    case disconnected(ConnectionPayload)
+    case connectFailed(ConnectionPayload)
 }
 
 // MARK: - BluetoothActor
@@ -117,6 +125,11 @@ actor BluetoothActor {
     private var discoveryContinuations: [UUID: AsyncStream<PeripheralDiscoveryEvent>.Continuation] = [:]
     private var peripheralsContinuations: [UUID: AsyncStream<[Peripheral]>.Continuation] = [:]
 
+    /// Per-peripheral connection states, keyed by ``Peripheral/id``.
+    var connectionStates: [String: ConnectionState] = [:]
+
+    private var connectionStateChangesContinuations: [UUID: AsyncStream<ConnectionStateChange>.Continuation] = [:]
+
     // MARK: - Initialization
 
     private init() {}
@@ -169,6 +182,17 @@ actor BluetoothActor {
         }
     }
 
+    /// Returns a fresh `AsyncStream` of connection-state changes for a single subscriber.
+    ///
+    /// Each call mints an independent stream. This feed does **not** replay a value on
+    /// subscription — a subscriber only receives state changes that occur after it registers,
+    /// mirroring ``peripheralDiscoveriesStream()``.
+    nonisolated func connectionStateChangesStream() -> AsyncStream<ConnectionStateChange> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(BluetoothActor.discoveryBufferLimit)) { continuation in
+            Task { await BluetoothActor.shared.register(connectionStateChangeContinuation: continuation) }
+        }
+    }
+
     // MARK: - Continuation Registration
     //
     // Registration runs as a single, indivisible actor job: the replay-yield, dictionary insert,
@@ -205,6 +229,24 @@ actor BluetoothActor {
     private func removeStateContinuation(_ id: UUID) { stateContinuations[id] = nil }
     private func removeDiscoveryContinuation(_ id: UUID) { discoveryContinuations[id] = nil }
     private func removePeripheralsContinuation(_ id: UUID) { peripheralsContinuations[id] = nil }
+
+    private func register(connectionStateChangeContinuation continuation: AsyncStream<ConnectionStateChange>.Continuation) {
+        let id = UUID()
+        connectionStateChangesContinuations[id] = continuation
+        continuation.onTermination = { _ in
+            Task { await BluetoothActor.shared.removeConnectionStateChangeContinuation(id) }
+        }
+    }
+
+    private func removeConnectionStateChangeContinuation(_ id: UUID) { connectionStateChangesContinuations[id] = nil }
+
+    /// A one-shot snapshot of the current per-peripheral connection states.
+    ///
+    /// Read this to seed a view on appearance without waiting for the next
+    /// ``connectionStateChangesStream()`` event.
+    var currentConnectionStates: [String: ConnectionState] {
+        connectionStates
+    }
 
     /// Yields a value to every registered continuation in `continuations`.
     ///
@@ -297,6 +339,12 @@ actor BluetoothActor {
                 advertisementData: payload.advertisementData,
                 rssi: payload.rssi
             )
+        case .connected(let payload):
+            handleDidConnect(payload)
+        case .disconnected(let payload):
+            handleDidDisconnect(payload)
+        case .connectFailed(let payload):
+            handleDidFailToConnect(payload)
         }
     }
 
@@ -569,6 +617,7 @@ actor BluetoothActor {
     private func invalidatePeripherals() {
         // The value snapshots hold no CoreBluetooth reference to clear; drop the live registry instead.
         cbPeripherals.removeAll()
+        connectionStates.removeAll()
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
         log?.debug("Invalidated all peripheral references")
     }
@@ -594,17 +643,65 @@ actor BluetoothActor {
 
     // MARK: - Connection
 
+    /// Resolves a ``Peripheral/id`` from the live `CBPeripheral` reference using reverse object-identity lookup.
+    ///
+    /// Derives nothing — it reads back the key that ``handlePeripheralDiscovered(_:advertisementData:rssi:)``
+    /// already assigned, so ``handlePeripheralDiscovered(_:advertisementData:rssi:)`` remains the library's single
+    /// source of identity truth.
+    // TODO: FR-8.5
+    private func id(for cbPeripheral: CBPeripheral) -> String? {
+        cbPeripherals.first { $0.value === cbPeripheral }?.key
+    }
+
+    private func handleDidConnect(_ payload: ConnectionPayload) {
+        guard let id = id(for: payload.peripheral) else {
+            log?.warn(tags: [.category(.connection)], "didConnect for unknown peripheral — dropped")
+            return
+        }
+        connectionStates[id] = .connected
+        log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral connected")
+        broadcast(ConnectionStateChange(peripheralId: id, state: .connected), to: connectionStateChangesContinuations)
+    }
+
+    private func handleDidDisconnect(_ payload: ConnectionPayload) {
+        guard let id = id(for: payload.peripheral) else {
+            log?.warn(tags: [.category(.connection)], "didDisconnect for unknown peripheral — dropped")
+            return
+        }
+        let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
+        let state: ConnectionState = .disconnected(reason: mappedError)
+        connectionStates[id] = state
+        if let error = mappedError {
+            log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected with error: \(error)")
+        } else {
+            log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected")
+        }
+        broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+    }
+
+    private func handleDidFailToConnect(_ payload: ConnectionPayload) {
+        guard let id = id(for: payload.peripheral) else {
+            log?.warn(tags: [.category(.connection)], "didFailToConnect for unknown peripheral — dropped")
+            return
+        }
+        let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
+        let state: ConnectionState = .failed(reason: mappedError)
+        connectionStates[id] = state
+        log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral connection failed with error: \(mappedError ?? .unknown)")
+        broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+    }
+
     /// Initiates a connection to the live peripheral backing the given snapshot `id`.
+    ///
+    /// Optimistically broadcasts `.connecting` before the CoreBluetooth call, then issues the
+    /// connection request. The actual `.connected` or `.failed` callback arrives later via the
+    /// delegate pipeline.
     ///
     /// - Parameter id: The ``Peripheral/id`` of a previously discovered peripheral.
     /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id` (a stale snapshot).
-    ///
-    /// - Note: This currently only fires the connection request. The full connection lifecycle
-    ///   (didConnect/didDisconnect handling and a connection-state surface) is deferred to a later release.
+    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
     func connect(id: String) throws {
         guard let centralManager else {
-            // No central manager means Bluetooth was never set up (e.g. not authorized). Surface this
-            // rather than silently succeeding, mirroring the throwing `notFound` path below.
             log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
             throw PeripheralError.bluetoothUnavailable
         }
@@ -613,7 +710,32 @@ actor BluetoothActor {
             throw PeripheralError.notFound
         }
 
+        connectionStates[id] = .connecting
+        broadcast(ConnectionStateChange(peripheralId: id, state: .connecting), to: connectionStateChangesContinuations)
         centralManager.connect(cbPeripheral, options: nil)
+    }
+
+    /// Initiates a disconnection from the live peripheral backing the given snapshot `id`.
+    ///
+    /// Optimistically broadcasts `.disconnecting` before cancelling the connection. The actual
+    /// `.disconnected` callback arrives later via the delegate pipeline.
+    ///
+    /// - Parameter id: The ``Peripheral/id`` of a previously connected peripheral.
+    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id`.
+    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
+    func disconnect(id: String) throws {
+        guard let centralManager else {
+            log?.warn(tags: [.peripheral(id)], "Attempted to disconnect without a central manager")
+            throw PeripheralError.bluetoothUnavailable
+        }
+
+        guard let cbPeripheral = cbPeripherals[id] else {
+            throw PeripheralError.notFound
+        }
+
+        connectionStates[id] = .disconnecting
+        broadcast(ConnectionStateChange(peripheralId: id, state: .disconnecting), to: connectionStateChangesContinuations)
+        centralManager.cancelPeripheralConnection(cbPeripheral)
     }
 }
 
@@ -652,5 +774,20 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
         // the actor.
         let payload = DiscoveryPayload(peripheral: peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
         eventContinuation.yield(.discovered(payload))
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        let payload = ConnectionPayload(peripheral: peripheral, error: nil)
+        eventContinuation.yield(.connected(payload))
+    }
+    
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        let payload = ConnectionPayload(peripheral: peripheral, error: error)
+        eventContinuation.yield(.connectFailed(payload))
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: Error?) {
+        let payload = ConnectionPayload(peripheral: peripheral, error: error)
+        eventContinuation.yield(.disconnected(payload))
     }
 }

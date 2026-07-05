@@ -85,6 +85,28 @@ public final class ReliaBLEManager: Sendable {
         get async { await BluetoothActor.shared.currentBluetoothState }
     }
     
+    /// A multi-subscriber `AsyncStream` of connection-state changes for all peripherals.
+    ///
+    /// Each property access returns a fresh, independent stream. This stream does **not** replay
+    /// a value on subscription — subscribe before initiating connections to observe every
+    /// transition. To filter for a single peripheral:
+    /// ```swift
+    /// for await change in manager.connectionStateChanges where change.peripheralId == device.id {
+    ///     // handle change
+    /// }
+    /// ```
+    public var connectionStateChanges: AsyncStream<ConnectionStateChange> {
+        BluetoothActor.shared.connectionStateChangesStream()
+    }
+    
+    /// An async snapshot of the current per-peripheral connection states, useful for seeding
+    /// a view on appearance without waiting for the next change event.
+    public var currentConnectionStates: [String: ConnectionState] {
+        get async { await BluetoothActor.shared.currentConnectionStates }
+    }
+    
+    // MARK: - Authorization
+    
     /// Requests authorization to use Bluetooth, presenting the iOS permission prompt when authorization has not yet
     /// been determined.
     ///
@@ -162,6 +184,19 @@ public final class ReliaBLEManager: Sendable {
     public func connect(to peripheral: Peripheral) async throws {
         await BluetoothActor.shared.ensureInitialized(log: log)
         try await BluetoothActor.shared.connect(id: peripheral.id)
+    }
+
+    /// Initiates a disconnection from a previously connected peripheral.
+    ///
+    /// The ``Peripheral`` is a value snapshot. This forwards its ``Peripheral/id`` to the live
+    /// CoreBluetooth peripheral and cancels the connection.
+    ///
+    /// - Parameter peripheral: A peripheral previously delivered via ``discoveredPeripherals``.
+    /// - Throws: ``PeripheralError/notFound`` if the peripheral's live reference has been
+    ///   invalidated, or ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
+    public func disconnect(from peripheral: Peripheral) async throws {
+        await BluetoothActor.shared.ensureInitialized(log: log)
+        try await BluetoothActor.shared.disconnect(id: peripheral.id)
     }
 }
 

@@ -25,6 +25,8 @@
 //  SOFTWARE.
 
 
+import CoreBluetooth
+
 /// Errors thrown by peripheral operations such as ``ReliaBLEManager/connect(to:)``.
 public enum PeripheralError: Error, Sendable, Equatable {
     /// The peripheral is no longer known to the library.
@@ -41,4 +43,28 @@ public enum PeripheralError: Error, Sendable, Equatable {
     /// because Bluetooth has not been authorized yet. Call ``ReliaBLEManager/authorizeBluetooth()`` and wait for a
     /// ready state before retrying.
     case bluetoothUnavailable
+
+    /// The connection to the peripheral failed.
+    case connectionFailed
+
+    /// The connection attempt timed out.
+    case connectionTimeout
+
+    /// The peripheral disconnected unexpectedly.
+    case peripheralDisconnected
+
+    /// An unknown CoreBluetooth error occurred.
+    case unknown
+
+    /// Maps a `CBError` to a ``PeripheralError`` for public surfacing.
+    ///
+    /// The mapper is exhaustive — unrecognized codes fall back to ``unknown``.
+    static func fromCBError(_ error: CBError) -> PeripheralError {
+        switch error.code {
+        case .connectionFailed: return .connectionFailed
+        case .connectionTimeout: return .connectionTimeout
+        case .peripheralDisconnected: return .peripheralDisconnected
+        default: return .unknown
+        }
+    }
 }

@@ -30,6 +30,18 @@ import SwiftData
 
 import ReliaBLE
 
+extension ConnectionState {
+    var description: String {
+        switch self {
+        case .connecting: "Connecting"
+        case .connected: "Connected"
+        case .disconnecting: "Disconnecting"
+        case .disconnected(let reason): "Disconnected\(reason.map { " (\($0))" } ?? "")"
+        case .failed(let reason): "Failed\(reason.map { " (\($0))" } ?? "")"
+        }
+    }
+}
+
 struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.bleManager) private var reliaBLE
@@ -115,17 +127,50 @@ struct CentralView: View {
                         await store.syncDevices(peripherals)
                     }
                 }
+                group.addTask {
+                    for await change in manager.connectionStateChanges {
+                        await viewModel.updateConnectionState(change)
+                    }
+                }
             }
         }
     }
 
     private var deviceList: some View {
         List {
-            ForEach(devices) { device in
+            ForEach(devices, id: \.persistentModelID) { device in
                 NavigationLink {
-                    Text("Device Details")
-                    Text("ID: \(device.id)")
-                    Text("Last seen: \(device.lastSeen?.formatted(date: .numeric, time: .standard) ?? "")")
+                    Group {
+                        let currentState = viewModel.connectionStates[device.id]
+                        VStack(spacing: 16) {
+                            Text("ID: \(device.id)")
+                            Text("Last seen: \(device.lastSeen?.formatted(date: .numeric, time: .standard) ?? "")")
+
+                            if let state = currentState {
+                                Text("Connection: \(state.description)")
+                                    .foregroundStyle(state == .connected ? Color.green : Color.orange)
+                            } else {
+                                Text("Connection: unknown")
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Button(action: {
+                                if let state = currentState, state == .connected {
+                                    Task { try? await reliaBLE.disconnect(from: Peripheral(id: device.id)) }
+                                } else {
+                                    Task { try? await reliaBLE.connect(to: Peripheral(id: device.id)) }
+                                }
+                            }) {
+                                if let state = currentState, state == .connected {
+                                    Text("Disconnect")
+                                } else {
+                                    Text("Connect")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .padding()
+                    }
                 } label: {
                     Text("\(device.name ?? "Unknown")")
                 }

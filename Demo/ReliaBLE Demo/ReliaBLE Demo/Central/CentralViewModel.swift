@@ -33,6 +33,7 @@ import ReliaBLE
 @Observable class CentralViewModel {
     var currentState: BluetoothState = .unknown
     var servicesInput = ""
+    var connectionStates: [String: ConnectionState] = [:]
 
     private var deviceStore: DeviceStoreActor?
     private var reliaBLE: ReliaBLEManager?
@@ -50,6 +51,11 @@ import ReliaBLE
     @MainActor
     func updateState(_ state: BluetoothState) {
         currentState = state
+    }
+
+    @MainActor
+    func updateConnectionState(_ change: ConnectionStateChange) {
+        connectionStates[change.peripheralId] = change.state
     }
 
     func authorizeBluetooth() {

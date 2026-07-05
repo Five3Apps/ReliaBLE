@@ -143,11 +143,35 @@ If your app already knows a peripheral's identity ahead of time — for example,
 
 ## Connecting to a Peripheral
 
-Pass a discovered ``Peripheral`` to ``ReliaBLEManager/connect(to:)``. The snapshot carries only a stable identifier; ReliaBLE looks up the live CoreBluetooth peripheral it owns internally and initiates the connection.
+Use ``ReliaBLEManager/connect(to:)`` to initiate a connection to a discovered ``Peripheral``. Consume ``ReliaBLEManager/connectionStateChanges`` (an `AsyncStream<ConnectionStateChange>`) to observe the full lifecycle for any peripheral; filter by `peripheralId` for a specific device. Call ``ReliaBLEManager/disconnect(from:)`` to end the session.
 
 ```swift
 do {
+    let changes = bleManager.connectionStateChanges
+    
+    let observer = Task {
+        for await change in changes where change.peripheralId == peripheral.id {
+            switch change.state {
+            case .connected:
+                print("Connected to \(peripheral.id)")
+                return
+            case .disconnected(let reason):
+                print("Disconnected", reason ?? "clean")
+                return
+            case .failed(let reason):
+            print("Failed", reason ?? "")
+                return
+            default:
+                break
+            }
+        }
+    }
+    defer { observer.cancel() }
+    
     try await bleManager.connect(to: peripheral)
+    
+    // Later, when you're done with the session:
+    try await bleManager.disconnect(from: peripheral)
 } catch PeripheralError.notFound {
     // The snapshot is stale — its underlying peripheral reference was invalidated
     // (for example, after a Bluetooth reset). Re-scan to rediscover it.
@@ -157,4 +181,4 @@ do {
 }
 ```
 
-- Note: `connect(to:)` currently initiates the connection request only. The full connection lifecycle (connection-state updates and disconnection handling) will arrive in a later release.
+Each access to `connectionStateChanges` yields a fresh stream; it does not replay, so begin iteration before calling `connect(to:)`. The `ConnectionState` values are `.connecting`, `.connected`, `.disconnecting`, `.disconnected(reason:)`, and `.failed(reason:)`. Terminal states carry an optional ``PeripheralError`` reason.
