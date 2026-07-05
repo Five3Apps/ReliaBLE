@@ -516,6 +516,160 @@ struct ReliaBLEManagerTests {
         #expect(writer.captured.count == 4)
     }
 
+        // MARK: - Connection Lifecycle
+
+    @Test func connectionStateChangesEmitsConnectSuccessSequence() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let changes = manager.connectionStateChanges
+
+        // Discover the connectable test peripheral.
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+
+        let connecting = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(connecting?.peripheralId == discovered.id)
+        #expect(connecting?.state == .connecting)
+
+        let connected = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(connected?.peripheralId == discovered.id)
+        #expect(connected?.state == .connected)
+    }
+
+    @Test func connectionStateChangesEmitsDisconnectSequence() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+
+        // Drain .connecting and .connected.
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+
+        try await manager.disconnect(from: discovered)
+
+        let disconnecting = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(disconnecting?.peripheralId == discovered.id)
+        #expect(disconnecting?.state == .disconnecting)
+
+        let disconnected = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(disconnected?.peripheralId == discovered.id)
+        #expect(disconnected?.state == .disconnected(reason: nil))
+    }
+
+    @Test func connectionStateChangesEmitsConnectFailureSequence() async throws {
+        // Pre-condition: no stale connection state from a preceding lifecycle test.
+        Mock.connectionTestSpec.simulateDisconnection()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        // Drain any spurious events that simulateDisconnection may have injected
+        // into the actor's stream continuations.
+        await BluetoothActor.shared.updateState()
+
+        Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        // Force a clean disconnection on the spec to reset any lingering
+        // `virtualConnections` / `isConnected` state left by a preceding test.
+        Mock.connectionTestSpec.simulateDisconnection()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        try await manager.connect(to: discovered)
+
+        var events: [ConnectionStateChange] = []
+        for _ in 0..<3 {
+            if let change = await firstConnectionStateChange(from: changes, withinNanoseconds: 3_000_000_000) {
+                events.append(change)
+            }
+        }
+
+        // The mock's connection callback fires on an async timer (0.045 s), so the
+        // time spent collecting events is well under the 3 s timeout per event.  The
+        // failure test must see .connecting then .failed(reason: .connectionTimeout).
+        guard events.count >= 2 else {
+            #expect(Bool(false), "Expected at least 2 events, got \(events.count): \(events)")
+            return
+        }
+        #expect(events[0].peripheralId == discovered.id)
+        #expect(events[0].state == .connecting)
+        #expect(events[1].peripheralId == discovered.id)
+        #expect(events[1].state == .failed(reason: .connectionTimeout))
+    }
+
+    @Test func connectionStateChangesSupportsConcurrentSubscribers() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        var subscriberA = manager.connectionStateChanges.makeAsyncIterator()
+        var subscriberB = manager.connectionStateChanges.makeAsyncIterator()
+
+        // Force an actor hop to guarantee the registration Tasks have completed
+        // before we issue the connect (connectionStateChanges has no replay).
+        _ = await manager.currentConnectionStates
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+
+        // Both subscribers see the .connecting event.
+        let a1 = await subscriberA.next()
+        let b1 = await subscriberB.next()
+        #expect(a1?.state == .connecting)
+        #expect(b1?.state == .connecting)
+
+        // Both subscribers see the .connected event.
+        let a2 = await subscriberA.next()
+        let b2 = await subscriberB.next()
+        #expect(a2?.state == .connected)
+        #expect(b2?.state == .connected)
+    }
+
     // MARK: - Event Stream Broadcaster
 
     @Test func stateStreamReplaysToConcurrentSubscribers() async throws {
@@ -557,6 +711,25 @@ struct ReliaBLEManagerTests {
 }
 
 // MARK: - Logging Test Support
+
+/// A configurable ``CBMPeripheralSpecDelegate`` used by the connection-lifecycle tests.
+///
+/// The connection result returned from ``peripheralDidReceiveConnectionRequest(_:)`` is set on the
+/// instance before a test runs. The delegate is registered once in ``SimulationConfig/ensureConfigured()``
+/// and shared across all connection tests via ``Mock/connectionTestDelegate``.
+final class ConnectionTestDelegate: @unchecked Sendable {
+    var connectionResult: Result<Void, Error> = .success(())
+}
+
+extension ConnectionTestDelegate: CBMPeripheralSpecDelegate {
+    func reset() {}
+
+    func peripheralDidReceiveConnectionRequest(_ peripheral: CBMPeripheralSpec) -> Result<Void, Error> {
+        connectionResult
+    }
+
+    func peripheral(_ peripheral: CBMPeripheralSpec, didDisconnect error: Error?) {}
+}
 
 /// A ``LogWriter`` that records every forwarded message so tests can assert on exactly what the
 /// ``LoggingService`` emitted — message text and level — at the writer boundary.
@@ -603,7 +776,27 @@ enum Mock {
     ///
     /// The actor resolves a peripheral's id as `name ?? advertisement.localName ?? identifier`. Our spec advertises
     /// this exact local name, so the discovered snapshot's `id` is deterministic.
+    /// The resolved ``Peripheral/id`` of the simulated test peripheral.
+    ///
+    /// The actor resolves a peripheral's id as `name ?? advertisement.localName ?? identifier`. Our spec advertises
+    /// this exact local name, so the discovered snapshot's `id` is deterministic.
     static let testPeripheralID = "ReliaBLE-Test-Peripheral"
+
+    /// The resolved ``Peripheral/id`` of the connectable test peripheral.
+    ///
+    /// This peripheral is backed by a ``CBMPeripheralSpec`` whose ``connectionDelegate`` is
+    /// ``connectionTestDelegate``, so the connection outcome (success or failure) is configurable per-test.
+    static let connectionTestPeripheralID = "ReliaBLE-Connection-Test"
+
+    /// Configurable connection delegate shared across all lifecycle tests.
+    ///
+    /// Set ``ConnectionTestDelegate/connectionResult`` to `.failure(...)` before a test to simulate a
+    /// failed connection; reset to `.success(())` in a `defer` or at the start of each test.
+    static let connectionTestDelegate = ConnectionTestDelegate()
+
+    /// The spec registered with the mock so tests can force a clean disconnection between
+    /// lifecycle tests that otherwise leak `virtualConnections` state.
+    nonisolated(unsafe) static let connectionTestSpec = makeConnectionTestPeripheralSpec()
 
     /// Builds a `ReliaBLEManager` after ensuring the one-time mock configuration has run.
     ///
@@ -659,6 +852,23 @@ enum Mock {
             .build()
     }
 
+    /// Builds the simulated peripheral used by connection-lifecycle tests, backed by
+    /// ``connectionTestDelegate`` so connection outcomes are configurable per-test.
+    private static func makeConnectionTestPeripheralSpec() -> CBMPeripheralSpec {
+        CBMPeripheralSpec
+            .simulatePeripheral(proximity: .immediate)
+            .advertising(
+                advertisementData: [
+                    CBMAdvertisementDataLocalNameKey: connectionTestPeripheralID,
+                    CBMAdvertisementDataServiceUUIDsKey: [CBMUUID(string: "180D")],
+                    CBMAdvertisementDataIsConnectable: NSNumber(value: true)
+                ],
+                withInterval: 0.05
+            )
+            .connectable(name: connectionTestPeripheralID, services: [], delegate: connectionTestDelegate)
+            .build()
+    }
+
     /// Polls `manager.currentState` until its description matches `description` or the timeout elapses.
     static func waitForState(_ description: String, on manager: ReliaBLEManager, timeout: Double = 3.0) async -> Bool {
         await pollUntil(timeout: timeout) {
@@ -707,7 +917,7 @@ actor SimulationConfig {
         guard !configured else { return }
         configured = true
         CBMCentralManagerMock.simulateInitialState(.poweredOn)
-        CBMCentralManagerMock.simulatePeripherals([Mock.makeTestPeripheralSpec()])
+        CBMCentralManagerMock.simulatePeripherals([Mock.makeTestPeripheralSpec(), Mock.connectionTestSpec])
         // Pin authorization to `.notDetermined` so `ReliaBLEManager.init`'s `.allowedAlways` auto-setup cannot
         // create a central before the peripheral set is registered.
         CBMCentralManagerMock.simulateAuthorization(.notDetermined)
@@ -749,6 +959,28 @@ func firstEvent(
         group.addTask {
             for await event in stream {
                 return event
+            }
+            return nil
+        }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
+    }
+}
+
+/// Returns the first connection-state change from `stream`, or `nil` if none arrives within `nanoseconds`.
+func firstConnectionStateChange(
+    from stream: AsyncStream<ConnectionStateChange>,
+    withinNanoseconds nanoseconds: UInt64
+) async -> ConnectionStateChange? {
+    await withTaskGroup(of: ConnectionStateChange?.self) { group in
+        group.addTask {
+            for await change in stream {
+                return change
             }
             return nil
         }
