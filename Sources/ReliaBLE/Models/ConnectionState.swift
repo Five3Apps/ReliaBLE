@@ -22,6 +22,8 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
+import Foundation
+
 /// The connection state of a single peripheral tracked by the library.
 ///
 /// ``ConnectionState`` is a finite, `Sendable` enumeration. Every non-terminal state change
@@ -30,6 +32,8 @@
 public enum ConnectionState: Sendable, Equatable, Hashable {
     /// A connection request has been issued and is in flight.
     case connecting
+    /// A reconnection attempt is scheduled or in progress after a previous disconnect or failed connect.
+    case reconnecting(attempt: Int, nextRetryAt: Date)
     /// The peripheral is currently connected.
     case connected
     /// A disconnection request has been issued and is in flight.

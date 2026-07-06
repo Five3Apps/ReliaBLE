@@ -59,7 +59,7 @@ public final class ReliaBLEManager: Sendable {
         // immediately after `init` from racing ahead of that setup, every public entry point funnels
         // through `ensureInitialized(log:)` (which is idempotent) before acting — so this eager call
         // is an optimization, not a correctness requirement.
-        Task { await BluetoothActor.shared.ensureInitialized(log: loggingService) }
+        Task { await BluetoothActor.shared.ensureInitialized(log: loggingService, reconnectPolicy: config.reconnectPolicy) }
     }
     
     // MARK: - State

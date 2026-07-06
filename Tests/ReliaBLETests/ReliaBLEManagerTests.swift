@@ -670,6 +670,259 @@ struct ReliaBLEManagerTests {
         #expect(b2?.state == .connected)
     }
 
+    // MARK: - Reconnection
+
+    /// A fast reconnect policy for tests: tiny delays, no jitter, small max attempts.
+    private static let testReconnectPolicy: ReconnectPolicy = {
+        var policy = ReconnectPolicy()
+        policy.enabled = true
+        policy.maxAttempts = 3
+        policy.initialDelay = 0.001
+        policy.maxDelay = 0.005
+        policy.jitter = 0
+        return policy
+    }()
+
+    @Test func reconnectAfterUnexpectedDisconnect() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager(reconnectPolicy: Self.testReconnectPolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(Self.testReconnectPolicy)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+
+        // Drain .connecting and .connected.
+        let c1 = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(c1?.state == .connecting)
+        let c2 = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(c2?.state == .connected)
+
+        // Simulate an unexpected disconnect.
+        Mock.connectionTestSpec.simulateDisconnection()
+
+        // Observe .disconnected(reason:).
+        let c3 = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        guard case .disconnected = c3?.state else {
+            Issue.record("Expected .disconnected, got \(String(describing: c3?.state))")
+            return
+        }
+
+        // Observe .reconnecting(attempt: 1, ...).
+        let c4 = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        guard case .reconnecting(let attempt, _) = c4?.state else {
+            Issue.record("Expected .reconnecting, got \(String(describing: c4?.state))")
+            return
+        }
+        #expect(attempt == 1)
+
+        // Observe .connecting (reconnect attempt).
+        let c5 = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(c5?.state == .connecting)
+
+        // Observe .connected (recovery).
+        let c6 = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(c6?.state == .connected)
+
+        // Cleanup: explicit disconnect to cancel any pending reconnect state.
+        try? await manager.disconnect(from: discovered)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    @Test func reconnectGivesUpAfterMaxAttempts() async throws {
+        var giveUpPolicy = ReconnectPolicy()
+        giveUpPolicy.enabled = true
+        giveUpPolicy.maxAttempts = 2
+        giveUpPolicy.initialDelay = 0.001
+        giveUpPolicy.maxDelay = 0.005
+        giveUpPolicy.jitter = 0
+
+        Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager(reconnectPolicy: giveUpPolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(giveUpPolicy)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        // Force a clean disconnection to reset any lingering mock state.
+        Mock.connectionTestSpec.simulateDisconnection()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        try await manager.connect(to: discovered)
+
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 5_000_000_000)
+        let states = events.map { $0.state }
+
+        #expect(states.count >= 6, "Expected at least 6 events, got \(states.count)")
+
+        // Sequence: .connecting, .failed, .reconnecting(1), .connecting, .failed, .reconnecting(2), .connecting, .failed
+        #expect(states[0] == .connecting)
+        guard case .failed = states[1] else {
+            Issue.record("Expected .failed at index 1, got \(String(describing: states[1]))")
+            return
+        }
+        guard case .reconnecting(let a1, _) = states[2] else {
+            Issue.record("Expected .reconnecting at index 2, got \(String(describing: states[2]))")
+            return
+        }
+        #expect(a1 == 1)
+        #expect(states[3] == .connecting)
+        guard case .failed = states[4] else {
+            Issue.record("Expected .failed at index 4, got \(String(describing: states[4]))")
+            return
+        }
+        guard case .reconnecting(let a2, _) = states[5] else {
+            Issue.record("Expected .reconnecting at index 5, got \(String(describing: states[5]))")
+            return
+        }
+        #expect(a2 == 2)
+
+        // The terminal state after give-up should be .failed, not .reconnecting.
+        if events.count >= 8 {
+            #expect(states[6] == .connecting)
+            guard case .failed = states[7] else {
+                Issue.record("Expected terminal .failed at index 7, got \(String(describing: states[7]))")
+                return
+            }
+        }
+
+        // Verify no more .reconnecting events after the terminal state.
+        let reconnectingCount = states.filter {
+            if case .reconnecting = $0 { return true }
+            return false
+        }.count
+        #expect(reconnectingCount == 2, "Expected exactly 2 .reconnecting events, got \(reconnectingCount)")
+
+        // Cleanup: disable reconnect to prevent interference.
+        var disabledPolicy = ReconnectPolicy()
+        disabledPolicy.enabled = false
+        await BluetoothActor.shared.setReconnectPolicy(disabledPolicy)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    @Test func explicitDisconnectDoesNotReconnect() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager(reconnectPolicy: Self.testReconnectPolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(Self.testReconnectPolicy)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+
+        // Drain .connecting and .connected.
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+
+        // Explicit disconnect.
+        try await manager.disconnect(from: discovered)
+
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 3_000_000_000)
+        let states = events.map { $0.state }
+
+        // Sequence: .disconnecting, .disconnected(reason: nil). No .reconnecting.
+        #expect(states.count == 2, "Expected 2 events, got \(states.count)")
+        #expect(states[0] == .disconnecting)
+        guard case .disconnected(let reason) = states[1] else {
+            Issue.record("Expected .disconnected at index 1, got \(String(describing: states[1]))")
+            return
+        }
+        #expect(reason == nil, "Expected nil reason for explicit disconnect, got \(String(describing: reason))")
+
+        let hasReconnecting = states.contains {
+            if case .reconnecting = $0 { return true }
+            return false
+        }
+        #expect(!hasReconnecting, "Expected no .reconnecting events after explicit disconnect")
+
+        // Cleanup: disable reconnect to prevent interference.
+        var disabledPolicy = ReconnectPolicy()
+        disabledPolicy.enabled = false
+        await BluetoothActor.shared.setReconnectPolicy(disabledPolicy)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    @Test func transientConnectFailureArmsReconnect() async throws {
+        Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager(reconnectPolicy: Self.testReconnectPolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(Self.testReconnectPolicy)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        // Force a clean disconnection to reset any lingering mock state.
+        Mock.connectionTestSpec.simulateDisconnection()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        try await manager.connect(to: discovered)
+
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 5_000_000_000)
+        let states = events.map { $0.state }
+
+        #expect(states.count >= 3, "Expected at least 3 events, got \(states.count)")
+
+        // Sequence: .connecting, .failed, .reconnecting(attempt: 1, ...)
+        #expect(states[0] == .connecting)
+        guard case .failed = states[1] else {
+            Issue.record("Expected .failed at index 1, got \(String(describing: states[1]))")
+            return
+        }
+        guard case .reconnecting(let attempt, _) = states[2] else {
+            Issue.record("Expected .reconnecting at index 2, got \(String(describing: states[2]))")
+            return
+        }
+        #expect(attempt == 1)
+
+        // Cleanup: disable reconnect to prevent interference.
+        var disabledPolicy = ReconnectPolicy()
+        disabledPolicy.enabled = false
+        await BluetoothActor.shared.setReconnectPolicy(disabledPolicy)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
     // MARK: - Event Stream Broadcaster
 
     @Test func stateStreamReplaysToConcurrentSubscribers() async throws {
@@ -800,11 +1053,15 @@ enum Mock {
     /// is pinned to `.notDetermined` **before** any central can be created — including by the maintainer's
     /// authorization tests, whose `.notDetermined` `authorize()` path itself creates a central. Use
     /// ``ensureReady(_:)`` afterwards to bring the shared central online.
-    static func makeManager(loggingEnabled: Bool = false) async -> ReliaBLEManager {
+    static func makeManager(loggingEnabled: Bool = false, reconnectPolicy: ReconnectPolicy? = nil) async -> ReliaBLEManager {
         await SimulationConfig.shared.ensureConfigured()
 
         var config = ReliaBLEConfig()
         config.loggingEnabled = loggingEnabled
+        config.reconnectPolicy.enabled = false
+        if let reconnectPolicy {
+            config.reconnectPolicy = reconnectPolicy
+        }
         return ReliaBLEManager(config: config)
     }
 
@@ -987,5 +1244,28 @@ func firstConnectionStateChange(
         let first = await group.next() ?? nil
         group.cancelAll()
         return first
+    }
+}
+
+/// Drains all connection-state changes from `stream` within `nanoseconds`, returning them in arrival order.
+func drainConnectionStateChanges(
+    from stream: AsyncStream<ConnectionStateChange>,
+    withinNanoseconds nanoseconds: UInt64
+) async -> [ConnectionStateChange] {
+    await withTaskGroup(of: [ConnectionStateChange].self) { group in
+        group.addTask {
+            var events: [ConnectionStateChange] = []
+            for await change in stream {
+                events.append(change)
+            }
+            return events
+        }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            return []
+        }
+        _ = await group.next()
+        group.cancelAll()
+        return await group.next() ?? []
     }
 }

@@ -155,6 +155,8 @@ do {
             case .connected:
                 print("Connected to \(peripheral.id)")
                 return
+            case .reconnecting(let attempt, let nextRetryAt):
+                print("Reconnecting attempt \(attempt), next retry at \(nextRetryAt)")
             case .disconnected(let reason):
                 print("Disconnected", reason ?? "clean")
                 return

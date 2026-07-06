@@ -47,7 +47,42 @@ public struct ReliaBLEConfig: Sendable {
     /// Whether or not logging is enabled. The default value is `false`.
     public var loggingEnabled = false
     
+    /// Policy controlling automatic reconnection behavior with exponential backoff.
+    /// When `enabled`, the library will automatically attempt to reconnect after unexpected
+    /// disconnects or transient connect failures.
+    public var reconnectPolicy = ReconnectPolicy()
+    
     /// Initializes a new `ReliaBLEConfig` instance with the default values.
+    public init() {
+        
+    }
+}
+
+/// Policy controlling automatic reconnection with exponential backoff.
+///
+/// When ``enabled`` is `true` (the default), the library automatically attempts to reconnect a
+/// peripheral after an unexpected disconnect or a transient connect failure, using an exponential
+/// backoff delay with jitter, capped at ``maxDelay`` and bounded by ``maxAttempts``.
+public struct ReconnectPolicy: Sendable {
+    /// Whether automatic reconnection is enabled. The default value is `true`.
+    public var enabled = true
+
+    /// The maximum number of consecutive reconnection attempts before giving up. The default value is `5`.
+    public var maxAttempts = 5
+
+    /// The base delay before the first reconnection attempt, in seconds. Subsequent attempts grow
+    /// exponentially from this value. The default value is `1.0`.
+    public var initialDelay: TimeInterval = 1.0
+
+    /// The maximum delay between reconnection attempts, in seconds, after exponential growth is
+    /// capped. The default value is `30.0`.
+    public var maxDelay: TimeInterval = 30.0
+
+    /// The fractional jitter (0...1) applied to each computed delay to avoid synchronized retries.
+    /// The default value is `0.2`.
+    public var jitter: Double = 0.2
+
+    /// Initializes a new `ReconnectPolicy` with the default values.
     public init() {
         
     }
