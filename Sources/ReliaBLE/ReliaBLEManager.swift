@@ -175,15 +175,16 @@ public final class ReliaBLEManager: Sendable {
     /// to the live CoreBluetooth peripheral held internally and requests a connection.
     ///
     /// - Parameter peripheral: A peripheral previously delivered via ``discoveredPeripherals``.
+    /// - Parameter autoReconnect: When `true` (the default), the library passes
+    ///   `CBConnectPeripheralOptionEnableAutoReconnect` to the system and arms the app-side
+    ///   exponential-backoff ladder for cases the OS option doesn't cover. Set to `false` for
+    ///   one-shot connections where reconnection is not desired.
     /// - Throws: ``PeripheralError/notFound`` if the peripheral's live reference has been invalidated (a stale
     ///   snapshot), or ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up (for example, not
     ///   yet authorized).
-    ///
-    /// - Note: This currently only initiates the connection request. The full connection lifecycle is deferred to a
-    ///   later release.
-    public func connect(to peripheral: Peripheral) async throws {
+    public func connect(to peripheral: Peripheral, autoReconnect: Bool = true) async throws {
         await BluetoothActor.shared.ensureInitialized(log: log)
-        try await BluetoothActor.shared.connect(id: peripheral.id)
+        try await BluetoothActor.shared.connect(id: peripheral.id, autoReconnect: autoReconnect)
     }
 
     /// Initiates a disconnection from a previously connected peripheral.

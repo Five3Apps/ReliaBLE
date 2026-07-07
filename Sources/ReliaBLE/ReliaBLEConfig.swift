@@ -47,9 +47,10 @@ public struct ReliaBLEConfig: Sendable {
     /// Whether or not logging is enabled. The default value is `false`.
     public var loggingEnabled = false
     
-    /// Policy controlling automatic reconnection behavior with exponential backoff.
-    /// When `enabled`, the library will automatically attempt to reconnect after unexpected
-    /// disconnects or transient connect failures.
+    /// Policy controlling the behavior of the library-side exponential backoff supplement
+    /// for automatic reconnection. Enable/disable is a per-connect choice on
+    /// ``ReliaBLEManager/connect(to:autoReconnect:)``; this policy governs *how* the
+    /// library retries when auto-reconnect is active.
     public var reconnectPolicy = ReconnectPolicy()
     
     /// Initializes a new `ReliaBLEConfig` instance with the default values.
@@ -58,15 +59,15 @@ public struct ReliaBLEConfig: Sendable {
     }
 }
 
-/// Policy controlling automatic reconnection with exponential backoff.
+/// Policy controlling the library-side exponential backoff supplement for automatic
+/// reconnection.
 ///
-/// When ``enabled`` is `true` (the default), the library automatically attempts to reconnect a
-/// peripheral after an unexpected disconnect or a transient connect failure, using an exponential
-/// backoff delay with jitter, capped at ``maxDelay`` and bounded by ``maxAttempts``.
+/// This struct governs *how* the library retries when auto-reconnect is active (the
+/// enable/disable decision is a per-connect parameter, not global config). When the
+/// library ladder arms, retry delays follow exponential growth (`initialDelay * 2^(attempt-1)`)
+/// capped at ``maxDelay``, with ``jitter`` spread to avoid synchronized retries, and
+/// bounded by ``maxAttempts``.
 public struct ReconnectPolicy: Sendable {
-    /// Whether automatic reconnection is enabled. The default value is `true`.
-    public var enabled = true
-
     /// The maximum number of consecutive reconnection attempts before giving up. The default value is `5`.
     public var maxAttempts = 5
 
