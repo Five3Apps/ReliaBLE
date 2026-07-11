@@ -631,6 +631,7 @@ actor BluetoothActor {
         reconnectTasks.removeAll()
         reconnectAttempts.removeAll()
         reconnectEnabled.removeAll()
+        intentionalDisconnects.removeAll()
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
         log?.debug("Invalidated all peripheral references")
     }
@@ -768,6 +769,11 @@ actor BluetoothActor {
         }
         
         if payload.isReconnecting {
+            // Defensively cancel any pending library ladder so Tier 0 (system) and Tier 1
+            // (library) cannot overlap under odd callback ordering.
+            reconnectTasks[id]?.cancel()
+            reconnectTasks[id] = nil
+
             connectionStates[id] = .reconnecting(source: .system, attempt: nil, nextRetryAt: nil)
             log?.info(tags: [.peripheral(id), .category(.connection)], "System auto-reconnect in progress")
             
@@ -813,6 +819,9 @@ actor BluetoothActor {
 
         let attempts = reconnectAttempts[id] ?? 0
         guard reconnectPolicy.maxAttempts > 0, attempts < reconnectPolicy.maxAttempts else {
+            // Give-up clears in-flight ladder bookkeeping only. `reconnectEnabled` is deliberately
+            // retained so reconnection intent survives until an explicit `disconnect` — a later
+            // unexpected drop must start a fresh ladder from attempt 1.
             clearReconnectState(for: id)
             log?.info(tags: [.peripheral(id), .category(.connection)], "Reconnect attempts exhausted")
             
@@ -857,13 +866,21 @@ actor BluetoothActor {
         guard !Task.isCancelled,
               reconnectAttempts[id] == attempt,
               case .reconnecting(_, let currentAttempt?, _) = connectionStates[id],
-              currentAttempt == attempt,
-              cbPeripherals[id] != nil
+              currentAttempt == attempt
         else {
             return
         }
         
-        try? connect(id: id, autoReconnect: true)
+        do {
+            try connect(id: id, autoReconnect: true)
+        } catch {
+            let reason = (error as? PeripheralError) ?? .unknown
+            clearReconnectState(for: id)
+            let state: ConnectionState = .failed(reason: reason)
+            connectionStates[id] = state
+            log?.warn(tags: [.peripheral(id), .category(.connection)], "Reconnect attempt failed: \(reason)")
+            broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+        }
     }
     
     private func clearReconnectState(for id: String) {
@@ -890,6 +907,21 @@ actor BluetoothActor {
         guard let cbPeripheral = cbPeripherals[id] else { return }
         let payload = ConnectionPayload(peripheral: cbPeripheral, isReconnecting: isReconnecting, error: error)
         handleDidDisconnect(payload)
+    }
+
+    /// Test-only hook: runs the same peripheral invalidation as a Bluetooth reset/unauthorized path.
+    func testInvalidatePeripherals() {
+        invalidatePeripherals()
+    }
+
+    /// Test-only hook: whether `id` is currently marked as an intentional disconnect.
+    func testContainsIntentionalDisconnect(_ id: String) -> Bool {
+        intentionalDisconnects.contains(id)
+    }
+
+    /// Test-only hook: seeds intentional-disconnect intent without going through `disconnect(id:)`.
+    func testSeedIntentionalDisconnect(_ id: String) {
+        intentionalDisconnects.insert(id)
     }
 }
 

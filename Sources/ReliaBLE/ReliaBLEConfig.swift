@@ -83,8 +83,18 @@ public struct ReconnectPolicy: Sendable {
     /// The default value is `0.2`.
     public var jitter: Double = 0.2
 
-    /// Initializes a new `ReconnectPolicy` with the default values.
-    public init() {
-        
+    /// Initializes a new `ReconnectPolicy` with the given values.
+    ///
+    /// All parameters default to the library's standard policy so `ReconnectPolicy()` remains valid.
+    public init(
+        maxAttempts: Int = 5,
+        initialDelay: TimeInterval = 1.0,
+        maxDelay: TimeInterval = 30.0,
+        jitter: Double = 0.2
+    ) {
+        self.maxAttempts = maxAttempts
+        self.initialDelay = initialDelay
+        self.maxDelay = maxDelay
+        self.jitter = jitter
     }
 }

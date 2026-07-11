@@ -673,14 +673,12 @@ struct ReliaBLEManagerTests {
     // MARK: - Reconnection
 
     /// A fast reconnect policy for tests: tiny delays, no jitter, small max attempts.
-    private static let testReconnectPolicy: ReconnectPolicy = {
-        var policy = ReconnectPolicy()
-        policy.maxAttempts = 3
-        policy.initialDelay = 0.001
-        policy.maxDelay = 0.005
-        policy.jitter = 0
-        return policy
-    }()
+    private static let testReconnectPolicy = ReconnectPolicy(
+        maxAttempts: 3,
+        initialDelay: 0.001,
+        maxDelay: 0.005,
+        jitter: 0
+    )
 
     @Test func systemReconnectOnUnexpectedDrop() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
@@ -735,11 +733,12 @@ struct ReliaBLEManagerTests {
     }
 
     @Test func reconnectGivesUpAfterMaxAttempts() async throws {
-        var giveUpPolicy = ReconnectPolicy()
-        giveUpPolicy.maxAttempts = 2
-        giveUpPolicy.initialDelay = 0.001
-        giveUpPolicy.maxDelay = 0.005
-        giveUpPolicy.jitter = 0
+        let giveUpPolicy = ReconnectPolicy(
+            maxAttempts: 2,
+            initialDelay: 0.001,
+            maxDelay: 0.005,
+            jitter: 0
+        )
 
         Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
@@ -1033,6 +1032,223 @@ struct ReliaBLEManagerTests {
         var cleanup = ReconnectPolicy()
         cleanup.maxAttempts = 0
         await BluetoothActor.shared.setReconnectPolicy(cleanup)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    @Test func explicitDisconnectCancelsPendingLibraryRetry() async throws {
+        // Long enough that we can issue an explicit disconnect while the ladder is mid-sleep,
+        // but short enough to keep suite time down (disconnect runs immediately after .reconnecting).
+        let slowPolicy = ReconnectPolicy(
+            maxAttempts: 3,
+            initialDelay: 0.5,
+            maxDelay: 0.5,
+            jitter: 0
+        )
+
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager(reconnectPolicy: slowPolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(slowPolicy)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+
+        // Arm the library ladder, then cancel it mid-sleep with an explicit disconnect.
+        await BluetoothActor.shared.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+
+        let disconnected = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        guard case .disconnected = disconnected?.state else {
+            Issue.record("Expected .disconnected, got \(String(describing: disconnected?.state))")
+            return
+        }
+
+        let reconnecting = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        guard case .reconnecting(.library, let attempt, _) = reconnecting?.state else {
+            Issue.record("Expected .reconnecting(.library), got \(String(describing: reconnecting?.state))")
+            return
+        }
+        #expect(attempt == 1)
+
+        try await manager.disconnect(from: discovered)
+
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 1_000_000_000)
+        let states = events.map(\.state)
+
+        #expect(states.contains(.disconnecting))
+        #expect(states.contains(.disconnected(reason: nil)))
+
+        let hasConnecting = states.contains(.connecting)
+        let hasLibraryRetry = states.contains {
+            if case .reconnecting(.library, _, _) = $0 { return true }
+            return false
+        }
+        #expect(!hasConnecting, "Expected no reconnect .connecting after explicit cancel, got \(states)")
+        #expect(!hasLibraryRetry, "Expected no further library retries after explicit cancel, got \(states)")
+
+        await BluetoothActor.shared.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    @Test func successfulLibraryReconnectResetsAttemptCounter() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager(reconnectPolicy: Self.testReconnectPolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(Self.testReconnectPolicy)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+
+        // First unexpected drop → ladder attempt 1, then successful reconnect.
+        await BluetoothActor.shared.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .disconnected
+        let firstLadder = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        guard case .reconnecting(.library, let firstAttempt, _) = firstLadder?.state else {
+            Issue.record("Expected first .reconnecting(.library), got \(String(describing: firstLadder?.state))")
+            return
+        }
+        #expect(firstAttempt == 1)
+
+        let reconnectConnecting = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(reconnectConnecting?.state == .connecting)
+
+        let reconnectConnected = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(reconnectConnected?.state == .connected)
+
+        // Second unexpected drop must start a fresh ladder at attempt 1, not continue at 2.
+        await BluetoothActor.shared.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .disconnected
+        let secondLadder = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        guard case .reconnecting(.library, let secondAttempt, _) = secondLadder?.state else {
+            Issue.record("Expected second .reconnecting(.library), got \(String(describing: secondLadder?.state))")
+            return
+        }
+        #expect(secondAttempt == 1)
+
+        try? await manager.disconnect(from: discovered)
+        await BluetoothActor.shared.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    @Test func invalidateClearsIntentionalDisconnectIntent() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let id = "intentional-seed"
+        await BluetoothActor.shared.testSeedIntentionalDisconnect(id)
+        #expect(await BluetoothActor.shared.testContainsIntentionalDisconnect(id))
+
+        await BluetoothActor.shared.testInvalidatePeripherals()
+        #expect(!(await BluetoothActor.shared.testContainsIntentionalDisconnect(id)))
+    }
+
+    @Test func giveUpThenUnexpectedDropRearmsFreshLadder() async throws {
+        let giveUpPolicy = ReconnectPolicy(
+            maxAttempts: 1,
+            initialDelay: 0.001,
+            maxDelay: 0.005,
+            jitter: 0
+        )
+
+        Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager(reconnectPolicy: giveUpPolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(giveUpPolicy)
+
+        var changes = manager.connectionStateChanges.makeAsyncIterator()
+        // Force an actor hop so registration completes before we connect.
+        _ = await manager.currentConnectionStates
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        Mock.connectionTestSpec.simulateDisconnection()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        try await manager.connect(to: discovered)
+
+        // Exhaust the single-attempt ladder:
+        // connecting → failed → reconnecting(1) → connecting → failed (give-up).
+        let s0 = await changes.next()
+        #expect(s0?.state == .connecting)
+
+        let s1 = await changes.next()
+        guard case .failed = s1?.state else {
+            Issue.record("Expected .failed at index 1, got \(String(describing: s1?.state))")
+            return
+        }
+
+        let s2 = await changes.next()
+        guard case .reconnecting(.library, let a1, _) = s2?.state else {
+            Issue.record("Expected .reconnecting(.library, 1), got \(String(describing: s2?.state))")
+            return
+        }
+        #expect(a1 == 1)
+
+        let s3 = await changes.next()
+        #expect(s3?.state == .connecting)
+
+        let s4 = await changes.next()
+        guard case .failed = s4?.state else {
+            Issue.record("Expected terminal .failed after give-up, got \(String(describing: s4?.state))")
+            return
+        }
+
+        // Intent survives give-up: a later unexpected drop must arm a fresh ladder at attempt 1.
+        await BluetoothActor.shared.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+
+        let s5 = await changes.next()
+        guard case .disconnected = s5?.state else {
+            Issue.record("Expected .disconnected after post-give-up drop, got \(String(describing: s5?.state))")
+            return
+        }
+
+        let s6 = await changes.next()
+        guard case .reconnecting(.library, let a2, _) = s6?.state else {
+            Issue.record("Expected fresh .reconnecting(.library, attempt: 1), got \(String(describing: s6?.state))")
+            return
+        }
+        #expect(a2 == 1)
+
+        try? await manager.disconnect(from: discovered)
+        await BluetoothActor.shared.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
 

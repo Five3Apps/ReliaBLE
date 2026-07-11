@@ -167,6 +167,10 @@ config.reconnectPolicy.jitter = 0.2         // ±20% randomization
 let bleManager = ReliaBLEManager(config: config)
 ```
 
+> Important: `ReconnectPolicy` (and logging configuration) is applied only during the **first** `ReliaBLEManager` initialization (the first actor setup) behind the library's process-wide actor singleton. Constructing a second `ReliaBLEManager(config:)` in the same process will **not** update the already-stashed policy — set your desired config before creating the first manager instance.
+
+> Note: iOS's Tier-0 auto-reconnect give-up budget and timing (`CBConnectPeripheralOptionEnableAutoReconnect`) are not publicly documented by Apple. The exact retry duration and failure threshold still require on-device verification — this is deliberately deferred follow-up work.
+
 ```swift
 do {
     let changes = bleManager.connectionStateChanges
@@ -188,7 +192,7 @@ do {
                 print("Disconnected", reason ?? "clean")
                 return
             case .failed(let reason):
-            print("Failed", reason ?? "")
+                print("Failed", reason ?? "")
                 return
             default:
                 break
