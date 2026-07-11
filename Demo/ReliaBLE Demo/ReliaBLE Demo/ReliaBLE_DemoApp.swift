@@ -61,6 +61,14 @@ struct ReliaBLE_DemoApp: App {
         config.logQueue = DispatchQueue(label: "com.five3apps.relia-ble-demo.logging", qos: .utility)
         config.loggingEnabled = true
         
+        let defaults = UserDefaults.standard
+        var reconnectPolicy = ReconnectPolicy()
+        reconnectPolicy.maxAttempts = defaults.object(forKey: "reconnectPolicy.maxAttempts") as? Int ?? 5
+        reconnectPolicy.initialDelay = defaults.object(forKey: "reconnectPolicy.initialDelay") as? Double ?? 1.0
+        reconnectPolicy.maxDelay = defaults.object(forKey: "reconnectPolicy.maxDelay") as? Double ?? 30.0
+        reconnectPolicy.jitter = defaults.object(forKey: "reconnectPolicy.jitter") as? Double ?? 0.2
+        config.reconnectPolicy = reconnectPolicy
+        
         return ReliaBLEManager(config: config)
     }()
 

@@ -34,11 +34,46 @@ extension ConnectionState {
     var description: String {
         switch self {
         case .connecting: "Connecting"
+        case .reconnecting(let source, let attempt, _):
+            switch source {
+            case .system: "System reconnecting…"
+            case .library: "Reconnecting (attempt \(attempt ?? 0))"
+            }
         case .connected: "Connected"
         case .disconnecting: "Disconnecting"
         case .disconnected(let reason): "Disconnected\(reason.map { " (\($0))" } ?? "")"
         case .failed(let reason): "Failed\(reason.map { " (\($0))" } ?? "")"
         }
+    }
+
+    var nextRetryAt: Date? {
+        if case .reconnecting(_, _, let date) = self { return date }
+        return nil
+    }
+
+    var color: Color {
+        switch self {
+        case .connected: .green
+        case .reconnecting: .yellow
+        case .disconnected(let reason): reason == nil ? .secondary : .orange
+        case .failed: .red
+        default: .orange
+        }
+    }
+
+    /// True when a connection is active or in progress (including reconnect).
+    var isActiveConnection: Bool {
+        switch self {
+        case .connecting, .connected, .disconnecting, .reconnecting:
+            true
+        case .disconnected, .failed:
+            false
+        }
+    }
+
+    /// Auto-reconnect can only be changed when initiating a fresh connect.
+    var canEditAutoReconnect: Bool {
+        !isActiveConnection
     }
 }
 
@@ -140,37 +175,11 @@ struct CentralView: View {
         List {
             ForEach(devices, id: \.persistentModelID) { device in
                 NavigationLink {
-                    Group {
-                        let currentState = viewModel.connectionStates[device.id]
-                        VStack(spacing: 16) {
-                            Text("ID: \(device.id)")
-                            Text("Last seen: \(device.lastSeen?.formatted(date: .numeric, time: .standard) ?? "")")
-
-                            if let state = currentState {
-                                Text("Connection: \(state.description)")
-                                    .foregroundStyle(state == .connected ? Color.green : Color.orange)
-                            } else {
-                                Text("Connection: unknown")
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Button(action: {
-                                if let state = currentState, state == .connected {
-                                    Task { try? await reliaBLE.disconnect(from: Peripheral(id: device.id)) }
-                                } else {
-                                    Task { try? await reliaBLE.connect(to: Peripheral(id: device.id)) }
-                                }
-                            }) {
-                                if let state = currentState, state == .connected {
-                                    Text("Disconnect")
-                                } else {
-                                    Text("Connect")
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                        .padding()
-                    }
+                    DeviceDetailView(
+                        device: device,
+                        viewModel: viewModel,
+                        reliaBLE: reliaBLE
+                    )
                 } label: {
                     Text("\(device.name ?? "Unknown")")
                 }
@@ -198,6 +207,78 @@ struct CentralView: View {
                 viewModel.deleteDiscoveries(ids: ids)
             }
         }
+    }
+}
+
+private struct DeviceDetailView: View {
+    let device: Device
+    let viewModel: CentralViewModel
+    let reliaBLE: ReliaBLEManager
+
+    @State private var autoReconnect = true
+
+    private var connectionState: ConnectionState? {
+        viewModel.connectionStates[device.id]
+    }
+
+    private var isActive: Bool {
+        connectionState?.isActiveConnection == true
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("ID: \(device.id)")
+            Text("Last seen: \(device.lastSeen?.formatted(date: .numeric, time: .standard) ?? "")")
+
+            if let state = connectionState {
+                Text("Connection: \(state.description)")
+                    .foregroundStyle(state.color)
+
+                if let retryAt = state.nextRetryAt {
+                    CountdownView(targetDate: retryAt)
+                }
+            } else {
+                Text("Connection: unknown")
+                    .foregroundStyle(.secondary)
+            }
+
+            Button(action: {
+                if isActive {
+                    Task { try? await reliaBLE.disconnect(from: Peripheral(id: device.id)) }
+                } else {
+                    Task {
+                        try? await reliaBLE.connect(
+                            to: Peripheral(id: device.id),
+                            autoReconnect: autoReconnect
+                        )
+                    }
+                }
+            }) {
+                Text(isActive ? "Disconnect" : "Connect")
+            }
+            .buttonStyle(.bordered)
+
+            Toggle("Auto Reconnect:", isOn: $autoReconnect)
+                .disabled(connectionState.map { !$0.canEditAutoReconnect } ?? false)
+        }
+        .padding()
+    }
+}
+
+private struct CountdownView: View {
+    let targetDate: Date
+
+    @State private var now = Date()
+
+    var body: some View {
+        let remaining = max(0, targetDate.timeIntervalSince(now))
+        Text("Next retry in: \(Int(remaining))s")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+                now = Date()
+            }
     }
 }
 

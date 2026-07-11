@@ -32,10 +32,42 @@ struct SettingsView: View {
     @Environment(\.bleManager) private var reliaBLE
     @State private var isLoggingEnabled: Bool = false
 
+    @AppStorage("reconnectPolicy.maxAttempts") private var maxAttempts = 5
+    @AppStorage("reconnectPolicy.initialDelay") private var initialDelay = 1.0
+    @AppStorage("reconnectPolicy.maxDelay") private var maxDelay = 30.0
+    @AppStorage("reconnectPolicy.jitter") private var jitter = 0.2
+
     var body: some View {
         NavigationView {
             Form {
-                Toggle("Enable Logging", isOn: $isLoggingEnabled)
+                Section("Logging") {
+                    Toggle("Enable Logging", isOn: $isLoggingEnabled)
+                }
+
+                Section {
+                    Stepper("Max Attempts: \(maxAttempts)", value: $maxAttempts, in: 1...20)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Initial Delay: \(String(format: "%.1f", initialDelay))s")
+                        Slider(value: $initialDelay, in: 0.5...10, step: 0.5)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Max Delay: \(String(format: "%.0f", maxDelay))s")
+                        Slider(value: $maxDelay, in: 5...120, step: 5)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Jitter: \(String(format: "%.2f", jitter))")
+                        Slider(value: $jitter, in: 0...0.5, step: 0.05)
+                    }
+
+                    Text("Changes take effect on next app launch.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Reconnect Policy")
+                }
             }
             .navigationTitle("Settings")
         }
