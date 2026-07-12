@@ -143,7 +143,33 @@ If your app already knows a peripheral's identity ahead of time — for example,
 
 ## Connecting to a Peripheral
 
-Use ``ReliaBLEManager/connect(to:)`` to initiate a connection to a discovered ``Peripheral``. Consume ``ReliaBLEManager/connectionStateChanges`` (an `AsyncStream<ConnectionStateChange>`) to observe the full lifecycle for any peripheral; filter by `peripheralId` for a specific device. Call ``ReliaBLEManager/disconnect(from:)`` to end the session.
+Use ``ReliaBLEManager/connect(to:autoReconnect:)`` to initiate a connection to a discovered ``Peripheral``. Consume ``ReliaBLEManager/connectionStateChanges`` (an `AsyncStream<ConnectionStateChange>`) to observe the full lifecycle for any peripheral; filter by `peripheralId` for a specific device. Call ``ReliaBLEManager/disconnect(from:)`` to end the session.
+
+Reconnection is **on by default** via the `autoReconnect` parameter (default `true`). When active, ReliaBLE uses a **two-tier model**:
+
+1. **Tier 0 — System-managed (primary).** The connection request includes `CBConnectPeripheralOptionEnableAutoReconnect`, which asks the iOS daemon to re-establish the link itself after an unexpected drop. This is power-efficient, daemon-held, and keeps trying across app suspension. While the system retries, ReliaBLE emits ``ConnectionState/reconnecting(source:attempt:nextRetryAt:)`` with ``ReconnectSource/system`` (`attempt` and `nextRetryAt` are both `nil` — iOS exposes neither).
+2. **Tier 1 — Library-managed (supplement).** Covers what the OS option doesn't: initial-connect failures and drops where the OS gives up. The library arms an exponential-backoff ladder governed by ``ReconnectPolicy``, emitting ``ReconnectSource/library`` with populated `attempt` and `nextRetryAt` so your UI can show a countdown.
+
+To disable auto-reconnect for a one-shot connection (a sensor you pair with briefly, then disconnect), pass `autoReconnect: false`:
+
+```swift
+try await bleManager.connect(to: peripheral, autoReconnect: false)
+```
+
+Tune the library backoff via ``ReliaBLEConfig/reconnectPolicy``:
+
+```swift
+var config = ReliaBLEConfig()
+config.reconnectPolicy.maxAttempts = 3
+config.reconnectPolicy.initialDelay = 1.0   // seconds before first retry
+config.reconnectPolicy.maxDelay = 10.0      // cap exponential growth
+config.reconnectPolicy.jitter = 0.2         // ±20% randomization
+let bleManager = ReliaBLEManager(config: config)
+```
+
+> Important: `ReconnectPolicy` (and logging configuration) is applied only during the **first** `ReliaBLEManager` initialization (the first actor setup) behind the library's process-wide actor singleton. Constructing a second `ReliaBLEManager(config:)` in the same process will **not** update the already-stashed policy — set your desired config before creating the first manager instance.
+
+> Note: iOS's Tier-0 auto-reconnect give-up budget and timing (`CBConnectPeripheralOptionEnableAutoReconnect`) are not publicly documented by Apple. The exact retry duration and failure threshold still require on-device verification — this is deliberately deferred follow-up work.
 
 ```swift
 do {
@@ -155,11 +181,18 @@ do {
             case .connected:
                 print("Connected to \(peripheral.id)")
                 return
+            case .reconnecting(let source, let attempt, let nextRetryAt):
+                switch source {
+                case .system:
+                    print("System reconnecting…")
+                case .library:
+                    print("Reconnecting attempt \(attempt ?? 0), next retry at \(nextRetryAt ?? .now)")
+                }
             case .disconnected(let reason):
                 print("Disconnected", reason ?? "clean")
                 return
             case .failed(let reason):
-            print("Failed", reason ?? "")
+                print("Failed", reason ?? "")
                 return
             default:
                 break
@@ -168,7 +201,7 @@ do {
     }
     defer { observer.cancel() }
     
-    try await bleManager.connect(to: peripheral)
+    try await bleManager.connect(to: peripheral, autoReconnect: true)
     
     // Later, when you're done with the session:
     try await bleManager.disconnect(from: peripheral)
@@ -181,4 +214,4 @@ do {
 }
 ```
 
-Each access to `connectionStateChanges` yields a fresh stream; it does not replay, so begin iteration before calling `connect(to:)`. The `ConnectionState` values are `.connecting`, `.connected`, `.disconnecting`, `.disconnected(reason:)`, and `.failed(reason:)`. Terminal states carry an optional ``PeripheralError`` reason.
+Each access to `connectionStateChanges` yields a fresh stream; it does not replay, so begin iteration before calling ``ReliaBLEManager/connect(to:autoReconnect:)``. The `ConnectionState` values are ``ConnectionState/connecting``, ``ConnectionState/connected``, ``ConnectionState/disconnecting``, ``ConnectionState/disconnected(reason:)``, ``ConnectionState/failed(reason:)``, and ``ConnectionState/reconnecting(source:attempt:nextRetryAt:)``. Terminal states carry an optional ``PeripheralError`` reason.

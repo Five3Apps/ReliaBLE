@@ -47,6 +47,7 @@ private struct DiscoveryPayload: @unchecked Sendable {
 
 private struct ConnectionPayload: @unchecked Sendable {
     let peripheral: CBPeripheral
+    let isReconnecting: Bool
     let error: Error?
 }
 
@@ -129,6 +130,12 @@ actor BluetoothActor {
     var connectionStates: [String: ConnectionState] = [:]
 
     private var connectionStateChangesContinuations: [UUID: AsyncStream<ConnectionStateChange>.Continuation] = [:]
+
+    private var reconnectPolicy: ReconnectPolicy = ReconnectPolicy()
+    private var reconnectEnabled: Set<String> = []
+    private var intentionalDisconnects: Set<String> = []
+    private var reconnectAttempts: [String: Int] = [:]
+    private var reconnectTasks: [String: Task<Void, Never>] = [:]
 
     // MARK: - Initialization
 
@@ -281,14 +288,16 @@ actor BluetoothActor {
     /// the lazy-permission contract: the iOS prompt only appears when the integrating app calls
     /// ``ReliaBLEManager/authorizeBluetooth()``. The initial state is broadcast on first setup and
     /// whenever the manager is created, but not on every redundant call.
-    func ensureInitialized(log: LoggingService) {
+    func ensureInitialized(log: LoggingService, reconnectPolicy: ReconnectPolicy = ReconnectPolicy()) {
         let firstInitialization = !isInitialized
         if firstInitialization {
             isInitialized = true
             configure(log: log)
+            self.reconnectPolicy = reconnectPolicy
         }
 
         var createdManager = false
+
         if centralManager == nil, CBCentralManager.authorization == .allowedAlways {
             setupCentralManager()
             createdManager = true
@@ -618,6 +627,11 @@ actor BluetoothActor {
         // The value snapshots hold no CoreBluetooth reference to clear; drop the live registry instead.
         cbPeripherals.removeAll()
         connectionStates.removeAll()
+        for task in reconnectTasks.values { task.cancel() }
+        reconnectTasks.removeAll()
+        reconnectAttempts.removeAll()
+        reconnectEnabled.removeAll()
+        intentionalDisconnects.removeAll()
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
         log?.debug("Invalidated all peripheral references")
     }
@@ -642,6 +656,73 @@ actor BluetoothActor {
     }
 
     // MARK: - Connection
+    
+    /// Initiates a connection to the live peripheral backing the given snapshot `id`.
+    ///
+    /// Optimistically broadcasts `.connecting` before the CoreBluetooth call, then issues the
+    /// connection request. The actual `.connected` or `.failed` callback arrives later via the
+    /// delegate pipeline.
+    ///
+    /// - Parameter id: The ``Peripheral/id`` of a previously discovered peripheral.
+    /// - Parameter autoReconnect: When `true`, the OS auto-reconnect option is passed and the
+    ///   library ladder may arm on failure. When `false`, reconnection is suppressed entirely.
+    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id` (a stale snapshot).
+    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
+    func connect(id: String, autoReconnect: Bool = true) throws {
+        guard let centralManager else {
+            log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
+            throw PeripheralError.bluetoothUnavailable
+        }
+        
+        guard let cbPeripheral = cbPeripherals[id] else {
+            throw PeripheralError.notFound
+        }
+        
+        if autoReconnect {
+            reconnectEnabled.insert(id)
+        } else {
+            reconnectEnabled.remove(id)
+        }
+        intentionalDisconnects.remove(id)
+        connectionStates[id] = .connecting
+        broadcast(ConnectionStateChange(peripheralId: id, state: .connecting), to: connectionStateChangesContinuations)
+        
+        var options: [String: Any]?
+        if #available(macOS 14.0, iOS 17.0, *) {
+            options = autoReconnect ? [CBConnectPeripheralOptionEnableAutoReconnect: true] : nil
+        }
+        centralManager.connect(cbPeripheral, options: options)
+    }
+    
+    /// Initiates a disconnection from the live peripheral backing the given snapshot `id`.
+    ///
+    /// Optimistically broadcasts `.disconnecting` before cancelling the connection. The actual
+    /// `.disconnected` callback arrives later via the delegate pipeline.
+    ///
+    /// - Parameter id: The ``Peripheral/id`` of a previously connected peripheral.
+    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id`.
+    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
+    func disconnect(id: String) throws {
+        guard let centralManager else {
+            log?.warn(tags: [.peripheral(id)], "Attempted to disconnect without a central manager")
+            throw PeripheralError.bluetoothUnavailable
+        }
+        
+        guard let cbPeripheral = cbPeripherals[id] else {
+            throw PeripheralError.notFound
+        }
+        
+        // Reset auto-reconnect since this was an explicit disconnect
+        intentionalDisconnects.insert(id)
+        reconnectEnabled.remove(id)
+        reconnectTasks[id]?.cancel()
+        reconnectTasks[id] = nil
+        reconnectAttempts[id] = nil
+        
+        connectionStates[id] = .disconnecting
+        broadcast(ConnectionStateChange(peripheralId: id, state: .disconnecting), to: connectionStateChangesContinuations)
+        centralManager.cancelPeripheralConnection(cbPeripheral)
+    }
 
     /// Resolves a ``Peripheral/id`` from the live `CBPeripheral` reference using reverse object-identity lookup.
     ///
@@ -658,6 +739,9 @@ actor BluetoothActor {
             log?.warn(tags: [.category(.connection)], "didConnect for unknown peripheral — dropped")
             return
         }
+        
+        clearReconnectState(for: id)
+        
         connectionStates[id] = .connected
         log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral connected")
         broadcast(ConnectionStateChange(peripheralId: id, state: .connected), to: connectionStateChangesContinuations)
@@ -668,15 +752,48 @@ actor BluetoothActor {
             log?.warn(tags: [.category(.connection)], "didDisconnect for unknown peripheral — dropped")
             return
         }
+        
+        if intentionalDisconnects.remove(id) != nil {
+            // Contract: `.disconnected(reason:)` carries `nil` for a clean, app-initiated disconnect.
+            // CoreBluetooth can still deliver a benign cancellation-style error on-device for an
+            // explicit `cancelPeripheralConnection`, so we intentionally ignore `payload.error` here
+            // and always report a clean disconnect — otherwise the app/Demo would misclassify an
+            // intentional disconnect as an error drop.
+            let state: ConnectionState = .disconnected(reason: nil)
+            connectionStates[id] = state
+            log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected (explicit)")
+            
+            broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+            
+            return
+        }
+        
+        if payload.isReconnecting {
+            // Defensively cancel any pending library ladder so Tier 0 (system) and Tier 1
+            // (library) cannot overlap under odd callback ordering.
+            reconnectTasks[id]?.cancel()
+            reconnectTasks[id] = nil
+
+            connectionStates[id] = .reconnecting(source: .system, attempt: nil, nextRetryAt: nil)
+            log?.info(tags: [.peripheral(id), .category(.connection)], "System auto-reconnect in progress")
+            
+            broadcast(ConnectionStateChange(peripheralId: id, state: .reconnecting(source: .system, attempt: nil, nextRetryAt: nil)), to: connectionStateChangesContinuations)
+            
+            return
+        }
+        
         let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
         let state: ConnectionState = .disconnected(reason: mappedError)
         connectionStates[id] = state
+        
         if let error = mappedError {
             log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected with error: \(error)")
         } else {
             log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected")
         }
+        
         broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+        armReconnect(id: id)
     }
 
     private func handleDidFailToConnect(_ payload: ConnectionPayload) {
@@ -684,58 +801,139 @@ actor BluetoothActor {
             log?.warn(tags: [.category(.connection)], "didFailToConnect for unknown peripheral — dropped")
             return
         }
+        
         let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
         let state: ConnectionState = .failed(reason: mappedError)
         connectionStates[id] = state
+        
         log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral connection failed with error: \(mappedError ?? .unknown)")
+        
         broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+        armReconnect(id: id)
     }
 
-    /// Initiates a connection to the live peripheral backing the given snapshot `id`.
-    ///
-    /// Optimistically broadcasts `.connecting` before the CoreBluetooth call, then issues the
-    /// connection request. The actual `.connected` or `.failed` callback arrives later via the
-    /// delegate pipeline.
-    ///
-    /// - Parameter id: The ``Peripheral/id`` of a previously discovered peripheral.
-    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id` (a stale snapshot).
-    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
-    func connect(id: String) throws {
-        guard let centralManager else {
-            log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
-            throw PeripheralError.bluetoothUnavailable
+    // MARK: - Reconnection
+
+    private func armReconnect(id: String) {
+        guard reconnectEnabled.contains(id) else { return }
+
+        let attempts = reconnectAttempts[id] ?? 0
+        guard reconnectPolicy.maxAttempts > 0, attempts < reconnectPolicy.maxAttempts else {
+            // Give-up clears in-flight ladder bookkeeping only. `reconnectEnabled` is deliberately
+            // retained so reconnection intent survives until an explicit `disconnect` — a later
+            // unexpected drop must start a fresh ladder from attempt 1.
+            clearReconnectState(for: id)
+            log?.info(tags: [.peripheral(id), .category(.connection)], "Reconnect attempts exhausted")
+            
+            return
         }
 
-        guard let cbPeripheral = cbPeripherals[id] else {
-            throw PeripheralError.notFound
-        }
-
-        connectionStates[id] = .connecting
-        broadcast(ConnectionStateChange(peripheralId: id, state: .connecting), to: connectionStateChangesContinuations)
-        centralManager.connect(cbPeripheral, options: nil)
+        reconnectAttempts[id] = attempts + 1
+        scheduleReconnect(id: id, attempt: attempts + 1)
     }
 
-    /// Initiates a disconnection from the live peripheral backing the given snapshot `id`.
-    ///
-    /// Optimistically broadcasts `.disconnecting` before cancelling the connection. The actual
-    /// `.disconnected` callback arrives later via the delegate pipeline.
-    ///
-    /// - Parameter id: The ``Peripheral/id`` of a previously connected peripheral.
-    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id`.
-    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
-    func disconnect(id: String) throws {
-        guard let centralManager else {
-            log?.warn(tags: [.peripheral(id)], "Attempted to disconnect without a central manager")
-            throw PeripheralError.bluetoothUnavailable
-        }
+    private func scheduleReconnect(id: String, attempt: Int) {
+        reconnectTasks[id]?.cancel()
 
-        guard let cbPeripheral = cbPeripherals[id] else {
-            throw PeripheralError.notFound
-        }
+        // `ReconnectPolicy` is public and unvalidated; collapse any non-finite field (`nan`/`inf`)
+        // to a safe value here. Beyond the UInt64 conversion below, a non-finite `jitter` would also
+        // trap `Double.random(in: -jitter...jitter)` ("Range requires lowerBound <= upperBound").
+        let initial = reconnectPolicy.initialDelay.isFinite ? max(0, reconnectPolicy.initialDelay) : 0
+        let maxDelay = reconnectPolicy.maxDelay.isFinite ? max(initial, reconnectPolicy.maxDelay) : initial
+        let jitter = reconnectPolicy.jitter.isFinite ? min(max(reconnectPolicy.jitter, 0), 1) : 0
 
-        connectionStates[id] = .disconnecting
-        broadcast(ConnectionStateChange(peripheralId: id, state: .disconnecting), to: connectionStateChangesContinuations)
-        centralManager.cancelPeripheralConnection(cbPeripheral)
+        let baseDelay = min(initial * pow(2, Double(attempt - 1)), maxDelay)
+        let jittered = baseDelay * (1 + Double.random(in: -jitter...jitter))
+        // `ReconnectPolicy` is public and its fields are unvalidated, so a caller could supply
+        // non-finite values (`nan`/`inf`). Collapse those to zero here so the `UInt64` nanosecond
+        // conversion below cannot trap at runtime.
+        let delaySeconds = jittered.isFinite ? max(0, jittered) : 0
+
+        // Clamp the nanosecond conversion to `UInt64` range to avoid an overflow trap for very
+        // large (but finite) configured delays.
+        let nanosDouble = (delaySeconds * 1_000_000_000).rounded()
+        let sleepNanos: UInt64 = nanosDouble >= Double(UInt64.max) ? .max : UInt64(nanosDouble)
+
+        let nextRetryAt = Date().addingTimeInterval(delaySeconds)
+        connectionStates[id] = .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)
+        broadcast(ConnectionStateChange(peripheralId: id, state: .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)), to: connectionStateChangesContinuations)
+
+        reconnectTasks[id] = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: sleepNanos)
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else {
+                return
+            }
+            
+            await self.performReconnect(id: id, attempt: attempt)
+        }
+    }
+
+    private func performReconnect(id: String, attempt: Int) {
+        guard !Task.isCancelled,
+              reconnectAttempts[id] == attempt,
+              case .reconnecting(_, let currentAttempt?, _) = connectionStates[id],
+              currentAttempt == attempt
+        else {
+            return
+        }
+        
+        do {
+            try connect(id: id, autoReconnect: true)
+        } catch {
+            let reason = (error as? PeripheralError) ?? .unknown
+            clearReconnectState(for: id)
+            let state: ConnectionState = .failed(reason: reason)
+            connectionStates[id] = state
+            log?.warn(tags: [.peripheral(id), .category(.connection)], "Reconnect attempt failed: \(reason)")
+            broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+        }
+    }
+    
+    private func clearReconnectState(for id: String) {
+        reconnectTasks[id]?.cancel()
+        reconnectTasks[id] = nil
+        reconnectAttempts[id] = nil
+        intentionalDisconnects.remove(id)
+    }
+
+    /// Test-only hook
+    func setReconnectPolicy(_ policy: ReconnectPolicy) {
+        reconnectPolicy = policy
+    }
+
+    /// Test-only hook: injects a disconnect event with the specified `isReconnecting` flag,
+    /// routing through the same `handleDidDisconnect(_:)` path as a real delegate callback.
+    ///
+    /// Needed because CoreBluetoothMock hardcodes `isReconnecting: true` after any connect
+    /// with `CBConnectPeripheralOptionEnableAutoReconnect`, making it impossible to simulate
+    /// an OS give-up (`isReconnecting: false`) through the mock's public API. Tests that need
+    /// `isReconnecting: false` (OS give-up → Tier-1 ladder, or unexpected drop without the
+    /// OS option) inject via this hook instead.
+    func testInjectDisconnect(for id: String, isReconnecting: Bool, error: Error? = nil) {
+        guard let cbPeripheral = cbPeripherals[id] else { return }
+        let payload = ConnectionPayload(peripheral: cbPeripheral, isReconnecting: isReconnecting, error: error)
+        handleDidDisconnect(payload)
+    }
+
+    /// Test-only hook: runs the same peripheral invalidation as a Bluetooth reset/unauthorized path.
+    func testInvalidatePeripherals() {
+        invalidatePeripherals()
+    }
+
+    /// Test-only hook: whether `id` is currently marked as an intentional disconnect.
+    func testContainsIntentionalDisconnect(_ id: String) -> Bool {
+        intentionalDisconnects.contains(id)
+    }
+
+    /// Test-only hook: seeds intentional-disconnect intent without going through `disconnect(id:)`.
+    func testSeedIntentionalDisconnect(_ id: String) {
+        intentionalDisconnects.insert(id)
     }
 }
 
@@ -777,17 +975,17 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        let payload = ConnectionPayload(peripheral: peripheral, error: nil)
+        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: false, error: nil)
         eventContinuation.yield(.connected(payload))
     }
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        let payload = ConnectionPayload(peripheral: peripheral, error: error)
+        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: false, error: error)
         eventContinuation.yield(.connectFailed(payload))
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: Error?) {
-        let payload = ConnectionPayload(peripheral: peripheral, error: error)
+        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: isReconnecting, error: error)
         eventContinuation.yield(.disconnected(payload))
     }
 }

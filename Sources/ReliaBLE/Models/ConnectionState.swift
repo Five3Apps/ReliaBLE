@@ -22,6 +22,8 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //  SOFTWARE.
 
+import Foundation
+
 /// The connection state of a single peripheral tracked by the library.
 ///
 /// ``ConnectionState`` is a finite, `Sendable` enumeration. Every non-terminal state change
@@ -30,6 +32,13 @@
 public enum ConnectionState: Sendable, Equatable, Hashable {
     /// A connection request has been issued and is in flight.
     case connecting
+    /// A reconnection is in progress.
+    ///
+    /// ``ReconnectSource/system`` means iOS is reconnecting at the daemon level; the library
+    /// is not involved and exposes no attempt count or next-retry time (both are `nil`).
+    /// ``ReconnectSource/library`` means the app-side exponential-backoff ladder has armed;
+    /// `attempt` and `nextRetryAt` are populated.
+    case reconnecting(source: ReconnectSource, attempt: Int?, nextRetryAt: Date?)
     /// The peripheral is currently connected.
     case connected
     /// A disconnection request has been issued and is in flight.
@@ -44,6 +53,18 @@ public enum ConnectionState: Sendable, Equatable, Hashable {
     /// The `reason` carries a ``PeripheralError`` mapped from the underlying `CBError` so the
     /// integrating app can react to addressable failures without importing CoreBluetooth.
     case failed(reason: PeripheralError?)
+}
+
+/// Identifies which tier is driving a reconnection.
+public enum ReconnectSource: Sendable, Equatable, Hashable {
+    /// The iOS daemon-level auto-reconnect (`CBConnectPeripheralOptionEnableAutoReconnect`)
+    /// is in control. The library does not schedule its own retries while the system is
+    /// attempting recovery.
+    case system
+    /// The library-side exponential-backoff ladder has armed. `attempt` and `nextRetryAt`
+    /// are populated on the ``ConnectionState/reconnecting(source:attempt:nextRetryAt:)``
+    /// case.
+    case library
 }
 
 /// A single connection-state transition emitted on ``ReliaBLEManager/connectionStateChanges``.

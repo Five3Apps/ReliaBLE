@@ -47,8 +47,54 @@ public struct ReliaBLEConfig: Sendable {
     /// Whether or not logging is enabled. The default value is `false`.
     public var loggingEnabled = false
     
+    /// Policy controlling the behavior of the library-side exponential backoff supplement
+    /// for automatic reconnection. Enable/disable is a per-connect choice on
+    /// ``ReliaBLEManager/connect(to:autoReconnect:)``; this policy governs *how* the
+    /// library retries when auto-reconnect is active.
+    public var reconnectPolicy = ReconnectPolicy()
+    
     /// Initializes a new `ReliaBLEConfig` instance with the default values.
     public init() {
         
+    }
+}
+
+/// Policy controlling the library-side exponential backoff supplement for automatic
+/// reconnection.
+///
+/// This struct governs *how* the library retries when auto-reconnect is active (the
+/// enable/disable decision is a per-connect parameter, not global config). When the
+/// library ladder arms, retry delays follow exponential growth (`initialDelay * 2^(attempt-1)`)
+/// capped at ``maxDelay``, with ``jitter`` spread to avoid synchronized retries, and
+/// bounded by ``maxAttempts``.
+public struct ReconnectPolicy: Sendable {
+    /// The maximum number of consecutive reconnection attempts before giving up. The default value is `5`.
+    public var maxAttempts = 5
+
+    /// The base delay before the first reconnection attempt, in seconds. Subsequent attempts grow
+    /// exponentially from this value. The default value is `1.0`.
+    public var initialDelay: TimeInterval = 1.0
+
+    /// The maximum delay between reconnection attempts, in seconds, after exponential growth is
+    /// capped. The default value is `30.0`.
+    public var maxDelay: TimeInterval = 30.0
+
+    /// The fractional jitter (0...1) applied to each computed delay to avoid synchronized retries.
+    /// The default value is `0.2`.
+    public var jitter: Double = 0.2
+
+    /// Initializes a new `ReconnectPolicy` with the given values.
+    ///
+    /// All parameters default to the library's standard policy so `ReconnectPolicy()` remains valid.
+    public init(
+        maxAttempts: Int = 5,
+        initialDelay: TimeInterval = 1.0,
+        maxDelay: TimeInterval = 30.0,
+        jitter: Double = 0.2
+    ) {
+        self.maxAttempts = maxAttempts
+        self.initialDelay = initialDelay
+        self.maxDelay = maxDelay
+        self.jitter = jitter
     }
 }

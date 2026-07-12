@@ -27,7 +27,7 @@
 
 import CoreBluetooth
 
-/// Errors thrown by peripheral operations such as ``ReliaBLEManager/connect(to:)``.
+/// Errors thrown by peripheral operations such as ``ReliaBLEManager/connect(to:autoReconnect:)``.
 public enum PeripheralError: Error, Sendable, Equatable {
     /// The peripheral is no longer known to the library.
     ///

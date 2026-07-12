@@ -30,7 +30,7 @@ import Foundation
 ///
 /// A `Peripheral` carries no reference to the underlying CoreBluetooth `CBPeripheral`. The live `CBPeripheral` is
 /// owned exclusively by the library in an `id`-keyed registry that never escapes its internal concurrency domain.
-/// Operations that need the live peripheral (such as ``ReliaBLEManager/connect(to:)``) forward the snapshot's ``id``;
+/// Operations that need the live peripheral (such as ``ReliaBLEManager/connect(to:autoReconnect:)``) forward the snapshot's ``id``;
 /// the actor looks up the live reference and throws ``PeripheralError/notFound`` if the snapshot has since gone stale.
 ///
 /// The integrating app can also construct a `Peripheral` from a known identifier *before* it has been discovered —

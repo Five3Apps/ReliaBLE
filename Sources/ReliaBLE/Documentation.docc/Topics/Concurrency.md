@@ -41,7 +41,7 @@ All mutating actions are `async` and hop onto the Bluetooth actor for you:
 - ``ReliaBLEManager/authorizeBluetooth()``
 - ``ReliaBLEManager/startScanning(services:)``
 - ``ReliaBLEManager/stopScanning()``
-- ``ReliaBLEManager/connect(to:)``
+- ``ReliaBLEManager/connect(to:autoReconnect:)``
 
 The current Bluetooth state is exposed as an `async` getter,
 ``ReliaBLEManager/currentState``:
