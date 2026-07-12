@@ -1103,6 +1103,94 @@ struct ReliaBLEManagerTests {
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
 
+    @Test func explicitDisconnectReportsCleanReasonDespiteUnderlyingError() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager(reconnectPolicy: ReconnectPolicy(maxAttempts: 0))
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connecting
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connected
+
+        // Simulate an explicit disconnect that CoreBluetooth reports WITH a benign underlying error.
+        // The contract is that an app-initiated disconnect reports `reason: nil` regardless.
+        await BluetoothActor.shared.testSeedIntentionalDisconnect(discovered.id)
+        await BluetoothActor.shared.testInjectDisconnect(
+            for: discovered.id,
+            isReconnecting: false,
+            error: NSError(domain: "test.explicit", code: 1)
+        )
+
+        let disconnected = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        #expect(
+            disconnected?.state == .disconnected(reason: nil),
+            "Explicit disconnect must report a clean nil reason even when CoreBluetooth supplies an error, got \(String(describing: disconnected?.state))"
+        )
+
+        await BluetoothActor.shared.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    @Test func nonFiniteReconnectPolicyDoesNotTrapScheduler() async throws {
+        // `ReconnectPolicy` is public and unvalidated: a caller could pass non-finite delay/jitter.
+        // Scheduling a reconnect with these must not trap the UInt64 nanosecond conversion.
+        let hostilePolicy = ReconnectPolicy(
+            maxAttempts: 2,
+            initialDelay: .infinity,
+            maxDelay: .nan,
+            jitter: .nan
+        )
+
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager(reconnectPolicy: hostilePolicy)
+        await Mock.ensureReady(manager)
+        await BluetoothActor.shared.setReconnectPolicy(hostilePolicy)
+
+        let changes = manager.connectionStateChanges
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connecting
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connected
+
+        // Unexpected drop arms the library ladder; scheduling must survive the non-finite delay.
+        await BluetoothActor.shared.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .disconnected
+        let reconnecting = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
+        guard case .reconnecting(.library, let attempt, _) = reconnecting?.state else {
+            Issue.record("Expected .reconnecting(.library) without trapping, got \(String(describing: reconnecting?.state))")
+            return
+        }
+        #expect(attempt == 1)
+
+        try await manager.disconnect(from: discovered)
+        await BluetoothActor.shared.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
     @Test func successfulLibraryReconnectResetsAttemptCounter() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
 

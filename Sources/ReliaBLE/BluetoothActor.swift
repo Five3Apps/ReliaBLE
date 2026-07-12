@@ -754,14 +754,14 @@ actor BluetoothActor {
         }
         
         if intentionalDisconnects.remove(id) != nil {
-            let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
-            let state: ConnectionState = .disconnected(reason: mappedError)
+            // Contract: `.disconnected(reason:)` carries `nil` for a clean, app-initiated disconnect.
+            // CoreBluetooth can still deliver a benign cancellation-style error on-device for an
+            // explicit `cancelPeripheralConnection`, so we intentionally ignore `payload.error` here
+            // and always report a clean disconnect — otherwise the app/Demo would misclassify an
+            // intentional disconnect as an error drop.
+            let state: ConnectionState = .disconnected(reason: nil)
             connectionStates[id] = state
-            if let error = mappedError {
-                log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected with error: \(error)")
-            } else {
-                log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected")
-            }
+            log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected (explicit)")
             
             broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
             
@@ -835,20 +835,32 @@ actor BluetoothActor {
     private func scheduleReconnect(id: String, attempt: Int) {
         reconnectTasks[id]?.cancel()
 
-        let initial = max(0, reconnectPolicy.initialDelay)
-        let maxDelay = max(initial, reconnectPolicy.maxDelay)
-        let jitter = min(max(reconnectPolicy.jitter, 0), 1)
+        // `ReconnectPolicy` is public and unvalidated; collapse any non-finite field (`nan`/`inf`)
+        // to a safe value here. Beyond the UInt64 conversion below, a non-finite `jitter` would also
+        // trap `Double.random(in: -jitter...jitter)` ("Range requires lowerBound <= upperBound").
+        let initial = reconnectPolicy.initialDelay.isFinite ? max(0, reconnectPolicy.initialDelay) : 0
+        let maxDelay = reconnectPolicy.maxDelay.isFinite ? max(initial, reconnectPolicy.maxDelay) : initial
+        let jitter = reconnectPolicy.jitter.isFinite ? min(max(reconnectPolicy.jitter, 0), 1) : 0
 
         let baseDelay = min(initial * pow(2, Double(attempt - 1)), maxDelay)
         let jittered = baseDelay * (1 + Double.random(in: -jitter...jitter))
+        // `ReconnectPolicy` is public and its fields are unvalidated, so a caller could supply
+        // non-finite values (`nan`/`inf`). Collapse those to zero here so the `UInt64` nanosecond
+        // conversion below cannot trap at runtime.
+        let delaySeconds = jittered.isFinite ? max(0, jittered) : 0
 
-        let nextRetryAt = Date().addingTimeInterval(jittered)
+        // Clamp the nanosecond conversion to `UInt64` range to avoid an overflow trap for very
+        // large (but finite) configured delays.
+        let nanosDouble = (delaySeconds * 1_000_000_000).rounded()
+        let sleepNanos: UInt64 = nanosDouble >= Double(UInt64.max) ? .max : UInt64(nanosDouble)
+
+        let nextRetryAt = Date().addingTimeInterval(delaySeconds)
         connectionStates[id] = .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)
         broadcast(ConnectionStateChange(peripheralId: id, state: .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)), to: connectionStateChangesContinuations)
 
         reconnectTasks[id] = Task { [weak self] in
             do {
-                try await Task.sleep(nanoseconds: UInt64(jittered * 1_000_000_000))
+                try await Task.sleep(nanoseconds: sleepNanos)
             } catch is CancellationError {
                 return
             } catch {
