@@ -12,4 +12,9 @@ Modern library for handling BLE connections, with a focus on reliability.
 
 ## Documentation
 
-- Getting Started [TODO DOC LINK: Add link once doc site is up]
+Full API documentation is published from `master` to GitHub Pages:
+
+- [ReliaBLE Documentation](https://five3apps.github.io/ReliaBLE/documentation/reliable/)
+- [Getting Started](https://five3apps.github.io/ReliaBLE/documentation/reliable/gettingstarted)
+
+To build the documentation locally, run `swift package generate-documentation`.
