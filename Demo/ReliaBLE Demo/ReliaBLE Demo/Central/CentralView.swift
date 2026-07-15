@@ -97,15 +97,25 @@ struct CentralView: View {
                 }
                 .buttonStyle(.bordered)
             } else if case BluetoothState.ready = viewModel.currentState {
-                TextField("Enter service UUIDs (comma-separated)", text: $viewModel.servicesInput)
+                TextField("Service UUIDs (comma-separated; required for background)", text: $viewModel.servicesInput)
                     .textFieldStyle(.roundedBorder)
-                    .padding()
+                    .padding(.horizontal)
+
+                Text("Background discovery needs a non-empty service filter. Connect with Auto Reconnect on, then background/force-quit — restored connections reappear on relaunch.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
 
                 Button("Start Scanning") {
                     viewModel.startScanning()
                 }
                 .buttonStyle(.bordered)
             } else if case BluetoothState.scanning = viewModel.currentState {
+                Text("Scanning (continues in background when a service filter is set)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+
                 Button("Stop Scanning") {
                     viewModel.stopScanning()
                 }
@@ -181,7 +191,15 @@ struct CentralView: View {
                         reliaBLE: reliaBLE
                     )
                 } label: {
-                    Text("\(device.name ?? "Unknown")")
+                    HStack {
+                        Text("\(device.name ?? "Unknown")")
+                        Spacer()
+                        if let state = viewModel.connectionStates[device.id] {
+                            Text(state.description)
+                                .font(.caption)
+                                .foregroundStyle(state.color)
+                        }
+                    }
                 }
             }
             .onDelete { offsets in
@@ -260,6 +278,13 @@ private struct DeviceDetailView: View {
 
             Toggle("Auto Reconnect:", isOn: $autoReconnect)
                 .disabled(connectionState.map { !$0.canEditAutoReconnect } ?? false)
+
+            if isActive {
+                Text("Standing connection: leave Auto Reconnect on, background or force-quit the app, then relaunch — restored state shows here via connectionStateChanges.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
         }
         .padding()
     }
