@@ -76,11 +76,26 @@ use:
   states — ``ConnectionState/connected`` for preserved connections,
   ``ConnectionState/connecting`` for in-progress attempts.
 
+Restored peripherals are **not** emitted on
+``ReliaBLEManager/peripheralDiscoveries`` — restoration carries no
+advertisement payload or RSSI, so that feed remains reserved for real
+advertisements.
+
 The Tier-0 system-managed reconnection (``ReconnectSource/system``) survives
-app termination because it runs in the iOS daemon; Tier-1 library-managed
-reconnection (``ReconnectSource/library``) does not, but the library re-arms
-reconnect intent for restored connections so a post-relaunch drop triggers
-the exponential-backoff ladder governed by ``ReconnectPolicy``.
+app termination because it runs in the iOS daemon. Tier-1 library-managed
+reconnection (``ReconnectSource/library``) does not, so ReliaBLE persists your
+per-connect intent: when you call ``ReliaBLEManager/connect(to:autoReconnect:)``
+with `autoReconnect: true` (and a ``ReliaBLEConfig/restoreIdentifier`` is
+configured), that intent is stored in `UserDefaults` and re-armed for the
+restored connection on relaunch, so a post-relaunch drop still triggers the
+exponential-backoff ladder governed by ``ReconnectPolicy``. Connections made
+with `autoReconnect: false` are restored — their state and live reference are
+rehydrated — but reconnection stays disarmed.
+
+> Note: Restored `CBPeripheral` objects arrive without a peripheral-level
+> delegate. ReliaBLE does not yet use peripheral (GATT) callbacks, so no
+> delegate is re-attached during restoration. When GATT support lands, the
+> restoration path must also re-wire the peripheral delegate.
 
 > Note: ReliaBLE deliberately does **not** pass
 > `CBConnectPeripheralOptionNotifyOnConnection` or
