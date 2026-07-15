@@ -1,5 +1,7 @@
 # ReliaBLE
 
+[![CI](https://github.com/Five3Apps/ReliaBLE/actions/workflows/ci.yml/badge.svg)](https://github.com/Five3Apps/ReliaBLE/actions/workflows/ci.yml)
+
 Modern library for handling BLE connections, with a focus on reliability.
 
 ## Installation
