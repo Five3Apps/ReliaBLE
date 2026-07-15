@@ -1452,10 +1452,23 @@ struct ReliaBLEManagerTests {
 
         // Subscribe before restore so broadcasts are not missed. Note: no peripheralDiscoveries
         // subscription — restored peripherals are deliberately kept off the advertisement feed.
+        //
+        // Stream registration is asynchronous: `makeAsyncIterator()` only *schedules* the
+        // continuation registration on a detached `@BluetoothActor` hop. The connection-state feed
+        // does not replay, so if the restore broadcast below fires before that hop lands, the
+        // `.connected` event is dropped and `connectionChanges.next()` blocks forever (this is the
+        // 30-min CI/Xcode hang). A single actor hop is not enough slack; poll until both
+        // subscriptions have actually registered before invoking restore.
+        let baseConnectionSubscribers = await BluetoothActor.shared.testConnectionStateSubscriberCount()
+        let basePeripheralsSubscribers = await BluetoothActor.shared.testPeripheralsSubscriberCount()
         var peripherals = manager.discoveredPeripherals.makeAsyncIterator()
         var connectionChanges = manager.connectionStateChanges.makeAsyncIterator()
-        // Force registration hops.
-        _ = await manager.currentConnectionStates
+        let subscriptionsReady = await pollUntil(timeout: 3.0) {
+            let connectionReady = await BluetoothActor.shared.testConnectionStateSubscriberCount() > baseConnectionSubscribers
+            let peripheralsReady = await BluetoothActor.shared.testPeripheralsSubscriberCount() > basePeripheralsSubscribers
+            return connectionReady && peripheralsReady
+        }
+        #expect(subscriptionsReady)
 
         let scanUUID = CBUUID(string: "180D")
         await BluetoothActor.shared.testInvokeWillRestoreState(

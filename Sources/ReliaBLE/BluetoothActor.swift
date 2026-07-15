@@ -1244,6 +1244,22 @@ actor BluetoothActor {
         centralManager?.isScanning == true
     }
 
+    /// Test-only hook: number of registered `connectionStateChanges` subscribers.
+    ///
+    /// Stream registration is asynchronous — the factory schedules `register(...)` on a detached
+    /// `@BluetoothActor` hop (see ``connectionStateChangesStream()``). Tests that must observe a
+    /// broadcast emitted *right after* subscribing (e.g. the restore path) poll this until their
+    /// subscription has landed, otherwise a non-replaying broadcast can be missed entirely.
+    func testConnectionStateSubscriberCount() -> Int {
+        connectionStateChangesContinuations.count
+    }
+
+    /// Test-only hook: number of registered `discoveredPeripherals` subscribers. See
+    /// ``testConnectionStateSubscriberCount()`` for why tests need to observe registration.
+    func testPeripheralsSubscriberCount() -> Int {
+        peripheralsContinuations.count
+    }
+
     /// Test-only hook: service filter stashed when a restored scan was deferred until powered on.
     func testPendingRestoredScanServices() -> [CBUUID]? {
         pendingRestoredScanServices
