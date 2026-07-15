@@ -51,6 +51,22 @@ private struct ConnectionPayload: @unchecked Sendable {
     let error: Error?
 }
 
+/// Carries the restoration dictionary from `centralManager(_:willRestoreState:)` across the
+/// nonisolated delegate-queue → ``BluetoothActor`` hop.
+///
+/// The dictionary and nested `CBPeripheral` / `CBUUID` values are non-`Sendable`. They are treated
+/// as immutable payload and only accessed inside ``BluetoothActor`` after the hop, where they are
+/// immediately converted into `Sendable` snapshots and actor-owned live references.
+private struct RestorationPayload: @unchecked Sendable {
+    let state: [String: Any]
+}
+
+/// Holds a restored scan-options dictionary so it can live in actor-isolated state without
+/// tripping region-based isolation on non-`Sendable` `[String: Any]`.
+private struct RestoredScanOptions: @unchecked Sendable {
+    let options: [String: Any]?
+}
+
 /// A single CoreBluetooth delegate callback, carried in delivery order across the nonisolated
 /// delegate-queue → ``BluetoothActor`` hop.
 ///
@@ -64,6 +80,7 @@ private enum DelegateEvent: Sendable {
     case connected(ConnectionPayload)
     case disconnected(ConnectionPayload)
     case connectFailed(ConnectionPayload)
+    case willRestore(RestorationPayload)
 }
 
 // MARK: - BluetoothActor
@@ -132,6 +149,11 @@ actor BluetoothActor {
     private var connectionStateChangesContinuations: [UUID: AsyncStream<ConnectionStateChange>.Continuation] = [:]
 
     private var reconnectPolicy: ReconnectPolicy = ReconnectPolicy()
+    /// Stable CoreBluetooth restore identifier; `nil` disables state restoration.
+    private var restoreIdentifier: String?
+    /// Scan filter restored via `willRestoreState` when the central was not yet powered on.
+    private var pendingRestoredScanServices: [CBUUID]?
+    private var pendingRestoredScanOptions: RestoredScanOptions?
     private var reconnectEnabled: Set<String> = []
     private var intentionalDisconnects: Set<String> = []
     private var reconnectAttempts: [String: Int] = [:]
@@ -288,12 +310,22 @@ actor BluetoothActor {
     /// the lazy-permission contract: the iOS prompt only appears when the integrating app calls
     /// ``ReliaBLEManager/authorizeBluetooth()``. The initial state is broadcast on first setup and
     /// whenever the manager is created, but not on every redundant call.
-    func ensureInitialized(log: LoggingService, reconnectPolicy: ReconnectPolicy = ReconnectPolicy()) {
+    ///
+    /// When ``restoreIdentifier`` is non-`nil` and authorization is already `.allowedAlways`, the
+    /// central is created with `CBCentralManagerOptionRestoreIdentifierKey` so CoreBluetooth can
+    /// deliver `willRestoreState` as the first callback on relaunch. Authorization is never
+    /// relaxed — if Bluetooth is not authorized there is nothing to restore.
+    func ensureInitialized(
+        log: LoggingService,
+        reconnectPolicy: ReconnectPolicy = ReconnectPolicy(),
+        restoreIdentifier: String? = nil
+    ) {
         let firstInitialization = !isInitialized
         if firstInitialization {
             isInitialized = true
             configure(log: log)
             self.reconnectPolicy = reconnectPolicy
+            self.restoreIdentifier = restoreIdentifier
         }
 
         var createdManager = false
@@ -328,7 +360,16 @@ actor BluetoothActor {
         delegateShim = shim
         // Use CBCentralManagerFactory for consistency between normal and test targets.
         // `forceMock: true` is load-bearing for the ReliaBLEMock test target — do not remove.
-        centralManager = CBCentralManagerFactory.instance(delegate: shim, queue: centralManagerQueue, options: nil, forceMock: true)
+        var options: [String: Any]?
+        if let restoreIdentifier {
+            options = [CBCentralManagerOptionRestoreIdentifierKey: restoreIdentifier]
+        }
+        centralManager = CBCentralManagerFactory.instance(
+            delegate: shim,
+            queue: centralManagerQueue,
+            options: options,
+            forceMock: true
+        )
 
         delegateEventTask = Task { [weak self] in
             for await event in events {
@@ -354,6 +395,8 @@ actor BluetoothActor {
             handleDidDisconnect(payload)
         case .connectFailed(let payload):
             handleDidFailToConnect(payload)
+        case .willRestore(let payload):
+            handleWillRestoreState(payload)
         }
     }
 
@@ -449,6 +492,13 @@ actor BluetoothActor {
             return
         }
 
+        if services == nil || services?.isEmpty == true {
+            log?.warn(
+                tags: [.category(.scanning)],
+                "Scanning with an empty/nil service filter; background scanning requires a non-empty service UUID filter"
+            )
+        }
+
         centralManager.scanForPeripherals(withServices: services, options: nil)
 
         if centralManager.isScanning {
@@ -521,6 +571,148 @@ actor BluetoothActor {
 
     // MARK: - Delegate Entry Points (called by BluetoothDelegateShim)
 
+    /// Rehydrates scan and connection state delivered by CoreBluetooth on app relaunch.
+    ///
+    /// Restored `CBPeripheral`s arrive with no peripheral delegate and must be re-associated into
+    /// ``cbPeripherals`` immediately. Connection state is seeded from each peripheral's
+    /// `CBPeripheral.state`; no synchronous reconnect is issued (standing connects are OS-held).
+    /// If Bluetooth is later reported off/unauthorized, ``invalidatePeripherals()`` clears this
+    /// state intentionally.
+    private func handleWillRestoreState(_ payload: RestorationPayload) {
+        let restoredPeripherals = payload.state[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        let restoredScanServices = payload.state[CBCentralManagerRestoredStateScanServicesKey] as? [CBUUID]
+        let restoredScanOptions = payload.state[CBCentralManagerRestoredStateScanOptionsKey] as? [String: Any]
+
+        log?.info(
+            tags: [.category(.scanning)],
+            "Restoring BLE state: \(restoredPeripherals.count) peripheral(s), scanServices=\(restoredScanServices ?? [])"
+        )
+
+        // Empty advertisement placeholder — restoration carries no advertisement payload.
+        let emptyAdvertisement = AdvertisementData(rawAdvertisementData: [:])
+        let now = Date()
+        var didMutatePeripherals = false
+
+        for cbPeripheral in restoredPeripherals {
+            // Restored peripherals arrive with no delegate; re-associate into actor-owned maps
+            // using the same identity rules as discovery. Peripheral-level GATT callbacks are not
+            // yet used by the library, so no `CBPeripheralDelegate` is attached here.
+            let identifier = cbPeripheral.name ?? cbPeripheral.identifier.uuidString
+            let cbIdentifier = cbPeripheral.identifier
+            let name = cbPeripheral.name
+
+            let resolvedId: String
+            if let idx = discoveredPeripherals.firstIndex(where: { $0.id == identifier }) {
+                resolvedId = identifier
+                discoveredPeripherals[idx] = Peripheral(
+                    id: resolvedId,
+                    cbIdentifier: cbIdentifier,
+                    name: name,
+                    rssi: discoveredPeripherals[idx].rssi,
+                    lastSeen: now,
+                    advertisement: discoveredPeripherals[idx].advertisement ?? emptyAdvertisement
+                )
+            } else if let idx = discoveredPeripherals.firstIndex(where: { $0.cbIdentifier == cbIdentifier }) {
+                resolvedId = discoveredPeripherals[idx].id
+                discoveredPeripherals[idx] = Peripheral(
+                    id: resolvedId,
+                    cbIdentifier: cbIdentifier,
+                    name: name ?? discoveredPeripherals[idx].name,
+                    rssi: discoveredPeripherals[idx].rssi,
+                    lastSeen: now,
+                    advertisement: discoveredPeripherals[idx].advertisement ?? emptyAdvertisement
+                )
+            } else {
+                resolvedId = identifier
+                discoveredPeripherals.append(
+                    Peripheral(
+                        id: resolvedId,
+                        cbIdentifier: cbIdentifier,
+                        name: name,
+                        rssi: nil,
+                        lastSeen: now,
+                        advertisement: emptyAdvertisement
+                    )
+                )
+            }
+
+            cbPeripherals[resolvedId] = cbPeripheral
+            didMutatePeripherals = true
+
+            // Seed connection state after the live reference is registered. Do not reconnect here.
+            let connectionState: ConnectionState?
+            switch cbPeripheral.state {
+            case .connected:
+                connectionState = .connected
+                reconnectEnabled.insert(resolvedId)
+            case .connecting:
+                connectionState = .connecting
+                reconnectEnabled.insert(resolvedId)
+            case .disconnecting:
+                connectionState = .disconnecting
+            case .disconnected:
+                connectionState = nil
+            @unknown default:
+                connectionState = nil
+            }
+
+            if let connectionState {
+                connectionStates[resolvedId] = connectionState
+                broadcast(
+                    ConnectionStateChange(peripheralId: resolvedId, state: connectionState),
+                    to: connectionStateChangesContinuations
+                )
+            }
+
+            // Surface each restored peripheral on the lightweight discovery feed so subscribers
+            // that only listen to `peripheralDiscoveries` still learn about restored devices.
+            broadcast(
+                PeripheralDiscoveryEvent(cbPeripheral: cbPeripheral, advertisement: emptyAdvertisement, rssi: 0),
+                to: discoveryContinuations
+            )
+        }
+
+        if didMutatePeripherals {
+            broadcast(discoveredPeripherals, to: peripheralsContinuations)
+        }
+
+        // Resume a scan that was active at termination. If the central is not yet powered on
+        // (willRestoreState can precede the poweredOn state update), stash the filter and resume
+        // from handleCentralManagerStateUpdate once powered on.
+        if let restoredScanServices {
+            resumeRestoredScan(
+                services: restoredScanServices,
+                options: RestoredScanOptions(options: restoredScanOptions)
+            )
+        }
+    }
+
+    /// Issues `scanForPeripherals` for a restored service filter, or defers until powered on.
+    private func resumeRestoredScan(services: [CBUUID], options: RestoredScanOptions?) {
+        guard let centralManager else {
+            pendingRestoredScanServices = services
+            pendingRestoredScanOptions = options
+            return
+        }
+
+        guard centralManager.state == .poweredOn else {
+            pendingRestoredScanServices = services
+            pendingRestoredScanOptions = options
+            log?.debug(tags: [.category(.scanning)], "Deferred restored scan until powered on")
+            return
+        }
+
+        pendingRestoredScanServices = nil
+        pendingRestoredScanOptions = nil
+        centralManager.scanForPeripherals(withServices: services, options: options?.options)
+        if centralManager.isScanning {
+            log?.info(tags: [.category(.scanning)], "Restored scan resumed with services: \(services)")
+            updateState()
+        } else {
+            log?.warn(tags: [.category(.scanning)], "Failed to resume restored scan")
+        }
+    }
+
     func handleCentralManagerStateUpdate() {
         guard let centralManager else { return }
 
@@ -529,6 +721,9 @@ actor BluetoothActor {
         switch centralManager.state {
         case .poweredOn:
             refreshPeripherals()
+            if let services = pendingRestoredScanServices {
+                resumeRestoredScan(services: services, options: pendingRestoredScanOptions)
+            }
         case .poweredOff, .unknown:
             // These states do not invalidate peripherals.
             break
@@ -632,6 +827,8 @@ actor BluetoothActor {
         reconnectAttempts.removeAll()
         reconnectEnabled.removeAll()
         intentionalDisconnects.removeAll()
+        pendingRestoredScanServices = nil
+        pendingRestoredScanOptions = nil
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
         log?.debug("Invalidated all peripheral references")
     }
@@ -935,6 +1132,85 @@ actor BluetoothActor {
     func testSeedIntentionalDisconnect(_ id: String) {
         intentionalDisconnects.insert(id)
     }
+
+    /// Test-only hook: drives restoration with a hand-built CoreBluetooth restore dictionary,
+    /// routing through `process(.willRestore)` the same way ``BluetoothDelegateShim`` would.
+    ///
+    /// Needed because CoreBluetoothMock cannot synthesize `willRestoreState`.
+    func testInvokeWillRestoreState(_ state: [String: Any]) {
+        process(.willRestore(RestorationPayload(state: state)))
+    }
+
+    /// Test-only hook: builds a restoration dictionary from actor-owned live peripherals and
+    /// drives ``testInvokeWillRestoreState(_:)``. Keeps non-`Sendable` `CBPeripheral` references
+    /// inside the actor isolation boundary.
+    func testInvokeWillRestoreState(
+        peripheralIds: [String],
+        scanServices: [CBUUID]? = nil,
+        scanOptions: [String: Any]? = nil
+    ) {
+        var state: [String: Any] = [:]
+        // Avoid compactMap/closure patterns the region-based isolation checker cannot analyze
+        // for non-Sendable CBPeripheral values.
+        var peripherals: [CBPeripheral] = []
+        for id in peripheralIds {
+            if let peripheral = cbPeripherals[id] {
+                peripherals.append(peripheral)
+            }
+        }
+        if !peripherals.isEmpty {
+            state[CBCentralManagerRestoredStatePeripheralsKey] = peripherals
+        }
+        if let scanServices {
+            state[CBCentralManagerRestoredStateScanServicesKey] = scanServices
+        }
+        if let scanOptions {
+            state[CBCentralManagerRestoredStateScanOptionsKey] = scanOptions
+        }
+        testInvokeWillRestoreState(state)
+    }
+
+    /// Test-only hook: whether `id` is currently in ``reconnectEnabled``.
+    func testIsReconnectEnabled(_ id: String) -> Bool {
+        reconnectEnabled.contains(id)
+    }
+
+    /// Test-only hook: whether a live `CBPeripheral` is registered for `id`.
+    func testContainsCBPeripheral(_ id: String) -> Bool {
+        cbPeripherals[id] != nil
+    }
+
+    /// Test-only hook: whether the central is currently scanning.
+    func testIsScanning() -> Bool {
+        centralManager?.isScanning == true
+    }
+
+    /// Test-only hook: service filter stashed when a restored scan was deferred until powered on.
+    func testPendingRestoredScanServices() -> [CBUUID]? {
+        pendingRestoredScanServices
+    }
+
+    /// Test-only hook: restore identifier captured on first ``ensureInitialized`` call.
+    func testRestoreIdentifier() -> String? {
+        restoreIdentifier
+    }
+
+    /// Test-only hook: overwrites the stored restore identifier (process-lifetime actor may already
+    /// have been initialized by an earlier test without one).
+    func testSetRestoreIdentifier(_ id: String?) {
+        restoreIdentifier = id
+    }
+
+    /// Test-only hook: clears discovery snapshots and connection intent so a subsequent restore can
+    /// exercise the cold-relaunch (append-new) identity branch, while keeping live `CBPeripheral`
+    /// references available for ``testInvokeWillRestoreState(peripheralIds:scanServices:scanOptions:)``.
+    func testClearDiscoveredSnapshotsPreservingLiveReferences() {
+        discoveredPeripherals.removeAll()
+        connectionStates.removeAll()
+        reconnectEnabled.removeAll()
+        pendingRestoredScanServices = nil
+        pendingRestoredScanOptions = nil
+    }
 }
 
 // MARK: - BluetoothDelegateShim
@@ -987,5 +1263,11 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: Error?) {
         let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: isReconnecting, error: error)
         eventContinuation.yield(.disconnected(payload))
+    }
+
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        // First callback on relaunch when a restore identifier was used. Ferry the non-Sendable
+        // restoration dictionary across the actor hop; extraction happens inside the actor.
+        eventContinuation.yield(.willRestore(RestorationPayload(state: dict)))
     }
 }

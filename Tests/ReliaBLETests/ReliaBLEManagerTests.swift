@@ -1346,6 +1346,228 @@ struct ReliaBLEManagerTests {
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
 
+    // MARK: - State Restoration
+
+    @Test func reliaBLEConfigRestoreIdentifierDefaultsToNil() {
+        let config = ReliaBLEConfig()
+        #expect(config.restoreIdentifier == nil)
+
+        var custom = ReliaBLEConfig()
+        custom.restoreIdentifier = "com.example.ble-central"
+        #expect(custom.restoreIdentifier == "com.example.ble-central")
+    }
+
+    @Test func ensureInitializedWithoutRestoreIdentifierDoesNotCreateCentralWhenUnauthorized() async throws {
+        // Default makeManager pins .notDetermined before construction. A restoreIdentifier of nil
+        // must preserve the lazy contract: no central until authorize / allowedAlways.
+        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+
+        // Only meaningful on a cold process where no earlier test created the singleton central.
+        let alreadyHadCentral = await BluetoothActor.shared.hasCentralManager
+        let manager = await Mock.makeManager(restoreIdentifier: nil)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        if !alreadyHadCentral {
+            #expect(!(await BluetoothActor.shared.hasCentralManager))
+        }
+        // Config default remains nil on the value type regardless of actor lifetime.
+        #expect(ReliaBLEConfig().restoreIdentifier == nil)
+        _ = manager
+    }
+
+    @Test func ensureInitializedWithRestoreIdentifierCreatesCentralWhenAuthorized() async throws {
+        let restoreId = "com.five3apps.relia-ble.tests.restore"
+
+        // When authorized, a restoreIdentifier does not relax the auth gate — it only adds the
+        // restore-id option to the existing creation path. Process-lifetime central may already
+        // exist; still verify construction + ensureReady succeeds with the config set.
+        CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
+        CBMCentralManagerMock.simulatePowerOn()
+
+        let manager = await Mock.makeManager(restoreIdentifier: restoreId)
+        // firstInitialization only runs once per process; set the id so later assertions on the
+        // stored value are meaningful even if this suite is not first to touch the actor.
+        await BluetoothActor.shared.testSetRestoreIdentifier(restoreId)
+        #expect(await BluetoothActor.shared.testRestoreIdentifier() == restoreId)
+
+        await Mock.ensureReady(manager)
+        #expect(await BluetoothActor.shared.hasCentralManager)
+    }
+
+    @Test func willRestoreRepopulatesMapsSeedsConnectionStateAndBroadcasts() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: discovered)
+        let connected = await firstConnectionStateChange(
+            from: manager.connectionStateChanges,
+            withinNanoseconds: 5_000_000_000
+        )
+        // Drain connecting → connected if needed.
+        if connected?.state == .connecting {
+            let c2 = await firstConnectionStateChange(
+                from: manager.connectionStateChanges,
+                withinNanoseconds: 5_000_000_000
+            )
+            #expect(c2?.state == .connected)
+        } else {
+            #expect(connected?.state == .connected)
+        }
+
+        // Simulate cold relaunch: drop snapshots / intent while keeping live CBPeripheral refs
+        // so the restore path can rehydrate from the hand-built dictionary.
+        await BluetoothActor.shared.testClearDiscoveredSnapshotsPreservingLiveReferences()
+        #expect(await manager.currentConnectionStates[discovered.id] == nil)
+        #expect(!(await BluetoothActor.shared.testIsReconnectEnabled(discovered.id)))
+
+        // Subscribe before restore so broadcasts are not missed.
+        var discovery = manager.peripheralDiscoveries.makeAsyncIterator()
+        var peripherals = manager.discoveredPeripherals.makeAsyncIterator()
+        var connectionChanges = manager.connectionStateChanges.makeAsyncIterator()
+        // Force registration hops.
+        _ = await manager.currentConnectionStates
+
+        let scanUUID = CBUUID(string: "180D")
+        await BluetoothActor.shared.testInvokeWillRestoreState(
+            peripheralIds: [discovered.id],
+            scanServices: [scanUUID],
+            scanOptions: nil
+        )
+
+        // Maps rehydrated with discovery identity (name-based id preserved).
+        #expect(await BluetoothActor.shared.testContainsCBPeripheral(discovered.id))
+        let restoredList = await BluetoothActor.shared.discoveredPeripherals
+        #expect(restoredList.contains(where: { $0.id == discovered.id }))
+        #expect(await manager.currentConnectionStates[discovered.id] == .connected)
+        #expect(await BluetoothActor.shared.testIsReconnectEnabled(discovered.id))
+
+        // Streams broadcast restored state.
+        let discoveryEvent = await discovery.next()
+        #expect(discoveryEvent != nil)
+
+        let peripheralsEvent = await peripherals.next()
+        #expect(peripheralsEvent?.contains(where: { $0.id == discovered.id }) == true)
+
+        let connectionEvent = await connectionChanges.next()
+        #expect(connectionEvent?.peripheralId == discovered.id)
+        #expect(connectionEvent?.state == .connected)
+
+        // Scan resumed (central is powered on).
+        #expect(await BluetoothActor.shared.testIsScanning())
+        #expect(await BluetoothActor.shared.testPendingRestoredScanServices() == nil)
+
+        try? await manager.disconnect(from: discovered)
+        await manager.stopScanning()
+    }
+
+    @Test func willRestoreSeedingReconnectOnlyForConnectedOrConnecting() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        // Discover both peripherals so we have live refs for restore.
+        await manager.startScanning()
+        let connectionPeripheral = await Mock.waitForPeripheral(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let connected = try #require(connectionPeripheral)
+        let scanPeripheral = await Mock.waitForPeripheral(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let disconnected = try #require(scanPeripheral)
+        await manager.stopScanning()
+
+        try await manager.connect(to: connected)
+        _ = await firstConnectionStateChange(
+            from: manager.connectionStateChanges,
+            withinNanoseconds: 5_000_000_000
+        )
+        // Wait until connected (may already be past .connecting).
+        _ = await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[connected.id] == .connected
+        }
+
+        await BluetoothActor.shared.testClearDiscoveredSnapshotsPreservingLiveReferences()
+
+        await BluetoothActor.shared.testInvokeWillRestoreState(
+            peripheralIds: [connected.id, disconnected.id],
+            scanServices: nil
+        )
+
+        #expect(await manager.currentConnectionStates[connected.id] == .connected)
+        #expect(await BluetoothActor.shared.testIsReconnectEnabled(connected.id))
+        // Disconnected restored peripherals do not seed connectionStates / reconnectEnabled.
+        #expect(await manager.currentConnectionStates[disconnected.id] == nil)
+        #expect(!(await BluetoothActor.shared.testIsReconnectEnabled(disconnected.id)))
+
+        try? await manager.disconnect(from: connected)
+    }
+
+    @Test func willRestoreDefersScanUntilPoweredOn() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        await manager.startScanning()
+        let peripheral = await Mock.waitForPeripheral(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(peripheral)
+        await manager.stopScanning()
+
+        // Power off before restore so resumeRestoredScan stashes the filter.
+        CBMCentralManagerMock.simulatePowerOff()
+        #expect(await Mock.waitForState("Powered Off", on: manager))
+
+        await BluetoothActor.shared.testClearDiscoveredSnapshotsPreservingLiveReferences()
+
+        let scanUUID = CBUUID(string: "180D")
+        await BluetoothActor.shared.testInvokeWillRestoreState(
+            peripheralIds: [discovered.id],
+            scanServices: [scanUUID]
+        )
+
+        #expect(await BluetoothActor.shared.testPendingRestoredScanServices() == [scanUUID])
+        #expect(!(await BluetoothActor.shared.testIsScanning()))
+
+        // Power on should resume the deferred restored scan.
+        CBMCentralManagerMock.simulatePowerOn()
+        let becameScanning = await Mock.waitForState("Scanning", on: manager)
+        if !becameScanning {
+            #expect(await Mock.waitForState("Ready", on: manager))
+        }
+
+        let resumed = await pollUntil(timeout: 3.0) {
+            let pending = await BluetoothActor.shared.testPendingRestoredScanServices()
+            let scanning = await BluetoothActor.shared.testIsScanning()
+            return pending == nil && scanning
+        }
+        #expect(resumed)
+        #expect(await BluetoothActor.shared.testPendingRestoredScanServices() == nil)
+        #expect(await BluetoothActor.shared.testIsScanning())
+
+        await manager.stopScanning()
+    }
+
     // MARK: - Event Stream Broadcaster
 
     @Test func stateStreamReplaysToConcurrentSubscribers() async throws {
@@ -1476,11 +1698,16 @@ enum Mock {
     /// is pinned to `.notDetermined` **before** any central can be created — including by the maintainer's
     /// authorization tests, whose `.notDetermined` `authorize()` path itself creates a central. Use
     /// ``ensureReady(_:)`` afterwards to bring the shared central online.
-    static func makeManager(loggingEnabled: Bool = false, reconnectPolicy: ReconnectPolicy? = nil) async -> ReliaBLEManager {
+    static func makeManager(
+        loggingEnabled: Bool = false,
+        reconnectPolicy: ReconnectPolicy? = nil,
+        restoreIdentifier: String? = nil
+    ) async -> ReliaBLEManager {
         await SimulationConfig.shared.ensureConfigured()
 
         var config = ReliaBLEConfig()
         config.loggingEnabled = loggingEnabled
+        config.restoreIdentifier = restoreIdentifier
         if let reconnectPolicy {
             config.reconnectPolicy = reconnectPolicy
         } else {

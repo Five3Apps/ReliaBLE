@@ -215,3 +215,6 @@ do {
 ```
 
 Each access to `connectionStateChanges` yields a fresh stream; it does not replay, so begin iteration before calling ``ReliaBLEManager/connect(to:autoReconnect:)``. The `ConnectionState` values are ``ConnectionState/connecting``, ``ConnectionState/connected``, ``ConnectionState/disconnecting``, ``ConnectionState/disconnected(reason:)``, ``ConnectionState/failed(reason:)``, and ``ConnectionState/reconnecting(source:attempt:nextRetryAt:)``. Terminal states carry an optional ``PeripheralError`` reason.
+
+For keeping a session alive while your app is backgrounded or after it is
+terminated by the system, see <doc:Background>.
