@@ -12,4 +12,5 @@ Modern library for handling BLE connections, with a focus on reliability.
 
 ## Documentation
 
-- Getting Started [TODO DOC LINK: Add link once doc site is up]
+- [ReliaBLE Documentation](https://five3apps.github.io/ReliaBLE/documentation/reliable/)
+- [Getting Started](https://five3apps.github.io/ReliaBLE/documentation/reliable/gettingstarted)

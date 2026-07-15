@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default; the deploy-docs job elevates what it needs.
+permissions:
+  contents: read
+
 jobs:
   docc:
     name: DocC catalog
@@ -29,18 +33,38 @@ jobs:
       - name: Verify Swift version
         run: swift --version
 
+      # Builds the static-hosting site AND acts as the DocC validation gate on
+      # every PR via --warnings-as-errors. The extra static-hosting flags don't
+      # affect validation; they just shape the output for GitHub Pages.
       - name: Build DocC catalog
         run: |
-          swift package --allow-writing-to-directory ./docc-output \
-            generate-documentation --target ReliaBLE --warnings-as-errors \
-            --output-path ./docc-output
+          swift package --allow-writing-to-directory ./docs \
+            generate-documentation --target ReliaBLE \
+            --disable-indexing \
+            --transform-for-static-hosting \
+            --hosting-base-path ReliaBLE \
+            --output-path ./docs \
+            --warnings-as-errors
 
-      - name: Archive DocC output
-        run: ditto -c -k --sequesterRsrc --keepParent docc-output ReliaBLE-docs.zip
-
-      - name: Upload DocC archive
-        uses: actions/upload-artifact@v4
+      # Only publish from master; PRs validate but do not deploy.
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: ReliaBLE-docs
-          path: ReliaBLE-docs.zip
-          if-no-files-found: error
+          path: ./docs
+
+  deploy-docs:
+    name: Deploy documentation
+    if: github.ref == 'refs/heads/master'
+    needs: docc
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
