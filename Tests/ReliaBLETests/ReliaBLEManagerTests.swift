@@ -298,7 +298,13 @@ struct ReliaBLEManagerTests {
         #expect(peripheral?.advertisement?.localName == Mock.testPeripheralID)
         #expect(peripheral?.cbIdentifier != nil)
 
-        let event = await firstEvent(from: discoveries, withinNanoseconds: 3_000_000_000)
+        // The mock's connection-lifecycle peripheral advertises concurrently on the same shared
+        // central, so filter for this test's peripheral rather than racing on whichever arrives first.
+        let event = await firstEvent(
+            from: discoveries,
+            matching: { $0.advertisement.localName == Mock.testPeripheralID },
+            withinNanoseconds: 3_000_000_000
+        )
         #expect(event != nil)
         #expect(event?.advertisement.localName == Mock.testPeripheralID)
 
@@ -1634,6 +1640,35 @@ func firstEvent(
     await withTaskGroup(of: PeripheralDiscoveryEvent?.self) { group in
         group.addTask {
             for await event in stream {
+                return event
+            }
+            return nil
+        }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
+    }
+}
+
+/// Returns the first event matching `predicate` from `stream`, or `nil` if none arrives within
+/// `nanoseconds`.
+///
+/// The mock registers multiple simulated peripherals that all advertise concurrently on the same
+/// shared central, so a subscriber's *first* event is a race between them, not necessarily the one a
+/// test cares about. Filtering by predicate makes the wait deterministic regardless of advertising
+/// order.
+func firstEvent(
+    from stream: AsyncStream<PeripheralDiscoveryEvent>,
+    matching predicate: @escaping @Sendable (PeripheralDiscoveryEvent) -> Bool,
+    withinNanoseconds nanoseconds: UInt64
+) async -> PeripheralDiscoveryEvent? {
+    await withTaskGroup(of: PeripheralDiscoveryEvent?.self) { group in
+        group.addTask {
+            for await event in stream where predicate(event) {
                 return event
             }
             return nil
