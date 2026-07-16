@@ -26,9 +26,9 @@ ReliaBLE is a Swift package that provides a reliable, modern, yet easy to use in
 1. Reliability of Communication:
 
 - FR-1.1: Implement error detection and correction mechanisms for each BLE transaction.
-- FR-1.2: Ensure automatic reconnection attempts with exponential backoff for failed connections. On reconnection, services and characteristics must be re-discovered rather than reused, as part of returning to a discovery-*ready* state (FR-10.6, FR-10.3); a re-established link alone is not sufficient to resume characteristic I/O. Any future command-layer reconnect-and-rerun (FR-4/FR-5) depends on this ready transition rather than treating "connected again" as enough.
+- FR-1.2: Ensure automatic reconnection attempts with exponential backoff for failed connections. On reconnection, services and characteristics must be re-discovered rather than reused, as part of returning to a discovery-*ready* state (FR-10.6, FR-10.3); a re-established link alone is not sufficient to resume characteristic I/O. Any future command-layer reconnect-and-rerun (FR-4/FR-5) depends on this ready transition rather than treating "connected again" as enough. (Reconnection with exponential backoff is implemented; the discovery re-run tie-in remains open pending FR-10.)
 - FR-1.3: Provide status updates on connection stability and data transmission integrity.
-    - FR-1.3.1: Provide status updates on connection stability (e.g. connected, disconnected, reconnecting).
+    - ✅ FR-1.3.1: Provide status updates on connection stability (e.g. connected, disconnected, reconnecting).
     - FR-1.3.2: Provide status updates on data transmission integrity.
 
 
@@ -37,7 +37,7 @@ ReliaBLE is a Swift package that provides a reliable, modern, yet easy to use in
 - FR-2.1: Design a clear, documented API for developers to interact with BLE functionality without UI components.
 - FR-2.2: Include example usage in documentation showing how to connect, send commands, and receive responses.
 - FR-2.3: Provide delegate methods or callbacks for asynchronous operations like connection changes or data received.
-    - FR-2.3.1: Provide callbacks/streams for connection changes (connection, disconnection, connection failure).
+    - ✅ FR-2.3.1: Provide callbacks/streams for connection changes (connection, disconnection, connection failure).
     - FR-2.3.2: Provide callbacks/streams for data received from peripherals.
 
 
@@ -61,7 +61,7 @@ ReliaBLE is a Swift package that provides a reliable, modern, yet easy to use in
 
 5. Simultaneous Connection to Multiple Devices:
 
-- FR-5.1: Ensure the system can maintain connections to multiple peripherals concurrently.
+- ✅ FR-5.1: Ensure the system can maintain connections to multiple peripherals concurrently.
 
 - FR-5.2: Implement a queue system for command execution with the following capabilities:
     - FR-5.2.1: Support for scheduling commands in a queue, where commands are executed in FIFO order unless dependencies dictate otherwise.
@@ -119,7 +119,7 @@ ReliaBLE is a Swift package that provides a reliable, modern, yet easy to use in
         - FR-9.1.3.2: Ensure that if no custom handler is provided, logs can default to a standard output like the console or be disabled.
 
 - FR-9.2: Log key events such as:
-    - Connection/disconnection events
+    - ✅ Connection/disconnection events
     - Command successes or failures
     - ✅ Scanning start/stop
     - Service/characteristic discovery events (discovery start/completion/failure, readiness transitions, GATT table changes, subscription state changes)
