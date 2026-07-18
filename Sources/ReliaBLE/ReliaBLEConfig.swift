@@ -52,6 +52,19 @@ public struct ReliaBLEConfig: Sendable {
     /// ``ReliaBLEManager/connect(to:autoReconnect:)``; this policy governs *how* the
     /// library retries when auto-reconnect is active.
     public var reconnectPolicy = ReconnectPolicy()
+
+    /// Stable CoreBluetooth state-restoration identifier for the central manager.
+    ///
+    /// When non-`nil`, ReliaBLE creates `CBCentralManager` with
+    /// `CBCentralManagerOptionRestoreIdentifierKey` so iOS can relaunch the app into a
+    /// working BLE session after termination (restoring an active scan and any
+    /// connected/connecting peripherals). The value **must be stable across launches** —
+    /// changing it breaks the restoration chain. Use a fixed string such as a bundle-derived
+    /// constant (for example `"\(Bundle.main.bundleIdentifier!).ble-central"`).
+    ///
+    /// The default `nil` disables state restoration and preserves the existing lazy-init
+    /// contract unchanged.
+    public var restoreIdentifier: String? = nil
     
     /// Initializes a new `ReliaBLEConfig` instance with the default values.
     public init() {

@@ -32,7 +32,8 @@ import ReliaBLE
 
 @Observable class CentralViewModel {
     var currentState: BluetoothState = .unknown
-    var servicesInput = ""
+    /// Defaults to the Demo peripheral service UUID so background scans have a required filter.
+    var servicesInput = "12345678-90AB-CDEF-1234-567890ABCDEF"
     var connectionStates: [String: ConnectionState] = [:]
 
     private var deviceStore: DeviceStoreActor?

@@ -34,6 +34,14 @@ CoreBluetooth
 `BluetoothActor` is an **internal** implementation detail. Consumers must not
 reference it; interact only through ``ReliaBLEManager``.
 
+> Note: The internal central manager is created lazily and only once Bluetooth
+> authorization is `.allowedAlways` — the permission prompt stays under your
+> app's control via ``ReliaBLEManager/authorizeBluetooth()``. The one exception:
+> when ``ReliaBLEConfig/restoreIdentifier`` is set and authorization was already
+> granted, the central is created eagerly at ``ReliaBLEManager`` init so state
+> restoration can deliver its `willRestoreState` callback on relaunch. See
+> <doc:Background> for details.
+
 ### Calling actions
 
 All mutating actions are `async` and hop onto the Bluetooth actor for you:

@@ -11,7 +11,6 @@ This is a temporary overview.
 ### Essentials
 
 - <doc:GettingStarted>
-- <doc:Logging>
 
 ### Peripherals
 
@@ -28,3 +27,4 @@ This is a temporary overview.
 ### Advanced Usage
 
 - <doc:Logging>
+- <doc:Background>
