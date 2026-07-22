@@ -32,14 +32,17 @@ import Willow
 /// The main entry point for the ReliaBLE library.
 ///
 /// `ReliaBLEManager` is a `nonisolated`, `Sendable` value-like façade: it owns no mutable state and
-/// forwards every operation to a process-wide internal actor that serializes all Core Bluetooth
+/// forwards every operation to its owned ``BluetoothActor`` that serializes all Core Bluetooth
 /// interactions. Because it is not bound to any actor, it is callable directly from `@MainActor`
 /// SwiftUI code *and* from background actors without forcing a main-actor hop on background callers.
 public final class ReliaBLEManager: Sendable {
     public let loggingService: LoggingService
-    
+
     private let log: LoggingService
-    
+
+    /// Per-manager BLE stack. Internal so `@testable` tests can reach actor hooks.
+    let bluetooth: BluetoothActor
+
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
     /// Initializing a ReliaBLEManager does not start the `CBCentralManager` unless the user has already authorized
@@ -51,23 +54,25 @@ public final class ReliaBLEManager: Sendable {
     public init(config: ReliaBLEConfig = ReliaBLEConfig()) {
         loggingService = LoggingService(levels: config.logLevels, writers: config.logWriters, queue: config.logQueue)
         loggingService.enabled = config.loggingEnabled
-        
+
         log = loggingService
-        
-        // `init` stays synchronous and kicks off one-time actor setup via a fire-and-forget `Task`
+
+        bluetooth = BluetoothActor(
+            log: loggingService,
+            reconnectPolicy: config.reconnectPolicy,
+            restoreIdentifier: config.restoreIdentifier
+        )
+
+        // `init` stays synchronous and kicks off central creation via a fire-and-forget `Task`
         // rather than awaiting it, so the initializer never blocks. To prevent an operation invoked
-        // immediately after `init` from racing ahead of that setup, every public entry point funnels
-        // through `ensureInitialized(log:)` (which is idempotent) before acting — so this eager call
-        // is an optimization, not a correctness requirement.
+        // immediately after `init` from racing ahead of that setup, every operational entry point
+        // funnels through `ensureCentralManager()` (which is idempotent) before acting — so this
+        // eager call is an optimization, not a correctness requirement.
         Task {
-            await BluetoothActor.shared.ensureInitialized(
-                log: loggingService,
-                reconnectPolicy: config.reconnectPolicy,
-                restoreIdentifier: config.restoreIdentifier
-            )
+            await bluetooth.ensureCentralManager()
         }
     }
-    
+
     // MARK: - State
 
     /// A multi-subscriber `AsyncStream` of real-time state changes of the underlying Core Bluetooth
@@ -81,16 +86,16 @@ public final class ReliaBLEManager: Sendable {
     /// }
     /// ```
     public var state: AsyncStream<BluetoothState> {
-        BluetoothActor.shared.stateStream()
+        bluetooth.stateStream()
     }
-    
+
     /// Asynchronous, thread-safe access to the current state of the underlying Core Bluetooth
     /// system. The read is serialized on the library's internal concurrency domain, so the access
     /// is `await`-ed.
     public var currentState: BluetoothState {
-        get async { await BluetoothActor.shared.currentBluetoothState }
+        get async { await bluetooth.currentBluetoothState }
     }
-    
+
     /// A multi-subscriber `AsyncStream` of connection-state changes for all peripherals.
     ///
     /// Each property access returns a fresh, independent stream. This stream does **not** replay
@@ -102,17 +107,17 @@ public final class ReliaBLEManager: Sendable {
     /// }
     /// ```
     public var connectionStateChanges: AsyncStream<ConnectionStateChange> {
-        BluetoothActor.shared.connectionStateChangesStream()
+        bluetooth.connectionStateChangesStream()
     }
-    
+
     /// An async snapshot of the current per-peripheral connection states, useful for seeding
     /// a view on appearance without waiting for the next change event.
     public var currentConnectionStates: [String: ConnectionState] {
-        get async { await BluetoothActor.shared.currentConnectionStates }
+        get async { await bluetooth.currentConnectionStates }
     }
-    
+
     // MARK: - Authorization
-    
+
     /// Requests authorization to use Bluetooth, presenting the iOS permission prompt when authorization has not yet
     /// been determined.
     ///
@@ -122,19 +127,19 @@ public final class ReliaBLEManager: Sendable {
     ///
     /// - Throws: An ``AuthorizationError`` if the user has denied or restricted Bluetooth access.
     public func authorizeBluetooth() async throws {
-        await BluetoothActor.shared.ensureInitialized(log: log)
+        await bluetooth.ensureCentralManager()
 
         // Own the cancellation wiring here, in the nonisolated façade. When authorization is
         // undetermined the actor suspends until the decision resolves; cancelling the calling task
         // unblocks that wait with a `CancellationError` rather than hanging indefinitely.
         let id = UUID()
         try await withTaskCancellationHandler {
-            try await BluetoothActor.shared.authorize(id: id)
+            try await bluetooth.authorize(id: id)
         } onCancel: {
-            Task { await BluetoothActor.shared.cancelAuthorizationContinuation(id) }
+            Task { await bluetooth.cancelAuthorizationContinuation(id) }
         }
     }
-    
+
     // MARK: - Scanning
 
     /// A multi-subscriber `AsyncStream` that emits peripheral discovery events during scanning. It
@@ -145,16 +150,16 @@ public final class ReliaBLEManager: Sendable {
     /// ``discoveredPeripherals`` this stream does **not** replay a value on subscription — subscribe
     /// before you start scanning to avoid missing early advertisements.
     public var peripheralDiscoveries: AsyncStream<PeripheralDiscoveryEvent> {
-        BluetoothActor.shared.peripheralDiscoveriesStream()
+        bluetooth.peripheralDiscoveriesStream()
     }
 
     /// A multi-subscriber `AsyncStream` that emits the current de-duplicated list of discovered
     /// peripherals each time it changes. Each property access returns a fresh, independent stream;
     /// the current list is replayed as the first element on subscription.
     public var discoveredPeripherals: AsyncStream<[Peripheral]> {
-        BluetoothActor.shared.discoveredPeripheralsStream()
+        bluetooth.discoveredPeripheralsStream()
     }
-    
+
     /// Starts scanning for peripheral devices, optionally filtering by specific services.
     ///
     /// - Parameter services: An optional array of `CBUUID` objects representing the services to scan for. If provided,
@@ -163,16 +168,16 @@ public final class ReliaBLEManager: Sendable {
     /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
     /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
     public func startScanning(services: sending [CBUUID]? = nil) async {
-        await BluetoothActor.shared.ensureInitialized(log: log)
-        await BluetoothActor.shared.startScanning(services: services)
+        await bluetooth.ensureCentralManager()
+        await bluetooth.startScanning(services: services)
     }
-    
+
     /// Stops scanning for peripheral devices.
     public func stopScanning() async {
-        await BluetoothActor.shared.ensureInitialized(log: log)
-        await BluetoothActor.shared.stopScanning()
+        await bluetooth.ensureCentralManager()
+        await bluetooth.stopScanning()
     }
-    
+
     // MARK: - Connection
 
     /// Initiates a connection to a previously discovered peripheral.
@@ -189,8 +194,8 @@ public final class ReliaBLEManager: Sendable {
     ///   snapshot), or ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up (for example, not
     ///   yet authorized).
     public func connect(to peripheral: Peripheral, autoReconnect: Bool = true) async throws {
-        await BluetoothActor.shared.ensureInitialized(log: log)
-        try await BluetoothActor.shared.connect(id: peripheral.id, autoReconnect: autoReconnect)
+        await bluetooth.ensureCentralManager()
+        try await bluetooth.connect(id: peripheral.id, autoReconnect: autoReconnect)
     }
 
     /// Initiates a disconnection from a previously connected peripheral.
@@ -202,8 +207,8 @@ public final class ReliaBLEManager: Sendable {
     /// - Throws: ``PeripheralError/notFound`` if the peripheral's live reference has been
     ///   invalidated, or ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
     public func disconnect(from peripheral: Peripheral) async throws {
-        await BluetoothActor.shared.ensureInitialized(log: log)
-        try await BluetoothActor.shared.disconnect(id: peripheral.id)
+        await bluetooth.ensureCentralManager()
+        try await bluetooth.disconnect(id: peripheral.id)
     }
 }
 
@@ -240,7 +245,7 @@ public enum BluetoothState: Sendable {
     /// This is a temporary state. After Core Bluetooth initializes or resets, ReliaBLE updates the
     /// state value.
     case unknown
-    
+
     /// A user-friendly string representation of the `BluetoothState`.
     ///
     /// - Returns: A string describing the `BluetoothState`.
