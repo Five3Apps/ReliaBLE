@@ -251,6 +251,20 @@ struct ReliaBLEManagerTests {
         await manager.bluetooth.updateState()
     }
 
+    @Test func freshManagerBroadcastsUnauthorizedNotDeterminedWithoutCentral() async throws {
+        // Pin auth before construction: ensureConfigured only does this once, and the prior
+        // test may have left .allowedAlways. Init's fire-and-forget ensureCentralManager must
+        // publish .unauthorized(.notDetermined) even though no central is created.
+        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        let manager = await Mock.makeManager()
+
+        #expect(await Mock.waitForState("Not Authorized", on: manager))
+
+        var iterator = manager.state.makeAsyncIterator()
+        let replayed = await iterator.next()
+        #expect(replayed?.description == "Not Authorized")
+    }
+
     // MARK: - Scanning
 
     @Test func startAndStopScanningTransitionsState() async throws {

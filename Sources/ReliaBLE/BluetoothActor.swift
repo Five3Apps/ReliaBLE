@@ -160,6 +160,10 @@ actor BluetoothActor {
     /// Once true, the actor is dead — ops no-op / throw and no second central can be created.
     private var isShutdown = false
 
+    /// Tracks whether ``ensureCentralManager()`` has run at least once so the initial
+    /// authorization-derived state is broadcast even when no central is created.
+    private var hasEnsuredOnce = false
+
     /// Continuations for in-flight ``authorize()`` calls awaiting an authorization decision, keyed by a
     /// per-call id so a cancelled call can resume just its own continuation. All pending continuations are
     /// resumed together once `CBCentralManager.authorization` resolves away from `.notDetermined`.
@@ -399,6 +403,9 @@ actor BluetoothActor {
     func ensureCentralManager() {
         guard !isShutdown else { return }
 
+        let firstEnsure = !hasEnsuredOnce
+        hasEnsuredOnce = true
+
         var createdManager = false
 
         if centralManager == nil, CBCentralManager.authorization == .allowedAlways {
@@ -406,7 +413,7 @@ actor BluetoothActor {
             createdManager = true
         }
 
-        if createdManager {
+        if firstEnsure || createdManager {
             updateState()
         }
     }
@@ -456,6 +463,8 @@ actor BluetoothActor {
 
     /// Drains a single delegate event on the actor, preserving CoreBluetooth's callback order.
     private func process(_ event: DelegateEvent) {
+        guard !isShutdown else { return }
+
         switch event {
         case .stateUpdate:
             handleCentralManagerStateUpdate()

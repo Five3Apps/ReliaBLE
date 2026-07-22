@@ -38,8 +38,6 @@ import Willow
 public final class ReliaBLEManager: Sendable {
     public let loggingService: LoggingService
 
-    private let log: LoggingService
-
     /// Per-manager BLE stack. Internal so `@testable` tests can reach actor hooks.
     ///
     /// Retain graph (no cycles): manager → actor → central → shim; shim holds only the
@@ -58,8 +56,6 @@ public final class ReliaBLEManager: Sendable {
     public init(config: ReliaBLEConfig = ReliaBLEConfig()) {
         loggingService = LoggingService(levels: config.logLevels, writers: config.logWriters, queue: config.logQueue)
         loggingService.enabled = config.loggingEnabled
-
-        log = loggingService
 
         bluetooth = BluetoothActor(
             log: loggingService,

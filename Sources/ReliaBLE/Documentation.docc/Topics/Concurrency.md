@@ -70,13 +70,16 @@ you run more than one manager at once:
 > underlying actor and central stay alive — dropping your reference to the
 > manager alone is not enough to tear the stack down.
 
-> Note: The internal central manager is created lazily and only once Bluetooth
-> authorization is `.allowedAlways` — the permission prompt stays under your
-> app's control via ``ReliaBLEManager/authorizeBluetooth()``. The one exception:
-> when ``ReliaBLEConfig/restoreIdentifier`` is set and authorization was already
-> granted, the central is created eagerly at ``ReliaBLEManager`` init so state
-> restoration can deliver its `willRestoreState` callback on relaunch. See
-> <doc:Background> for details.
+> Note: `ReliaBLEManager` init never prompts for Bluetooth permission. Creating
+> the internal central stays gated on existing `.allowedAlways` authorization so
+> the prompt remains under your app's control via
+> ``ReliaBLEManager/authorizeBluetooth()``. When authorization is already
+> `.allowedAlways`, init eagerly creates the central (via a fire-and-forget
+> `Task` into `BluetoothActor`) so a live stack is ready immediately.
+> ``ReliaBLEConfig/restoreIdentifier`` only affects the options passed at that
+> creation — it does not change *when* the central is created — so
+> `willRestoreState` can be delivered on relaunch. See <doc:Background> for
+> details.
 
 ### Calling actions
 
