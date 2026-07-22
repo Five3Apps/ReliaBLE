@@ -27,7 +27,7 @@
 import Foundation
 import Testing
 
-import CoreBluetoothMock
+@preconcurrency import CoreBluetoothMock
 import Willow
 @testable import ReliaBLEMock
 
@@ -35,15 +35,16 @@ import Willow
 
 /// All ReliaBLE behavioral tests live in a single **serialized** suite.
 ///
-/// Each test constructs its own ``ReliaBLEManager`` / ``BluetoothActor`` stack via
-/// ``Mock/makeManager(loggingEnabled:)``. Nordic's `CBMCentralManagerMock` keeps global static
-/// simulation state (authorization, power, peripherals), so parallel execution remains unsafe —
-/// `.serialized` guarantees no two tests mutate that mock state concurrently.
+/// Each test owns a fresh ``ReliaBLEManager`` / ``BluetoothActor`` stack via ``Mock/makeManager``.
+/// Stacks are instance-isolated; Nordic's `CBMCentralManagerMock` globals (authorization, power,
+/// peripheral specs, `simulateStateRestoration`) remain process-wide, so `.serialized` keeps tests
+/// from racing the mock.
 ///
-/// **Lifetime:** the suite keeps at most one active stack. ``Mock/makeManager`` tears down any
-/// previous manager via ``Mock/tearDown(_:)`` (explicit `shutdown()` + mock disconnect). Tests that
-/// need two live stacks must call ``Mock/tearDown(_:)`` themselves and coordinate mock power (see
-/// design item 4). Stateful tests re-baseline with ``Mock/ensureReady(_:)``.
+/// **Lifetime:** by default the suite keeps one active stack — ``makeManager`` tears down the
+/// previous via ``tearDown(_:)``. Cold-relaunch tests shut down stack 1 without resetting mock
+/// connections, install a spec-based `simulateStateRestoration` fixture, then build stack 2 with
+/// the same restore id so central init delivers faithful `willRestoreState`. Always clear
+/// `simulateStateRestoration` in a `defer`.
 @Suite(.serialized)
 struct ReliaBLEManagerTests {
 
@@ -1370,354 +1371,298 @@ struct ReliaBLEManagerTests {
         let restoreId = "com.five3apps.relia-ble.tests.restore"
 
         // When authorized, a restoreIdentifier does not relax the auth gate — it only adds the
-        // restore-id option to the existing creation path. Still verify construction + ensureReady
-        // succeeds with the config set.
+        // restore-id option to the existing creation path.
         CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
         CBMCentralManagerMock.simulatePowerOn()
 
         let manager = await Mock.makeManager(restoreIdentifier: restoreId)
-        // firstInitialization only runs once per process; set the id so later assertions on the
-        // stored value are meaningful even if this suite is not first to touch the actor.
-        await manager.bluetooth.testSetRestoreIdentifier(restoreId)
         #expect(await manager.bluetooth.testRestoreIdentifier() == restoreId)
 
-        // Unit-level wiring check: with the id set, the options dictionary handed to the factory
-        // contains the restore key (and without one, no options at all). End-to-end factory option
-        // fidelity is deferred to #42.
         let optionKeys = await manager.bluetooth.testCentralCreationOptionKeys()
         #expect(optionKeys.contains(CBMCentralManagerOptionRestoreIdentifierKey))
-        await manager.bluetooth.testSetRestoreIdentifier(nil)
-        #expect(await manager.bluetooth.testCentralCreationOptionKeys().isEmpty)
-        await manager.bluetooth.testSetRestoreIdentifier(restoreId)
 
         await Mock.ensureReady(manager)
         #expect(await manager.bluetooth.hasCentralManager)
+
+        let noRestore = await Mock.makeManager(restoreIdentifier: nil)
+        #expect(await noRestore.bluetooth.testCentralCreationOptionKeys().isEmpty)
     }
 
     @Test func willRestoreRepopulatesMapsSeedsConnectionStateAndBroadcasts() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
-        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+        defer {
+            Mock.connectionTestDelegate.connectionResult = .success(())
+            Mock.clearStateRestoration()
+        }
 
-        let manager = await Mock.makeManager()
-        await Mock.ensureReady(manager)
+        let restoreId = "com.five3apps.relia-ble.tests.restore-broadcasts"
+        let manager1 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager1)
+        await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        // Reconnect intent is persisted per restore identifier; pin a test-unique id and start
-        // from a clean persisted set so the re-arm assertion below is meaningful.
-        await manager.bluetooth.testSetRestoreIdentifier("com.five3apps.relia-ble.tests.restore-broadcasts")
-        await manager.bluetooth.testClearPersistedReconnectIntent()
-
-        await manager.startScanning()
+        await manager1.startScanning()
         let peripheral = await Mock.waitForPeripheral(
             id: Mock.connectionTestPeripheralID,
-            on: manager,
+            on: manager1,
             withinNanoseconds: 3_000_000_000
         )
         let discovered = try #require(peripheral)
-        await manager.stopScanning()
+        await manager1.stopScanning()
 
-        try await manager.connect(to: discovered)
-        let connected = await firstConnectionStateChange(
-            from: manager.connectionStateChanges,
-            withinNanoseconds: 5_000_000_000
-        )
-        // Drain connecting → connected if needed.
-        if connected?.state == .connecting {
-            let c2 = await firstConnectionStateChange(
-                from: manager.connectionStateChanges,
-                withinNanoseconds: 5_000_000_000
-            )
-            #expect(c2?.state == .connected)
-        } else {
-            #expect(connected?.state == .connected)
+        try await manager1.connect(to: discovered)
+        _ = await pollUntil(timeout: 3.0) {
+            await manager1.currentConnectionStates[discovered.id] == .connected
         }
+        #expect(await manager1.bluetooth.testPersistedReconnectIntent().contains(discovered.id))
 
-        // connect(autoReconnect: true) persisted Tier-1 intent under the pinned restore id.
-        #expect(await manager.bluetooth.testPersistedReconnectIntent().contains(discovered.id))
+        // Cold relaunch: shut down stack 1. Central deinit may zero virtualConnections, so
+        // re-mark the spec connected before install — persisted intent survives in UserDefaults.
+        await Mock.tearDown(manager1, resetMockConnections: false)
+        Mock.connectionTestSpec.simulateConnection()
 
-        // Simulate cold relaunch: drop snapshots / in-memory intent while keeping live CBPeripheral
-        // refs so the restore path can rehydrate from the hand-built dictionary. Persisted intent
-        // survives, mirroring UserDefaults across process death.
-        await manager.bluetooth.testClearDiscoveredSnapshotsPreservingLiveReferences()
-        #expect(await manager.currentConnectionStates[discovered.id] == nil)
-        #expect(!(await manager.bluetooth.testIsReconnectEnabled(discovered.id)))
-
-        // Subscribe before restore so broadcasts are not missed. Note: no peripheralDiscoveries
-        // subscription — restored peripherals are deliberately kept off the advertisement feed.
-        //
-        // Stream registration is asynchronous: `makeAsyncIterator()` only *schedules* the
-        // continuation registration on a detached `@BluetoothActor` hop. The connection-state feed
-        // does not replay, so if the restore broadcast below fires before that hop lands, the
-        // `.connected` event is dropped and `connectionChanges.next()` blocks forever (this is the
-        // 30-min CI/Xcode hang). A single actor hop is not enough slack; poll until both
-        // subscriptions have actually registered before invoking restore.
-        let baseConnectionSubscribers = await manager.bluetooth.testConnectionStateSubscriberCount()
-        let basePeripheralsSubscribers = await manager.bluetooth.testPeripheralsSubscriberCount()
-        var peripherals = manager.discoveredPeripherals.makeAsyncIterator()
-        var connectionChanges = manager.connectionStateChanges.makeAsyncIterator()
-        let subscriptionsReady = await pollUntil(timeout: 3.0) {
-            let connectionReady = await manager.bluetooth.testConnectionStateSubscriberCount() > baseConnectionSubscribers
-            let peripheralsReady = await manager.bluetooth.testPeripheralsSubscriberCount() > basePeripheralsSubscribers
-            return connectionReady && peripheralsReady
-        }
-        #expect(subscriptionsReady)
-
-        let scanUUID = CBUUID(string: "180D")
-        await Mock.simulateWillRestoreState(
-            on: manager,
-            peripheralIds: [discovered.id],
+        let scanUUID = CBMUUID(string: "180D")
+        Mock.installStateRestoration(
+            restoreIdentifier: restoreId,
+            peripherals: [Mock.connectionTestSpec],
             scanServices: [scanUUID]
         )
 
-        // Maps rehydrated with discovery identity (name-based id preserved).
-        #expect(await manager.bluetooth.testContainsCBPeripheral(discovered.id))
-        let restoredList = await manager.bluetooth.discoveredPeripherals
-        #expect(restoredList.contains(where: { $0.id == discovered.id }))
-        #expect(await manager.currentConnectionStates[discovered.id] == .connected)
-        #expect(await manager.bluetooth.testIsReconnectEnabled(discovered.id))
+        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        let manager2 = await Mock.makeManager(restoreIdentifier: restoreId)
+        let baseConn = await manager2.bluetooth.testConnectionStateSubscriberCount()
+        let basePeriph = await manager2.bluetooth.testPeripheralsSubscriberCount()
+        var peripherals = manager2.discoveredPeripherals.makeAsyncIterator()
+        var connectionChanges = manager2.connectionStateChanges.makeAsyncIterator()
+        let subscriptionsReady = await pollUntil(timeout: 3.0) {
+            let connReady = await manager2.bluetooth.testConnectionStateSubscriberCount() > baseConn
+            let periphReady = await manager2.bluetooth.testPeripheralsSubscriberCount() > basePeriph
+            return connReady && periphReady
+        }
+        #expect(subscriptionsReady)
 
-        // Streams broadcast restored state.
+        CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
+        CBMCentralManagerMock.simulatePowerOn()
+        try await manager2.authorizeBluetooth()
+
+        let connectionSeeded = await pollUntil(timeout: 3.0) {
+            let state = await manager2.currentConnectionStates[Mock.connectionTestPeripheralID]
+            return state == .connected || state == .connecting
+        }
+        #expect(connectionSeeded)
+        // Mock may restore as .connecting when virtualConnections was cleared by central deinit;
+        // simulateConnection before install prefers .connected. Either way maps rehydrate.
+        #expect(await manager2.bluetooth.testContainsCBPeripheral(Mock.connectionTestPeripheralID))
+        #expect(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID))
+
+        let restoredList = await manager2.bluetooth.discoveredPeripherals
+        #expect(restoredList.contains(where: { $0.id == Mock.connectionTestPeripheralID }))
+
+        // Restored peripherals are kept off the advertisement feed; discoveredPeripherals replays.
         let peripheralsEvent = await peripherals.next()
-        #expect(peripheralsEvent?.contains(where: { $0.id == discovered.id }) == true)
+        #expect(peripheralsEvent?.contains(where: { $0.id == Mock.connectionTestPeripheralID }) == true)
 
         let connectionEvent = await connectionChanges.next()
-        #expect(connectionEvent?.peripheralId == discovered.id)
-        #expect(connectionEvent?.state == .connected)
+        #expect(connectionEvent?.peripheralId == Mock.connectionTestPeripheralID)
+        #expect(
+            connectionEvent?.state == .connected
+                || connectionEvent?.state == .connecting
+        )
 
-        // Scan resumed (central is powered on).
-        #expect(await manager.bluetooth.testIsScanning())
-        #expect(await manager.bluetooth.testPendingRestoredScanServices() == nil)
+        let scanSettled = await pollUntil(timeout: 3.0) {
+            let scanning = await manager2.bluetooth.testIsScanning()
+            let pending = await manager2.bluetooth.testPendingRestoredScanServices()
+            return scanning && pending == nil
+        }
+        #expect(scanSettled)
 
-        try? await manager.disconnect(from: discovered)
-        await manager.stopScanning()
-        await manager.bluetooth.testClearPersistedReconnectIntent()
+        await manager2.bluetooth.testClearPersistedReconnectIntent()
+        await Mock.tearDown(manager2)
     }
 
     @Test func willRestoreSeedingReconnectOnlyForConnectedOrConnecting() async throws {
+        // Faithful path: connected restore re-arms Tier-1 from persisted intent.
+        // Disconnected-peripheral seeding is a direct-handler unit test (item 4) — iOS never
+        // restores disconnected peripherals, and the mock always restores specs as
+        // connected/connecting based on virtualConnections.
         Mock.connectionTestDelegate.connectionResult = .success(())
-        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+        defer {
+            Mock.connectionTestDelegate.connectionResult = .success(())
+            Mock.clearStateRestoration()
+        }
 
-        let manager = await Mock.makeManager()
-        await Mock.ensureReady(manager)
+        let restoreId = "com.five3apps.relia-ble.tests.restore-seeding"
+        let manager1 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager1)
+        await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        // Pin a test-unique restore id and start from a clean persisted-intent set.
-        await manager.bluetooth.testSetRestoreIdentifier("com.five3apps.relia-ble.tests.restore-seeding")
-        await manager.bluetooth.testClearPersistedReconnectIntent()
-
-        // Discover both peripherals so we have live refs for restore.
-        await manager.startScanning()
+        await manager1.startScanning()
         let connectionPeripheral = await Mock.waitForPeripheral(
             id: Mock.connectionTestPeripheralID,
-            on: manager,
+            on: manager1,
             withinNanoseconds: 3_000_000_000
         )
         let connected = try #require(connectionPeripheral)
-        let scanPeripheral = await Mock.waitForPeripheral(
-            id: Mock.testPeripheralID,
-            on: manager,
-            withinNanoseconds: 3_000_000_000
-        )
-        let disconnected = try #require(scanPeripheral)
-        await manager.stopScanning()
+        await manager1.stopScanning()
 
-        try await manager.connect(to: connected)
-        _ = await firstConnectionStateChange(
-            from: manager.connectionStateChanges,
-            withinNanoseconds: 5_000_000_000
-        )
-        // Wait until connected (may already be past .connecting).
+        try await manager1.connect(to: connected)
         _ = await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[connected.id] == .connected
+            await manager1.currentConnectionStates[connected.id] == .connected
         }
 
-        await manager.bluetooth.testClearDiscoveredSnapshotsPreservingLiveReferences()
+        await Mock.tearDown(manager1, resetMockConnections: false)
+        Mock.connectionTestSpec.simulateConnection()
 
-        await Mock.simulateWillRestoreState(
-            on: manager,
-            peripheralIds: [connected.id, disconnected.id],
+        Mock.installStateRestoration(
+            restoreIdentifier: restoreId,
+            peripherals: [Mock.connectionTestSpec],
             scanServices: nil
         )
 
-        #expect(await manager.currentConnectionStates[connected.id] == .connected)
-        // Re-armed because connect(autoReconnect: true) persisted intent before "process death".
-        #expect(await manager.bluetooth.testIsReconnectEnabled(connected.id))
-        // Disconnected restored peripherals do not seed connectionStates / reconnectEnabled.
-        #expect(await manager.currentConnectionStates[disconnected.id] == nil)
-        #expect(!(await manager.bluetooth.testIsReconnectEnabled(disconnected.id)))
+        let manager2 = try await Mock.makeRestoredManager(restoreIdentifier: restoreId)
 
-        try? await manager.disconnect(from: connected)
-        await manager.bluetooth.testClearPersistedReconnectIntent()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager2.currentConnectionStates[Mock.connectionTestPeripheralID] == .connected
+        })
+        #expect(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID))
+
+        await manager2.bluetooth.testClearPersistedReconnectIntent()
+        await Mock.tearDown(manager2)
     }
 
     @Test func willRestoreDoesNotRearmReconnectWithoutPersistedIntent() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
-        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+        defer {
+            Mock.connectionTestDelegate.connectionResult = .success(())
+            Mock.clearStateRestoration()
+        }
 
-        let manager = await Mock.makeManager()
-        await Mock.ensureReady(manager)
+        let restoreId = "com.five3apps.relia-ble.tests.restore-no-intent"
+        let manager1 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager1)
+        await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        await manager.bluetooth.testSetRestoreIdentifier("com.five3apps.relia-ble.tests.restore-no-intent")
-        await manager.bluetooth.testClearPersistedReconnectIntent()
-
-        await manager.startScanning()
+        await manager1.startScanning()
         let peripheral = await Mock.waitForPeripheral(
             id: Mock.connectionTestPeripheralID,
-            on: manager,
+            on: manager1,
             withinNanoseconds: 3_000_000_000
         )
         let discovered = try #require(peripheral)
-        await manager.stopScanning()
+        await manager1.stopScanning()
 
-        // autoReconnect: false must not persist Tier-1 intent.
-        try await manager.connect(to: discovered, autoReconnect: false)
+        try await manager1.connect(to: discovered, autoReconnect: false)
         _ = await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[discovered.id] == .connected
+            await manager1.currentConnectionStates[discovered.id] == .connected
         }
-        #expect(!(await manager.bluetooth.testPersistedReconnectIntent().contains(discovered.id)))
+        #expect(!(await manager1.bluetooth.testPersistedReconnectIntent().contains(discovered.id)))
 
-        await manager.bluetooth.testClearDiscoveredSnapshotsPreservingLiveReferences()
+        await Mock.tearDown(manager1, resetMockConnections: false)
+        Mock.connectionTestSpec.simulateConnection()
 
-        await Mock.simulateWillRestoreState(
-            on: manager,
-            peripheralIds: [discovered.id],
+        Mock.installStateRestoration(
+            restoreIdentifier: restoreId,
+            peripherals: [Mock.connectionTestSpec],
             scanServices: nil
         )
+        let manager2 = try await Mock.makeRestoredManager(restoreIdentifier: restoreId)
 
-        // The OS-held connection is still surfaced to the app model…
-        #expect(await manager.currentConnectionStates[discovered.id] == .connected)
-        // …but Tier-1 reconnect stays disarmed because no intent was persisted.
-        #expect(!(await manager.bluetooth.testIsReconnectEnabled(discovered.id)))
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager2.currentConnectionStates[Mock.connectionTestPeripheralID] == .connected
+        })
+        #expect(!(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID)))
 
-        try? await manager.disconnect(from: discovered)
-        // Wait for the disconnect to land so the mock peripheral resumes advertising
-        // before the next test scans for it.
-        _ = await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[discovered.id] != .connected
-        }
-        await manager.bluetooth.testClearPersistedReconnectIntent()
+        await manager2.bluetooth.testClearPersistedReconnectIntent()
+        await Mock.tearDown(manager2)
     }
 
     @Test func willRestoreIgnoresEmptyScanServiceFilter() async throws {
+        // Direct-handler unit test: CoreBluetoothMock treats a non-nil (even empty) scan-services
+        // array as `isScanning = true` at restore-init, so the faithful fixture cannot express
+        // "empty filter ignored" without fighting the mock. Production still ignores empty filters.
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
-            id: Mock.testPeripheralID,
-            on: manager,
-            withinNanoseconds: 3_000_000_000
-        )
-        let discovered = try #require(peripheral)
-        await manager.stopScanning()
-
-        await manager.bluetooth.testClearDiscoveredSnapshotsPreservingLiveReferences()
-
-        // An empty restored filter is background-useless; restoration must neither re-issue the
-        // scan nor stash it as pending.
-        await Mock.simulateWillRestoreState(
-            on: manager,
-            peripheralIds: [discovered.id],
-            scanServices: []
-        )
+        await manager.bluetooth.testHandleWillRestoreState(scanServices: [])
 
         #expect(!(await manager.bluetooth.testIsScanning()))
         #expect(await manager.bluetooth.testPendingRestoredScanServices() == nil)
     }
 
     @Test func invalidatePeripheralsClearsRestoredStateAndIntent() async throws {
-        // Pre-condition: no stale connection from a preceding lifecycle test — a still-connected
-        // mock peripheral does not advertise, so discovery below would time out.
-        Mock.connectionTestSpec.simulateDisconnection()
-        try? await Task.sleep(nanoseconds: 100_000_000)
-
         Mock.connectionTestDelegate.connectionResult = .success(())
-        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+        defer {
+            Mock.connectionTestDelegate.connectionResult = .success(())
+            Mock.clearStateRestoration()
+        }
 
-        let manager = await Mock.makeManager()
-        await Mock.ensureReady(manager)
+        let restoreId = "com.five3apps.relia-ble.tests.restore-invalidate"
+        let manager1 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager1)
+        await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        await manager.bluetooth.testSetRestoreIdentifier("com.five3apps.relia-ble.tests.restore-invalidate")
-        await manager.bluetooth.testClearPersistedReconnectIntent()
-
-        await manager.startScanning()
+        await manager1.startScanning()
         let peripheral = await Mock.waitForPeripheral(
             id: Mock.connectionTestPeripheralID,
-            on: manager,
+            on: manager1,
             withinNanoseconds: 3_000_000_000
         )
         let discovered = try #require(peripheral)
-        await manager.stopScanning()
+        await manager1.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await manager1.connect(to: discovered)
         _ = await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[discovered.id] == .connected
+            await manager1.currentConnectionStates[discovered.id] == .connected
         }
 
-        await manager.bluetooth.testClearDiscoveredSnapshotsPreservingLiveReferences()
+        await Mock.tearDown(manager1, resetMockConnections: false)
+        Mock.connectionTestSpec.simulateConnection()
 
-        // Restore while powered on: seeds connection state and re-arms from persisted intent.
-        await Mock.simulateWillRestoreState(
-            on: manager,
-            peripheralIds: [discovered.id],
+        Mock.installStateRestoration(
+            restoreIdentifier: restoreId,
+            peripherals: [Mock.connectionTestSpec],
             scanServices: nil
         )
-        #expect(await manager.bluetooth.testIsReconnectEnabled(discovered.id))
+        let manager2 = try await Mock.makeRestoredManager(restoreIdentifier: restoreId)
 
-        // Power off so a second restore stashes its scan filter as pending.
-        CBMCentralManagerMock.simulatePowerOff()
-        #expect(await Mock.waitForState("Powered Off", on: manager))
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID)
+        })
 
+        // Direct-handler: stash a pending restored scan, then invalidate (faithful second restore
+        // while powered off is awkward because mock forces isScanning at restore-init).
         let scanUUID = CBUUID(string: "180D")
-        await Mock.simulateWillRestoreState(
-            on: manager,
-            peripheralIds: [],
-            scanServices: [scanUUID]
-        )
-        #expect(await manager.bluetooth.testPendingRestoredScanServices() == [scanUUID])
+        CBMCentralManagerMock.simulatePowerOff()
+        #expect(await Mock.waitForState("Powered Off", on: manager2))
+        await manager2.bluetooth.testHandleWillRestoreState(scanServices: [scanUUID])
+        #expect(await manager2.bluetooth.testPendingRestoredScanServices() == [scanUUID])
 
-        // The unauthorized/resetting teardown path clears the pending restored scan, connection
-        // state, in-memory reconnect intent, and the persisted mirror (plan critique seam).
-        await manager.bluetooth.testInvalidatePeripherals()
-        #expect(await manager.bluetooth.testPendingRestoredScanServices() == nil)
-        #expect(!(await manager.bluetooth.testIsReconnectEnabled(discovered.id)))
-        #expect(await manager.currentConnectionStates[discovered.id] == nil)
-        #expect(await manager.bluetooth.testPersistedReconnectIntent().isEmpty)
+        await manager2.bluetooth.testInvalidatePeripherals()
+        #expect(await manager2.bluetooth.testPendingRestoredScanServices() == nil)
+        #expect(!(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID)))
+        #expect(await manager2.currentConnectionStates[Mock.connectionTestPeripheralID] == nil)
+        #expect(await manager2.bluetooth.testPersistedReconnectIntent().isEmpty)
 
-        // Restore power for subsequent tests.
         CBMCentralManagerMock.simulatePowerOn()
-        _ = await Mock.waitForState("Ready", on: manager)
-        await manager.bluetooth.testClearPersistedReconnectIntent()
+        await manager2.bluetooth.testClearPersistedReconnectIntent()
+        await Mock.tearDown(manager2)
     }
 
     @Test func willRestoreDefersScanUntilPoweredOn() async throws {
+        // Direct-handler unit test: CoreBluetoothMock sets `isScanning = true` synchronously
+        // inside central init when scan services are restored, so a faithful cold-relaunch cannot
+        // observe a deferred pending filter. Exercise our handler's powered-off deferral directly.
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
-            id: Mock.testPeripheralID,
-            on: manager,
-            withinNanoseconds: 3_000_000_000
-        )
-        let discovered = try #require(peripheral)
-        await manager.stopScanning()
-
-        // Power off before restore so resumeRestoredScan stashes the filter.
         CBMCentralManagerMock.simulatePowerOff()
         #expect(await Mock.waitForState("Powered Off", on: manager))
 
-        await manager.bluetooth.testClearDiscoveredSnapshotsPreservingLiveReferences()
-
         let scanUUID = CBUUID(string: "180D")
-        await Mock.simulateWillRestoreState(
-            on: manager,
-            peripheralIds: [discovered.id],
-            scanServices: [scanUUID]
-        )
+        await manager.bluetooth.testHandleWillRestoreState(scanServices: [scanUUID])
 
         #expect(await manager.bluetooth.testPendingRestoredScanServices() == [scanUUID])
         #expect(!(await manager.bluetooth.testIsScanning()))
 
-        // Power on should resume the deferred restored scan.
         CBMCentralManagerMock.simulatePowerOn()
         let becameScanning = await Mock.waitForState("Scanning", on: manager)
         if !becameScanning {
@@ -1864,18 +1809,77 @@ enum Mock {
     /// Active stack tracked for serialized-suite teardown. Cleared by ``tearDown(_:)``.
     nonisolated(unsafe) private static var activeManager: ReliaBLEManager?
 
-    /// Deterministically tears down a manager stack: disconnects mock peripherals while the
-    /// central still exists, then calls ``BluetoothActor/shutdown()`` (volatile state only —
-    /// persisted reconnect intent is preserved).
+    /// Deterministically tears down a manager stack via ``BluetoothActor/shutdown()`` (volatile
+    /// state only — persisted reconnect intent is preserved).
     ///
-    /// Safe to call more than once. Use at end of multi-stack scenarios, or rely on
-    /// ``makeManager`` which tears down the previous active stack automatically.
-    static func tearDown(_ manager: ReliaBLEManager) async {
-        connectionTestSpec.simulateDisconnection()
+    /// - Parameter resetMockConnections: When `true` (default), disconnects mock peripherals so
+    ///   they advertise again for the next test. Pass `false` for cold-relaunch so
+    ///   `CBMPeripheralSpec.virtualConnections` stays set and `simulateStateRestoration` can
+    ///   restore peripherals as `.connected`.
+    static func tearDown(_ manager: ReliaBLEManager, resetMockConnections: Bool = true) async {
+        if resetMockConnections {
+            connectionTestSpec.simulateDisconnection()
+        }
         await manager.bluetooth.shutdown()
         if activeManager === manager {
             activeManager = nil
         }
+    }
+
+    /// Installs a process-global `simulateStateRestoration` fixture built only from
+    /// ``CBMPeripheralSpec``s and scan-service UUIDs (no live `CBPeripheral` / actor state).
+    ///
+    /// **Always** pair with `defer { Mock.clearStateRestoration() }`.
+    static func installStateRestoration(
+        restoreIdentifier: String,
+        peripherals: [CBMPeripheralSpec] = [],
+        scanServices: [CBMUUID]? = nil
+    ) {
+        CBMCentralManagerMock.simulateStateRestoration = { id in
+            guard id == restoreIdentifier else { return nil }
+            var dict: [String: Any] = [:]
+            if !peripherals.isEmpty {
+                dict[CBMCentralManagerRestoredStatePeripheralsKey] = peripherals
+            }
+            if let scanServices {
+                dict[CBMCentralManagerRestoredStateScanServicesKey] = scanServices
+            }
+            return dict
+        }
+    }
+
+    static func clearStateRestoration() {
+        CBMCentralManagerMock.simulateStateRestoration = nil
+    }
+
+    /// Builds manager 2 for a cold relaunch: restores under `restoreIdentifier` when the central
+    /// is created. Caller must have already torn down stack 1 (typically with
+    /// `resetMockConnections: false`) and installed the restoration fixture.
+    ///
+    /// Leaves authorization undetermined until after stream subscribers are registered, then
+    /// authorizes so `willRestoreState` fires during central init. Poll for settled actor state
+    /// after return — restore side effects are applied asynchronously relative to authorize.
+    static func makeRestoredManager(
+        restoreIdentifier: String,
+        loggingEnabled: Bool = false,
+        reconnectPolicy: ReconnectPolicy? = nil
+    ) async throws -> ReliaBLEManager {
+        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        let manager = await makeManager(
+            loggingEnabled: loggingEnabled,
+            reconnectPolicy: reconnectPolicy,
+            restoreIdentifier: restoreIdentifier,
+            tearDownPrevious: true
+        )
+        CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
+        CBMCentralManagerMock.simulatePowerOn()
+        try await manager.authorizeBluetooth()
+        _ = await pollUntil(timeout: 3.0) {
+            let powered = await manager.bluetooth.isCentralPoweredOn
+            let hasCentral = await manager.bluetooth.hasCentralManager
+            return powered || hasCentral
+        }
+        return manager
     }
 
     /// Builds a `ReliaBLEManager` after ensuring the one-time mock configuration has run.
@@ -1947,26 +1951,6 @@ enum Mock {
         // when powered on and authorized.
         await manager.stopScanning()
         await manager.bluetooth.updateState()
-    }
-
-    /// Drives CoreBluetooth state restoration end-to-end through the mock harness.
-    ///
-    /// Builds the restoration dictionary from actor-owned live `CBPeripheral` references and delivers
-    /// `willRestoreState` on the real `BluetoothDelegateShim` the factory attached to the manager's
-    /// central, exercising the full shim → `AsyncStream` → `process(_:)` → `handleWillRestoreState`
-    /// path — the same glue CoreBluetooth uses on relaunch. Returns once restoration has been fully
-    /// applied on the actor, so callers can assert on settled state immediately.
-    ///
-    /// Replaces the retired `testInvokeWillRestoreState(...)` actor-boundary backdoor (issue #42).
-    static func simulateWillRestoreState(
-        on manager: ReliaBLEManager,
-        peripheralIds: [String],
-        scanServices: [CBUUID]? = nil
-    ) async {
-        await manager.bluetooth.testDeliverWillRestoreStateThroughDelegate(
-            peripheralIds: peripheralIds,
-            scanServices: scanServices
-        )
     }
 
     /// Builds the simulated, discoverable, connectable test peripheral.
