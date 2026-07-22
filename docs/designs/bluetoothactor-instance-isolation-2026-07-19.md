@@ -1,5 +1,5 @@
 # Design: Instance-Isolated BluetoothActor (retire `@globalActor`)
-*Follow-up to issue #42 · 2026-07-19 · Status: revised after oracle review (grok-4.5); ready to implement*
+*Follow-up to issue #42 · 2026-07-19 · Status: **IMPLEMENTED** 2026-07-21 (all 7 work items landed; see Progress log). Issue #65.*
 
 ## Goal
 
@@ -289,6 +289,17 @@ change):
   restoration unchanged from the consumer's view.
 - Verify the resolved CoreBluetoothMock actually contains `simulateStateRestoration` at build
   time (it does in 1.0.6; keep the `.upToNextMinor` pin and fail tests clearly if absent).
+
+## Progress log (orchestrator)
+
+- Baseline `cf33d84`: shim-routed restoration harness groundwork (#42) — `Mock.makeManager`, `Mock.simulateWillRestoreState`, specs.
+- [x] **Item 1** — `8b5a6b4`: de-globalized `BluetoothActor`, internal `bluetooth`, `ensureCentralManager()`, `EventPipeline`/`TaskRegistry` + `deinit`, terminal `shutdown()`, consumer-before-factory, harness migrated to `manager.bluetooth`. 53/53 green. NOTE: two live centrals crash CoreBluetoothMock → `Mock.makeManager` currently shuts down the prior manager (interim); reconcile in item 2 and re-examine before the item-4 two-manager test.
+- [x] **Item 2** — `0517264`: retain-cycle audit (no cycles), scrubbed process-lifetime comments in Sources, explicit `Mock.tearDown(_:)` (+ `tearDownPrevious:` flag). CONFIRMED: two concurrently-live centrals ARE feasible (mock tracks multiple managers); item-4 two-manager test viable via `tearDownPrevious: false` + explicit teardown of both, avoiding zombie centrals during power transitions. 53/53 green.
+- [x] **Item 3** — `1323b2d`: spec-based `Mock.installStateRestoration`/`clearStateRestoration` faithful fixture (defer-reset), migrated connected-restore/re-arm/no-rearm/invalidate tests to faithful path, deleted all shim-injection machinery, kept minimal `testHandleWillRestoreState(scanServices:)` direct-handler entry. Defer-scan + empty-scan-filter confirmed mock-conflict → stay direct-handler (capture in item 7). 53/53 green.
+- [x] **Item 4** — `5a4d1f0`: demoted disconnected-restore to direct-handler; added `twoManagersWithDistinctRestoreIdsHaveIndependentState` (two live stacks at once), `authorizeCancellationDoesNotAffectOtherManager`; Sendable proof instance-based. 56/56 green.
+- [x] **Item 5** — `a4ee8c5`: rewrote AGENTS.md "Swift Concurrency" (CLAUDE.md is a symlink → AGENTS.md, one file); replaced `@globalActor` narrative in DocC `Topics/Concurrency.md` with instance-per-manager model + "One stack per manager" section (per-stack discovery, global auth, shared radio, both halves of restore-id rule, stream-retains-actor lifetime); corrected the now-false "process-wide actor singleton" config note in `GettingStarted.md` and added multi-manager guidance. Restoration documented as consumer-unchanged.
+- [x] **Item 6** — Demo audit: 0 references to `BluetoothActor`/`@BluetoothActor`/`.shared`; single-manager wiring via EnvironmentKey; builds clean on iOS Simulator (~9s). No changes needed.
+- [x] **Item 7** — `b9819d5`: verified all 3 gaps real in CoreBluetoothMock 1.0.6 (forced `isScanning` on non-nil restored scan key [High]; no `.disconnected` restored state [Med]; no on-demand `willRestoreState` [Low]). Doc: `docs/plans/corebluetoothmock-upstream-gaps-2026-07-21.md`.
 
 ## Work items (each checkpoint compiles + tests green)
 
