@@ -110,6 +110,14 @@ actor BluetoothActor {
     /// Drains delegate callbacks in order. Lives for the process lifetime of the singleton actor.
     private var delegateEventTask: Task<Void, Never>?
 
+    /// Test-only continuations awaiting completion of a delegate-driven `willRestoreState` delivery.
+    ///
+    /// Resumed after the matching `.willRestore` event has been fully processed on the actor, so the
+    /// end-to-end mock harness (which drives the real shim → `AsyncStream` → ``process(_:)`` path,
+    /// rather than calling ``process(_:)`` directly) can await restoration side effects
+    /// deterministically. Always empty and unused on production paths.
+    private var restoreDeliveryWaiters: [CheckedContinuation<Void, Never>] = []
+
     /// Tracks one-time actor setup so ``ensureInitialized(log:)`` is idempotent across the many
     /// `ReliaBLEManager` façades that may share this process-wide actor.
     private var isInitialized = false
@@ -384,8 +392,10 @@ actor BluetoothActor {
     /// Builds the options dictionary passed to the central-manager factory.
     ///
     /// Factored out of ``setupCentralManager()`` so unit tests can assert the restore key is
-    /// included without tearing down the process-lifetime central. End-to-end factory option
-    /// fidelity is deferred to the mock-harness work in issue #42.
+    /// included without tearing down the process-lifetime central. CoreBluetoothMock cannot create a
+    /// central *from* a restore identifier and natively re-deliver `willRestoreState`, so the harness
+    /// asserts this option wiring at the unit level and drives restoration through the delegate shim
+    /// instead (see ``testDeliverWillRestoreStateThroughDelegate(peripheralIds:scanServices:)``).
     private func centralManagerCreationOptions() -> [String: Any]? {
         guard let restoreIdentifier else { return nil }
         return [CBCentralManagerOptionRestoreIdentifierKey: restoreIdentifier]
@@ -410,6 +420,19 @@ actor BluetoothActor {
             handleDidFailToConnect(payload)
         case .willRestore(let payload):
             handleWillRestoreState(payload)
+            resumeRestoreDeliveryWaiters()
+        }
+    }
+
+    /// Resumes any test harness continuations waiting for a delegate-driven `willRestoreState`
+    /// delivery to finish processing. No-op on production paths, where ``restoreDeliveryWaiters``
+    /// is always empty.
+    private func resumeRestoreDeliveryWaiters() {
+        guard !restoreDeliveryWaiters.isEmpty else { return }
+        let waiters = restoreDeliveryWaiters
+        restoreDeliveryWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
@@ -1192,22 +1215,26 @@ actor BluetoothActor {
         intentionalDisconnects.insert(id)
     }
 
-    /// Test-only hook: drives restoration with a hand-built CoreBluetooth restore dictionary,
-    /// routing through `process(.willRestore)` the same way ``BluetoothDelegateShim`` would.
+    /// Test-only hook: drives state restoration end-to-end through the real delegate dispatch path.
     ///
-    /// Needed because CoreBluetoothMock cannot synthesize `willRestoreState`.
-    func testInvokeWillRestoreState(_ state: [String: Any]) {
-        process(.willRestore(RestorationPayload(state: state)))
-    }
-
-    /// Test-only hook: builds a restoration dictionary from actor-owned live peripherals and
-    /// drives ``testInvokeWillRestoreState(_:)``. Keeps non-`Sendable` `CBPeripheral` references
-    /// inside the actor isolation boundary.
-    func testInvokeWillRestoreState(
+    /// Builds a CoreBluetooth restoration dictionary from actor-owned live `CBPeripheral` references,
+    /// then invokes ``BluetoothDelegateShim/centralManager(_:willRestoreState:)`` on the shim the
+    /// factory attached to the process central. That yields `DelegateEvent.willRestore` into the same
+    /// ordered `AsyncStream` CoreBluetooth feeds on relaunch, so the consumer task drains it through
+    /// ``process(_:)`` → ``handleWillRestoreState(_:)`` exactly as in production — no `process(_:)`
+    /// backdoor. Needed because CoreBluetoothMock cannot synthesize `willRestoreState`.
+    ///
+    /// Suspends until the restoration has been fully applied on the actor, so callers observe settled
+    /// state (rehydrated maps, stream broadcasts, scan resumption) on return.
+    ///
+    /// A `scanOptions` value is intentionally not injectable here: `[String: Any]` is non-`Sendable`,
+    /// so it cannot be forwarded across the actor boundary from the ``Mock`` harness. The production
+    /// ``handleWillRestoreState(_:)`` still reads `CBCentralManagerRestoredStateScanOptionsKey` from
+    /// the restoration dictionary; only the deferred/resumed scan *filter* is exercised in tests.
+    func testDeliverWillRestoreStateThroughDelegate(
         peripheralIds: [String],
-        scanServices: [CBUUID]? = nil,
-        scanOptions: [String: Any]? = nil
-    ) {
+        scanServices: [CBUUID]? = nil
+    ) async {
         var state: [String: Any] = [:]
         // Avoid compactMap/closure patterns the region-based isolation checker cannot analyze
         // for non-Sendable CBPeripheral values.
@@ -1223,10 +1250,28 @@ actor BluetoothActor {
         if let scanServices {
             state[CBCentralManagerRestoredStateScanServicesKey] = scanServices
         }
-        if let scanOptions {
-            state[CBCentralManagerRestoredStateScanOptionsKey] = scanOptions
+
+        // Drive the real shim the factory attached to the central, not `process(_:)` directly, so the
+        // shim → `AsyncStream` → consumer-task → `process(_:)` glue is exercised end-to-end.
+        guard let shim = delegateShim, let centralManager else { return }
+
+        // Synchronous, thread-safe yield into the delegate-event stream — identical to the call
+        // CoreBluetooth makes on relaunch. The consumer task drains it on the actor and drives
+        // `process(.willRestore)` → `handleWillRestoreState`, which resumes the waiter registered
+        // immediately below. No suspension point separates the yield from waiter registration, so
+        // the consumer cannot process the event (and resume the waiter) before it is registered.
+        shim.centralManager(centralManager, willRestoreState: state)
+        await suspendForRestoreDelivery()
+    }
+
+    /// Suspends until the pending delegate-driven `willRestoreState` delivery has been fully processed
+    /// on the actor. Kept as its own actor-isolated method so the `withCheckedContinuation` operation
+    /// closure captures only `Sendable` actor state — mirroring ``suspendForAuthorizationDecision(id:)``,
+    /// this keeps the region-isolation checker able to analyze it.
+    private func suspendForRestoreDelivery() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            restoreDeliveryWaiters.append(continuation)
         }
-        testInvokeWillRestoreState(state)
     }
 
     /// Test-only hook: whether `id` is currently in ``reconnectEnabled``.
@@ -1271,8 +1316,9 @@ actor BluetoothActor {
     }
 
     /// Test-only hook: keys of the options dictionary ``setupCentralManager()`` would pass to the
-    /// factory right now. Verifies restore-key wiring at the unit level; end-to-end factory option
-    /// fidelity is deferred to issue #42.
+    /// factory right now. Verifies restore-key wiring at the unit level; the mock cannot natively
+    /// re-deliver `willRestoreState` from a restore identifier, so end-to-end restoration is driven
+    /// through the delegate shim by ``testDeliverWillRestoreStateThroughDelegate(peripheralIds:scanServices:)``.
     func testCentralCreationOptionKeys() -> [String] {
         centralManagerCreationOptions().map { Array($0.keys) } ?? []
     }
@@ -1296,7 +1342,7 @@ actor BluetoothActor {
 
     /// Test-only hook: clears discovery snapshots and connection intent so a subsequent restore can
     /// exercise the cold-relaunch (append-new) identity branch, while keeping live `CBPeripheral`
-    /// references available for ``testInvokeWillRestoreState(peripheralIds:scanServices:scanOptions:)``.
+    /// references available for ``testDeliverWillRestoreStateThroughDelegate(peripheralIds:scanServices:scanOptions:)``.
     ///
     /// Deliberately does **not** touch persisted reconnect intent — this simulates process death,
     /// where in-memory state is lost but `UserDefaults` survives.

@@ -1471,10 +1471,9 @@ struct ReliaBLEManagerTests {
         #expect(subscriptionsReady)
 
         let scanUUID = CBUUID(string: "180D")
-        await BluetoothActor.shared.testInvokeWillRestoreState(
+        await Mock.simulateWillRestoreState(
             peripheralIds: [discovered.id],
-            scanServices: [scanUUID],
-            scanOptions: nil
+            scanServices: [scanUUID]
         )
 
         // Maps rehydrated with discovery identity (name-based id preserved).
@@ -1540,7 +1539,7 @@ struct ReliaBLEManagerTests {
 
         await BluetoothActor.shared.testClearDiscoveredSnapshotsPreservingLiveReferences()
 
-        await BluetoothActor.shared.testInvokeWillRestoreState(
+        await Mock.simulateWillRestoreState(
             peripheralIds: [connected.id, disconnected.id],
             scanServices: nil
         )
@@ -1584,7 +1583,7 @@ struct ReliaBLEManagerTests {
 
         await BluetoothActor.shared.testClearDiscoveredSnapshotsPreservingLiveReferences()
 
-        await BluetoothActor.shared.testInvokeWillRestoreState(
+        await Mock.simulateWillRestoreState(
             peripheralIds: [discovered.id],
             scanServices: nil
         )
@@ -1620,7 +1619,7 @@ struct ReliaBLEManagerTests {
 
         // An empty restored filter is background-useless; restoration must neither re-issue the
         // scan nor stash it as pending.
-        await BluetoothActor.shared.testInvokeWillRestoreState(
+        await Mock.simulateWillRestoreState(
             peripheralIds: [discovered.id],
             scanServices: []
         )
@@ -1661,7 +1660,7 @@ struct ReliaBLEManagerTests {
         await BluetoothActor.shared.testClearDiscoveredSnapshotsPreservingLiveReferences()
 
         // Restore while powered on: seeds connection state and re-arms from persisted intent.
-        await BluetoothActor.shared.testInvokeWillRestoreState(
+        await Mock.simulateWillRestoreState(
             peripheralIds: [discovered.id],
             scanServices: nil
         )
@@ -1672,7 +1671,7 @@ struct ReliaBLEManagerTests {
         #expect(await Mock.waitForState("Powered Off", on: manager))
 
         let scanUUID = CBUUID(string: "180D")
-        await BluetoothActor.shared.testInvokeWillRestoreState(
+        await Mock.simulateWillRestoreState(
             peripheralIds: [],
             scanServices: [scanUUID]
         )
@@ -1712,7 +1711,7 @@ struct ReliaBLEManagerTests {
         await BluetoothActor.shared.testClearDiscoveredSnapshotsPreservingLiveReferences()
 
         let scanUUID = CBUUID(string: "180D")
-        await BluetoothActor.shared.testInvokeWillRestoreState(
+        await Mock.simulateWillRestoreState(
             peripheralIds: [discovered.id],
             scanServices: [scanUUID]
         )
@@ -1914,6 +1913,25 @@ enum Mock {
         // `updateState()`, so this also resolves to `.ready` when powered on and authorized.
         await manager.stopScanning()
         await BluetoothActor.shared.updateState()
+    }
+
+    /// Drives CoreBluetooth state restoration end-to-end through the mock harness.
+    ///
+    /// Builds the restoration dictionary from actor-owned live `CBPeripheral` references and delivers
+    /// `willRestoreState` on the real `BluetoothDelegateShim` the factory attached to the process
+    /// central, exercising the full shim → `AsyncStream` → `process(_:)` → `handleWillRestoreState`
+    /// path — the same glue CoreBluetooth uses on relaunch. Returns once restoration has been fully
+    /// applied on the actor, so callers can assert on settled state immediately.
+    ///
+    /// Replaces the retired `testInvokeWillRestoreState(...)` actor-boundary backdoor (issue #42).
+    static func simulateWillRestoreState(
+        peripheralIds: [String],
+        scanServices: [CBUUID]? = nil
+    ) async {
+        await BluetoothActor.shared.testDeliverWillRestoreStateThroughDelegate(
+            peripheralIds: peripheralIds,
+            scanServices: scanServices
+        )
     }
 
     /// Builds the simulated, discoverable, connectable test peripheral.
