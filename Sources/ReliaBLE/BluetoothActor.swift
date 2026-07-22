@@ -1271,13 +1271,27 @@ actor BluetoothActor {
     }
 
     /// Test-only hook: invokes ``handleWillRestoreState(_:)`` directly for defensive unit tests
-    /// (e.g. empty scan filter, defer-until-powered-on) that cannot use the faithful mock
-    /// `simulateStateRestoration` path.
+    /// (e.g. empty scan filter, defer-until-powered-on, disconnected-peripheral seeding) that
+    /// cannot use the faithful mock `simulateStateRestoration` path.
     ///
     /// Does not go through the shim or event pipeline — production restoration is covered by
     /// cold-relaunch tests that set `CBMCentralManagerMock.simulateStateRestoration`.
-    func testHandleWillRestoreState(scanServices: [CBUUID]? = nil) {
+    ///
+    /// - Parameter peripheralIds: Live `cbPeripherals` keys to include in the restoration dictionary.
+    func testHandleWillRestoreState(
+        peripheralIds: [String] = [],
+        scanServices: [CBUUID]? = nil
+    ) {
         var state: [String: Any] = [:]
+        var peripherals: [CBPeripheral] = []
+        for id in peripheralIds {
+            if let peripheral = cbPeripherals[id] {
+                peripherals.append(peripheral)
+            }
+        }
+        if !peripherals.isEmpty {
+            state[CBCentralManagerRestoredStatePeripheralsKey] = peripherals
+        }
         if let scanServices {
             state[CBCentralManagerRestoredStateScanServicesKey] = scanServices
         }
