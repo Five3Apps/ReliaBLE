@@ -329,6 +329,7 @@ actor BluetoothActor {
     // missed by a *new* (replay-less) `peripheralDiscoveries` subscriber. Accepted and documented.
 
     private func register(stateContinuation continuation: AsyncStream<BluetoothState>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         continuation.yield(currentBluetoothState)
         stateContinuations[id] = continuation
@@ -338,6 +339,7 @@ actor BluetoothActor {
     }
 
     private func register(discoveryContinuation continuation: AsyncStream<PeripheralDiscoveryEvent>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         discoveryContinuations[id] = continuation
         continuation.onTermination = { _ in
@@ -346,6 +348,7 @@ actor BluetoothActor {
     }
 
     private func register(peripheralsContinuation continuation: AsyncStream<[Peripheral]>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         continuation.yield(discoveredPeripherals)
         peripheralsContinuations[id] = continuation
@@ -359,6 +362,7 @@ actor BluetoothActor {
     private func removePeripheralsContinuation(_ id: UUID) { peripheralsContinuations[id] = nil }
 
     private func register(connectionStateChangeContinuation continuation: AsyncStream<ConnectionStateChange>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         connectionStateChangesContinuations[id] = continuation
         continuation.onTermination = { _ in

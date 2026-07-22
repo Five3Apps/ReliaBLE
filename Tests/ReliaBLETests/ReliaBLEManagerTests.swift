@@ -265,6 +265,28 @@ struct ReliaBLEManagerTests {
         #expect(replayed?.description == "Not Authorized")
     }
 
+    @Test func streamSubscriptionAfterShutdownCompletesImmediately() async throws {
+        // A stack torn down via shutdown() is terminal. Every stream factory registers its
+        // continuation on the actor; without a guard, a stream created after shutdown() would
+        // insert a live-but-orphaned continuation that never finishes, hanging the consumer's
+        // `for await` forever. Each registrar must instead finish the continuation immediately,
+        // symmetric with how shutdown() finishes already-registered subscribers.
+        let manager = await Mock.makeManager()
+        await manager.bluetooth.shutdown()
+
+        var stateIterator = manager.state.makeAsyncIterator()
+        #expect(await stateIterator.next() == nil)
+
+        var discoveryIterator = manager.peripheralDiscoveries.makeAsyncIterator()
+        #expect(await discoveryIterator.next() == nil)
+
+        var peripheralsIterator = manager.discoveredPeripherals.makeAsyncIterator()
+        #expect(await peripheralsIterator.next() == nil)
+
+        var connectionIterator = manager.connectionStateChanges.makeAsyncIterator()
+        #expect(await connectionIterator.next() == nil)
+    }
+
     // MARK: - Scanning
 
     @Test func startAndStopScanningTransitionsState() async throws {
