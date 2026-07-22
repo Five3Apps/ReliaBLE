@@ -13,16 +13,21 @@ without manual locking or forced actor hops.
 
 ``ReliaBLEManager`` is a `nonisolated`, `Sendable` `final class`. It owns no
 mutable state itself; instead it forwards every operation to an internal
-`@globalActor` (`BluetoothActor`) that serializes all Core Bluetooth
-interactions. Because the manager is `Sendable` and nonisolated, you can hold a
-single instance and share it freely across isolation domains — there is no
-implicit `@MainActor` requirement and no forced main-thread hop.
+`actor` (`BluetoothActor`) that serializes all Core Bluetooth interactions.
+Because the manager is `Sendable` and nonisolated, you can hold a single
+instance and share it freely across isolation domains — there is no implicit
+`@MainActor` requirement and no forced main-thread hop.
+
+`BluetoothActor` is a plain `actor` **instance owned by each manager** — not a
+`@globalActor` and not a shared singleton. Every ``ReliaBLEManager`` creates and
+holds its own actor, so each manager is a self-contained isolated stack (see
+**One stack per manager**, below).
 
 ```
 ReliaBLEManager (nonisolated, Sendable)
         │  forwards async calls
         ▼
-BluetoothActor (@globalActor, internal)
+BluetoothActor (per-manager actor instance, internal)
         │  serializes all access
         ▼
 CBCentralManager delegate shim
@@ -33,6 +38,37 @@ CoreBluetooth
 
 `BluetoothActor` is an **internal** implementation detail. Consumers must not
 reference it; interact only through ``ReliaBLEManager``.
+
+### One stack per manager
+
+Each ``ReliaBLEManager`` is a **fully isolated stack**: its own actor,
+`CBCentralManager`, discovered-peripheral snapshots, connection state, and event
+streams. Constructing a second manager gives you a second, independent stack —
+their discovered peripherals, connection state, and streams never cross over.
+Two managers scanning the same physical device each hold their own
+``Peripheral`` snapshot; there is no shared, cross-manager discovered list.
+
+A few things are shared at the process level and are worth keeping in mind when
+you run more than one manager at once:
+
+- **Authorization is process-global.** `CBCentralManager.authorization` is
+  app-wide, so calling ``ReliaBLEManager/authorizeBluetooth()`` on one manager
+  affects every other manager in the process. Stacks are isolated in *state*,
+  not in *permission*.
+- **The Bluetooth radio is shared.** Running multiple concurrent, aggressive
+  scans degrades all of them — prefer a single scanning manager, or coordinate
+  scan windows yourself.
+- **Restore identifiers must be unique among simultaneously-live managers.** If
+  two live managers use the same ``ReliaBLEConfig/restoreIdentifier`` they
+  contend for the same reconnect-intent storage and CoreBluetooth's per-id
+  restoration domain, which is unsupported. Reusing the *same* identifier across
+  app launches, however, is **required** for state restoration to work. See
+  <doc:Background>.
+
+> Note: A live subscriber stream retains its manager's stack until the stream
+> terminates. As long as you are iterating one of the event streams below, the
+> underlying actor and central stay alive — dropping your reference to the
+> manager alone is not enough to tear the stack down.
 
 > Note: The internal central manager is created lazily and only once Bluetooth
 > authorization is `.allowedAlways` — the permission prompt stays under your

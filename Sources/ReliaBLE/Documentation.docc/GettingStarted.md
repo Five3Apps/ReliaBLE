@@ -22,6 +22,8 @@ bleConfig.loggingEnabled = true
 let bleManager = ReliaBLEManager(config: bleConfig)
 ```
 
+Most apps need a single ``ReliaBLEManager`` for the lifetime of the process. If you do create more than one, each is a **fully isolated stack** — its own actor, `CBCentralManager`, discovered peripherals, connection state, and streams — configured independently by the config you pass. Two rules apply when running managers side by side: Bluetooth authorization is process-global (authorizing one manager authorizes them all), and any ``ReliaBLEConfig/restoreIdentifier`` must be unique among simultaneously-live managers while remaining stable across launches. See <doc:Concurrency> for the full model.
+
 ## Authorizing Bluetooth
 
 iOS requires permission from the user for BLE access. To set this up in your project:
@@ -167,7 +169,7 @@ config.reconnectPolicy.jitter = 0.2         // ±20% randomization
 let bleManager = ReliaBLEManager(config: config)
 ```
 
-> Important: `ReconnectPolicy` (and logging configuration) is applied only during the **first** `ReliaBLEManager` initialization (the first actor setup) behind the library's process-wide actor singleton. Constructing a second `ReliaBLEManager(config:)` in the same process will **not** update the already-stashed policy — set your desired config before creating the first manager instance.
+> Note: Configuration — including `ReconnectPolicy` and logging — is applied **per manager**. Each ``ReliaBLEManager`` owns its own isolated stack, so the config you pass to `init(config:)` governs only that instance. Constructing a second `ReliaBLEManager(config:)` with different settings gives you a second, independently-configured stack; it does not affect the first. See <doc:Concurrency> for the one-stack-per-manager isolation model and the rules for running more than one manager at once.
 
 > Note: iOS's Tier-0 auto-reconnect give-up budget and timing (`CBConnectPeripheralOptionEnableAutoReconnect`) are not publicly documented by Apple. The exact retry duration and failure threshold still require on-device verification — this is deliberately deferred follow-up work.
 

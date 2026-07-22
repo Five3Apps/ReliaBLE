@@ -41,7 +41,16 @@ The package declares **three targets** that share a single source tree to make `
 
 ### Swift Concurrency
 
-The library is built with Swift 6 and **complete concurrency checking**. The `ReliaBLEManager` public API should be callable from `@MainActor`, but the library itself should avoid `@MainActor` and instead use `@BluetoothActor` (a custom actor defined in `BluetoothActor.swift`) to serialize all Bluetooth interactions. This keeps the library thread-safe and allows the integrating app to decide how to bridge to the main thread for UI updates.
+The library is built with Swift 6 and **complete concurrency checking**. The `ReliaBLEManager` public API should be callable from `@MainActor`, but the library itself should avoid `@MainActor` and instead serialize all Bluetooth interactions on `BluetoothActor` (a plain `actor` defined in `BluetoothActor.swift`). This keeps the library thread-safe and allows the integrating app to decide how to bridge to the main thread for UI updates.
+
+`BluetoothActor` is **not** a `@globalActor` and has no shared singleton. Each `ReliaBLEManager` **owns its own** `BluetoothActor` instance, created synchronously in the manager's `init` (`BluetoothActor(log:reconnectPolicy:restoreIdentifier:)`). There is no `@BluetoothActor` annotation, no `.shared`, and no process-wide state — do not reintroduce any of these.
+
+**One stack per manager.** Each `ReliaBLEManager` is a fully isolated stack: its own actor, `CBCentralManager`, discovered-peripheral snapshots, connection state, and streams. Constructing a second manager yields a second, independent stack — config (logging, `reconnectPolicy`) applies per manager, not first-wins. Two things are *not* isolated and must be kept in mind:
+
+- **Authorization is process-global.** `CBCentralManager.authorization` is app-wide, so one manager's `authorizeBluetooth()` affects every other stack in the process.
+- **The radio is shared.** Multiple concurrent aggressive scans degrade each other.
+
+**Restore identifiers.** A `ReliaBLEConfig/restoreIdentifier` must be **unique among simultaneously-live managers** (two live managers sharing an id contend for the same reconnect-intent `UserDefaults` key and CoreBluetooth's per-id restoration domain — unsupported), but the **same id must be reused across launches** for state restoration to work. A live subscriber stream retains its stack until the stream terminates, so a stack does not deinit while anyone is still subscribed.
 
 ### Logging
 
