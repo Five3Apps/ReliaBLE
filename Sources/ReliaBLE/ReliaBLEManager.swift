@@ -32,7 +32,7 @@ import Willow
 /// The main entry point for the ReliaBLE library.
 ///
 /// `ReliaBLEManager` is a `nonisolated`, `Sendable` value-like façade: it owns no mutable state and
-/// forwards every operation to its owned ``BluetoothActor`` that serializes all Core Bluetooth
+/// forwards every operation to its owned `BluetoothActor` that serializes all Core Bluetooth
 /// interactions. Because it is not bound to any actor, it is callable directly from `@MainActor`
 /// SwiftUI code *and* from background actors without forcing a main-actor hop on background callers.
 public final class ReliaBLEManager: Sendable {
