@@ -41,6 +41,10 @@ public final class ReliaBLEManager: Sendable {
     private let log: LoggingService
 
     /// Per-manager BLE stack. Internal so `@testable` tests can reach actor hooks.
+    ///
+    /// Retain graph (no cycles): manager → actor → central → shim; shim holds only the
+    /// event-pipeline continuation (no actor ref). `delegateEventTask` and reconnect tasks
+    /// capture `[weak self]`. Live stream subscribers retain the actor until terminated.
     let bluetooth: BluetoothActor
 
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.

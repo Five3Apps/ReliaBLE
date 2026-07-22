@@ -192,6 +192,8 @@ actor BluetoothActor {
     // One continuation per active subscriber, keyed by a per-subscription UUID. Mutated only on
     // the actor's serial executor: the stream factories register via `Task { await self.register(...) }`,
     // the broadcast sites iterate to `yield`, and each `onTermination` handler prunes its own entry.
+    // Registration / onTermination Tasks capture `self` strongly while the stream is live — deliberate
+    // so a consumed stream keeps the stack alive (see design: stream-retains-actor).
 
     private var stateContinuations: [UUID: AsyncStream<BluetoothState>.Continuation] = [:]
     private var discoveryContinuations: [UUID: AsyncStream<PeripheralDiscoveryEvent>.Continuation] = [:]
@@ -454,7 +456,7 @@ actor BluetoothActor {
     /// Builds the options dictionary passed to the central-manager factory.
     ///
     /// Factored out of ``setupCentralManager()`` so unit tests can assert the restore key is
-    /// included without tearing down the process-lifetime central. CoreBluetoothMock cannot create a
+    /// included without tearing down the stack's central. CoreBluetoothMock cannot create a
     /// central *from* a restore identifier and natively re-deliver `willRestoreState`, so the harness
     /// asserts this option wiring at the unit level and drives restoration through the delegate shim
     /// instead (see ``testDeliverWillRestoreStateThroughDelegate(peripheralIds:scanServices:)``).
@@ -1296,7 +1298,7 @@ actor BluetoothActor {
     ///
     /// Builds a CoreBluetooth restoration dictionary from actor-owned live `CBPeripheral` references,
     /// then invokes ``BluetoothDelegateShim/centralManager(_:willRestoreState:)`` on the shim the
-    /// factory attached to the process central. That yields `DelegateEvent.willRestore` into the same
+    /// factory attached to this stack's central. That yields `DelegateEvent.willRestore` into the same
     /// ordered `AsyncStream` CoreBluetooth feeds on relaunch, so the consumer task drains it through
     /// ``process(_:)`` → ``handleWillRestoreState(_:)`` exactly as in production — no `process(_:)`
     /// backdoor. Needed because CoreBluetoothMock cannot synthesize `willRestoreState`.
@@ -1411,8 +1413,8 @@ actor BluetoothActor {
         UserDefaults.standard.removeObject(forKey: key)
     }
 
-    /// Test-only hook: overwrites the stored restore identifier (process-lifetime actor may already
-    /// have been initialized by an earlier test without one).
+    /// Test-only hook: overwrites the stored restore identifier (e.g. after constructing a manager
+    /// without one, before exercising restore-option wiring).
     func testSetRestoreIdentifier(_ id: String?) {
         restoreIdentifier = id
     }

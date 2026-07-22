@@ -35,14 +35,15 @@ import Willow
 
 /// All ReliaBLE behavioral tests live in a single **serialized** suite.
 ///
-/// Each test constructs its own ``ReliaBLEManager`` / ``BluetoothActor`` stack, but Nordic's
-/// `CBMCentralManagerMock` keeps global static simulation state (authorization, power, peripherals),
-/// so parallel execution remains unsafe.
+/// Each test constructs its own ``ReliaBLEManager`` / ``BluetoothActor`` stack via
+/// ``Mock/makeManager(loggingEnabled:)``. Nordic's `CBMCentralManagerMock` keeps global static
+/// simulation state (authorization, power, peripherals), so parallel execution remains unsafe —
+/// `.serialized` guarantees no two tests mutate that mock state concurrently.
 ///
-/// `.serialized` guarantees no two tests mutate that shared mock state concurrently. Every test creates its
-/// manager via ``Mock/makeManager(loggingEnabled:)`` (which registers the simulated peripheral and pins
-/// authorization before any central can be created), and stateful tests re-establish their baseline via
-/// ``Mock/ensureReady(_:)``, so the suite is order-independent.
+/// **Lifetime:** the suite keeps at most one active stack. ``Mock/makeManager`` tears down any
+/// previous manager via ``Mock/tearDown(_:)`` (explicit `shutdown()` + mock disconnect). Tests that
+/// need two live stacks must call ``Mock/tearDown(_:)`` themselves and coordinate mock power (see
+/// design item 4). Stateful tests re-baseline with ``Mock/ensureReady(_:)``.
 @Suite(.serialized)
 struct ReliaBLEManagerTests {
 
@@ -1369,8 +1370,8 @@ struct ReliaBLEManagerTests {
         let restoreId = "com.five3apps.relia-ble.tests.restore"
 
         // When authorized, a restoreIdentifier does not relax the auth gate — it only adds the
-        // restore-id option to the existing creation path. Process-lifetime central may already
-        // exist; still verify construction + ensureReady succeeds with the config set.
+        // restore-id option to the existing creation path. Still verify construction + ensureReady
+        // succeeds with the config set.
         CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
         CBMCentralManagerMock.simulatePowerOn()
 
@@ -1832,6 +1833,7 @@ final class CapturingLogWriter: LogWriter, @unchecked Sendable {
     }
 }
 
+
 // MARK: - Mock Harness
 
 /// Helpers for driving the Nordic `CBMCentralManagerMock` simulation against a per-manager
@@ -1859,10 +1861,22 @@ enum Mock {
     /// lifecycle tests that otherwise leak `virtualConnections` state.
     nonisolated(unsafe) static let connectionTestSpec = makeConnectionTestPeripheralSpec()
 
-    /// Last manager returned by ``makeManager`` — shut down before creating the next so Nordic's
-    /// process-wide mock is not hit by multiple live centrals (checkpoint 1 interim; full
-    /// per-test teardown lands in the lifetime-hardening step).
-    nonisolated(unsafe) private static var lastManager: ReliaBLEManager?
+    /// Active stack tracked for serialized-suite teardown. Cleared by ``tearDown(_:)``.
+    nonisolated(unsafe) private static var activeManager: ReliaBLEManager?
+
+    /// Deterministically tears down a manager stack: disconnects mock peripherals while the
+    /// central still exists, then calls ``BluetoothActor/shutdown()`` (volatile state only —
+    /// persisted reconnect intent is preserved).
+    ///
+    /// Safe to call more than once. Use at end of multi-stack scenarios, or rely on
+    /// ``makeManager`` which tears down the previous active stack automatically.
+    static func tearDown(_ manager: ReliaBLEManager) async {
+        connectionTestSpec.simulateDisconnection()
+        await manager.bluetooth.shutdown()
+        if activeManager === manager {
+            activeManager = nil
+        }
+    }
 
     /// Builds a `ReliaBLEManager` after ensuring the one-time mock configuration has run.
     ///
@@ -1870,19 +1884,23 @@ enum Mock {
     /// is pinned to `.notDetermined` **before** any central can be created — including by the maintainer's
     /// authorization tests, whose `.notDetermined` `authorize()` path itself creates a central. Use
     /// ``ensureReady(_:)`` afterwards to bring the manager's central online.
+    ///
+    /// **Serialized-suite policy:** tears down any previous active stack via ``tearDown(_:)`` so
+    /// tests stay single-stack by default. Callers that need two simultaneous managers should not
+    /// use this auto-teardown path alone — tear down explicitly and manage mock power carefully.
+    /// - Parameter tearDownPrevious: When `true` (default), tears down the suite's previous
+    ///   active stack first. Pass `false` only for multi-stack scenarios that keep two managers
+    ///   alive (and call ``tearDown(_:)`` on each when done).
     static func makeManager(
         loggingEnabled: Bool = false,
         reconnectPolicy: ReconnectPolicy? = nil,
-        restoreIdentifier: String? = nil
+        restoreIdentifier: String? = nil,
+        tearDownPrevious: Bool = true
     ) async -> ReliaBLEManager {
         await SimulationConfig.shared.ensureConfigured()
 
-        if let previous = lastManager {
-            // Disconnect mock peripherals while the previous central still exists so the mock
-            // does not retain a zombie connected central across stacks.
-            connectionTestSpec.simulateDisconnection()
-            await previous.bluetooth.shutdown()
-            lastManager = nil
+        if tearDownPrevious, let previous = activeManager {
+            await tearDown(previous)
         }
 
         var config = ReliaBLEConfig()
@@ -1899,7 +1917,7 @@ enum Mock {
             config.reconnectPolicy = defaultPolicy
         }
         let manager = ReliaBLEManager(config: config)
-        lastManager = manager
+        activeManager = manager
         return manager
     }
 
@@ -1934,7 +1952,7 @@ enum Mock {
     /// Drives CoreBluetooth state restoration end-to-end through the mock harness.
     ///
     /// Builds the restoration dictionary from actor-owned live `CBPeripheral` references and delivers
-    /// `willRestoreState` on the real `BluetoothDelegateShim` the factory attached to the process
+    /// `willRestoreState` on the real `BluetoothDelegateShim` the factory attached to the manager's
     /// central, exercising the full shim → `AsyncStream` → `process(_:)` → `handleWillRestoreState`
     /// path — the same glue CoreBluetooth uses on relaunch. Returns once restoration has been fully
     /// applied on the actor, so callers can assert on settled state immediately.
@@ -2090,10 +2108,9 @@ func firstEvent(
 /// Returns the first event matching `predicate` from `stream`, or `nil` if none arrives within
 /// `nanoseconds`.
 ///
-/// The mock registers multiple simulated peripherals that all advertise concurrently on the same
-/// shared central, so a subscriber's *first* event is a race between them, not necessarily the one a
-/// test cares about. Filtering by predicate makes the wait deterministic regardless of advertising
-/// order.
+/// The mock registers multiple simulated peripherals that all advertise concurrently, so a
+/// subscriber's *first* event is a race between them, not necessarily the one a test cares about.
+/// Filtering by predicate makes the wait deterministic regardless of advertising order.
 func firstEvent(
     from stream: AsyncStream<PeripheralDiscoveryEvent>,
     matching predicate: @escaping @Sendable (PeripheralDiscoveryEvent) -> Bool,
