@@ -45,20 +45,11 @@ The library is built with Swift 6 and **complete concurrency checking**. The `Re
 
 `BluetoothActor` is **not** a `@globalActor` and has no shared singleton. Each `ReliaBLEManager` **owns its own** `BluetoothActor` instance, created synchronously in the manager's `init` (`BluetoothActor(log:reconnectPolicy:restoreIdentifier:)`). There is no `@BluetoothActor` annotation, no `.shared`, and no process-wide state — do not reintroduce any of these.
 
-**One stack per manager.** Each `ReliaBLEManager` is a fully isolated stack: its own actor, `CBCentralManager`, discovered-peripheral snapshots, connection state, and streams. Constructing a second manager yields a second, independent stack — config (logging, `reconnectPolicy`) applies per manager, not first-wins. Two things are *not* isolated and must be kept in mind:
-
-- **Authorization is process-global.** `CBCentralManager.authorization` is app-wide, so one manager's `authorizeBluetooth()` affects every other stack in the process.
-- **The radio is shared.** Multiple concurrent aggressive scans degrade each other.
-
-**Restore identifiers.** A `ReliaBLEConfig/restoreIdentifier` must be **unique among simultaneously-live managers** (two live managers sharing an id contend for the same reconnect-intent `UserDefaults` key and CoreBluetooth's per-id restoration domain — unsupported), but the **same id must be reused across launches** for state restoration to work. A live subscriber stream retains its stack until the stream terminates, so a stack does not deinit while anyone is still subscribed.
+**One stack per manager.** Each `ReliaBLEManager` is a fully isolated stack: its own actor, `CBCentralManager`, discovered-peripheral snapshots, connection state, and streams. Constructing a second manager yields a second, independent stack — config (logging, `reconnectPolicy`) applies per manager, not first-wins.
 
 ### Logging
 
 `LoggingService` wraps Willow's `Logger` with an async execution queue. The service is `Sendable` and passed by reference into both managers. Default writer is an `OSLogWriter` (`subsystem: com.five3apps.relia-ble`, `category: BLE`), configurable via `ReliaBLEConfig`. Logging is **disabled by default** — `config.loggingEnabled` must be set to true. Log calls take a `tags: [LogTag]` array; use `.category(.scanning)`, `.peripheral(id)`, etc. rather than embedding the category in the message.
-
-### Authorization flow
-
-`ReliaBLEManager.init` does **not** instantiate `CBCentralManager` unless the user has already granted `.allowedAlways`. This is deliberate so the integrating app controls when the iOS permission prompt appears — callers invoke `authorizeBluetooth()` when they want the prompt. Preserve this lazy-init behavior when touching `BluetoothActor.setupCentralManager()`.
 
 ## Notes for editing
 
