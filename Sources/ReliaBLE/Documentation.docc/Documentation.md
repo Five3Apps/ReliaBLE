@@ -22,9 +22,9 @@ This is a temporary overview.
 ### Concurrency & Isolation
 
 - <doc:Concurrency>
-- ``ReliaBLEManager``
 
 ### Advanced Usage
 
 - <doc:Logging>
 - <doc:Background>
+- <doc:Multi-Manager>

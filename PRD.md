@@ -159,9 +159,9 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - FR-8.2.1: Allow the library to scan continuously for BLE peripherals, providing real-time updates about nearby devices as **`DiscoveredPeripheral`** values (and/or equivalent), each resolvable to a `Peripheral` handle.
     - FR-8.2.2: Provide an interface for the app to start, stop, and check the status of the continuous scanning process.
 
-- FR-8.3: Background Scanning:
-    - FR-8.3.1: Implement background scanning capabilities, ensuring compliance with iOS background execution rules.
-    - FR-8.3.2: Notify the integrating app when new devices come into range even when the app is not in the foreground, using appropriate iOS background modes like bluetooth-central.
+- ✅ FR-8.3: Background Scanning:
+    - ✅ FR-8.3.1: Implement background scanning capabilities, ensuring compliance with iOS background execution rules.
+    - ✅ FR-8.3.2: Notify the integrating app when new devices come into range even when the app is not in the foreground, using appropriate iOS background modes like bluetooth-central.
 
 - ✅ FR-8.4: Processing of Advertisement Data:
     - ✅ FR-8.4.1: Extract and make available manufacturing data from advertisement packets to the integrating app.

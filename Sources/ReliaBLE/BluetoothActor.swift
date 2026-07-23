@@ -83,22 +83,69 @@ private enum DelegateEvent: Sendable {
     case willRestore(RestorationPayload)
 }
 
+// MARK: - Teardown Boxes
+
+/// Nonisolated box so the actor's nonisolated `deinit` may finish the delegate-event pipeline.
+fileprivate final class EventPipeline: @unchecked Sendable {
+    fileprivate let stream: AsyncStream<DelegateEvent>
+    fileprivate let continuation: AsyncStream<DelegateEvent>.Continuation
+
+    init() {
+        (stream, continuation) = AsyncStream.makeStream(
+            of: DelegateEvent.self,
+            bufferingPolicy: .unbounded
+        )
+    }
+
+    func finish() { continuation.finish() }
+}
+
+/// Thread-safe registry of unstructured task handles (reconnect ladder sleeps).
+fileprivate final class TaskRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tasks: [String: Task<Void, Never>] = [:]
+
+    func insert(_ id: String, _ task: Task<Void, Never>) {
+        lock.lock()
+        let previous = tasks[id]
+        tasks[id] = task
+        lock.unlock()
+        previous?.cancel()
+    }
+
+    func cancel(_ id: String) {
+        lock.lock()
+        let task = tasks.removeValue(forKey: id)
+        lock.unlock()
+        task?.cancel()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let all = Array(tasks.values)
+        tasks.removeAll()
+        lock.unlock()
+        for task in all { task.cancel() }
+    }
+}
+
 // MARK: - BluetoothActor
 
-/// Process-wide global actor that serializes all CoreBluetooth interactions.
+/// Actor that serializes all CoreBluetooth interactions for a single ``ReliaBLEManager`` stack.
 ///
 /// All mutable BLE state—`CBCentralManager`, per-subscriber `AsyncStream` continuations, and
-/// discovered peripherals—are owned exclusively by this actor. Two `ReliaBLEManager` instances
-/// share the same isolation domain; this is acceptable because CoreBluetooth already
-/// enforces a single central manager per process.
+/// discovered peripherals—are owned exclusively by this actor. Each manager owns its own instance.
 ///
-/// Delegate callbacks arrive on CoreBluetooth's internal queue and are hopped into this
-/// actor's isolation via `Task { @BluetoothActor in … }` inside the nonisolated
-/// ``BluetoothDelegateShim``.
-@globalActor
+/// Delegate callbacks arrive on CoreBluetooth's internal queue and are yielded into
+/// ``EventPipeline`` by the nonisolated ``BluetoothDelegateShim``.
 actor BluetoothActor {
-    /// The process-lifetime shared instance.
-    static let shared = BluetoothActor()
+
+    // MARK: - Nonisolated Teardown
+
+    /// Nonisolated box so `deinit` may finish the pipeline without touching actor-isolated state.
+    private nonisolated let eventPipeline = EventPipeline()
+    /// Nonisolated box so `deinit` may cancel reconnect tasks without touching actor-isolated state.
+    private nonisolated let taskRegistry = TaskRegistry()
 
     // MARK: - Actor-Isolated State
 
@@ -107,12 +154,15 @@ actor BluetoothActor {
     var centralManager: CBCentralManager?
     private var delegateShim: BluetoothDelegateShim?
 
-    /// Drains delegate callbacks in order. Lives for the process lifetime of the singleton actor.
+    /// Drains delegate callbacks in order from ``eventPipeline``.
     private var delegateEventTask: Task<Void, Never>?
 
-    /// Tracks one-time actor setup so ``ensureInitialized(log:)`` is idempotent across the many
-    /// `ReliaBLEManager` façades that may share this process-wide actor.
-    private var isInitialized = false
+    /// Once true, the actor is dead — ops no-op / throw and no second central can be created.
+    private var isShutdown = false
+
+    /// Tracks whether ``ensureCentralManager()`` has run at least once so the initial
+    /// authorization-derived state is broadcast even when no central is created.
+    private var hasEnsuredOnce = false
 
     /// Continuations for in-flight ``authorize()`` calls awaiting an authorization decision, keyed by a
     /// per-call id so a cancelled call can resume just its own continuation. All pending continuations are
@@ -136,8 +186,10 @@ actor BluetoothActor {
     // MARK: - AsyncStream Broadcaster State
     //
     // One continuation per active subscriber, keyed by a per-subscription UUID. Mutated only on
-    // the actor's serial executor: the stream factories register on a `@BluetoothActor` hop, the
-    // broadcast sites iterate to `yield`, and each `onTermination` handler prunes its own entry.
+    // the actor's serial executor: the stream factories register via `Task { await self.register(...) }`,
+    // the broadcast sites iterate to `yield`, and each `onTermination` handler prunes its own entry.
+    // Registration / onTermination Tasks capture `self` strongly while the stream is live — deliberate
+    // so a consumed stream keeps the stack alive (see design: stream-retains-actor).
 
     private var stateContinuations: [UUID: AsyncStream<BluetoothState>.Continuation] = [:]
     private var discoveryContinuations: [UUID: AsyncStream<PeripheralDiscoveryEvent>.Continuation] = [:]
@@ -148,7 +200,7 @@ actor BluetoothActor {
 
     private var connectionStateChangesContinuations: [UUID: AsyncStream<ConnectionStateChange>.Continuation] = [:]
 
-    private var reconnectPolicy: ReconnectPolicy = ReconnectPolicy()
+    private var reconnectPolicy: ReconnectPolicy
     /// Stable CoreBluetooth restore identifier; `nil` disables state restoration.
     private var restoreIdentifier: String?
     /// Scan filter restored via `willRestoreState` when the central was not yet powered on.
@@ -157,11 +209,58 @@ actor BluetoothActor {
     private var reconnectEnabled: Set<String> = []
     private var intentionalDisconnects: Set<String> = []
     private var reconnectAttempts: [String: Int] = [:]
-    private var reconnectTasks: [String: Task<Void, Never>] = [:]
 
     // MARK: - Initialization
 
-    private init() {}
+    /// Creates an actor with configuration only — no `CBCentralManager` is created here.
+    init(log: LoggingService, reconnectPolicy: ReconnectPolicy, restoreIdentifier: String?) {
+        self.log = log
+        self.reconnectPolicy = reconnectPolicy
+        self.restoreIdentifier = restoreIdentifier
+    }
+
+    deinit {
+        eventPipeline.finish()
+        taskRegistry.cancelAll()
+    }
+
+    /// Terminal teardown for tests/harness. Clears volatile state only — does **not** touch
+    /// persisted reconnect-intent `UserDefaults`.
+    func shutdown() {
+        guard !isShutdown else { return }
+        isShutdown = true
+
+        eventPipeline.finish()
+        taskRegistry.cancelAll()
+        delegateEventTask?.cancel()
+        delegateEventTask = nil
+
+        for continuation in stateContinuations.values { continuation.finish() }
+        for continuation in discoveryContinuations.values { continuation.finish() }
+        for continuation in peripheralsContinuations.values { continuation.finish() }
+        for continuation in connectionStateChangesContinuations.values { continuation.finish() }
+        stateContinuations.removeAll()
+        discoveryContinuations.removeAll()
+        peripheralsContinuations.removeAll()
+        connectionStateChangesContinuations.removeAll()
+
+        let pendingAuth = authorizationContinuations
+        authorizationContinuations.removeAll()
+        for continuation in pendingAuth.values {
+            continuation.resume(throwing: CancellationError())
+        }
+
+        centralManager = nil
+        delegateShim = nil
+        cbPeripherals.removeAll()
+        discoveredPeripherals.removeAll()
+        connectionStates.removeAll()
+        reconnectEnabled.removeAll()
+        intentionalDisconnects.removeAll()
+        reconnectAttempts.removeAll()
+        pendingRestoredScanServices = nil
+        pendingRestoredScanOptions = nil
+    }
 
     // MARK: - Event Streams
 
@@ -172,7 +271,7 @@ actor BluetoothActor {
     /// new subscriber always observes the current state without waiting for the next broadcast.
     nonisolated func stateStream() -> AsyncStream<BluetoothState> {
         AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            Task { await BluetoothActor.shared.register(stateContinuation: continuation) }
+            Task { await self.register(stateContinuation: continuation) }
         }
     }
 
@@ -196,7 +295,7 @@ actor BluetoothActor {
     /// drops the oldest pending advertisements rather than growing memory without bound.
     nonisolated func peripheralDiscoveriesStream() -> AsyncStream<PeripheralDiscoveryEvent> {
         AsyncStream(bufferingPolicy: .bufferingNewest(BluetoothActor.discoveryBufferLimit)) { continuation in
-            Task { await BluetoothActor.shared.register(discoveryContinuation: continuation) }
+            Task { await self.register(discoveryContinuation: continuation) }
         }
     }
 
@@ -207,7 +306,7 @@ actor BluetoothActor {
     /// a new subscriber immediately observes the peripherals already discovered.
     nonisolated func discoveredPeripheralsStream() -> AsyncStream<[Peripheral]> {
         AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            Task { await BluetoothActor.shared.register(peripheralsContinuation: continuation) }
+            Task { await self.register(peripheralsContinuation: continuation) }
         }
     }
 
@@ -218,7 +317,7 @@ actor BluetoothActor {
     /// mirroring ``peripheralDiscoveriesStream()``.
     nonisolated func connectionStateChangesStream() -> AsyncStream<ConnectionStateChange> {
         AsyncStream(bufferingPolicy: .bufferingNewest(BluetoothActor.discoveryBufferLimit)) { continuation in
-            Task { await BluetoothActor.shared.register(connectionStateChangeContinuation: continuation) }
+            Task { await self.register(connectionStateChangeContinuation: continuation) }
         }
     }
 
@@ -230,28 +329,31 @@ actor BluetoothActor {
     // missed by a *new* (replay-less) `peripheralDiscoveries` subscriber. Accepted and documented.
 
     private func register(stateContinuation continuation: AsyncStream<BluetoothState>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         continuation.yield(currentBluetoothState)
         stateContinuations[id] = continuation
         continuation.onTermination = { _ in
-            Task { await BluetoothActor.shared.removeStateContinuation(id) }
+            Task { await self.removeStateContinuation(id) }
         }
     }
 
     private func register(discoveryContinuation continuation: AsyncStream<PeripheralDiscoveryEvent>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         discoveryContinuations[id] = continuation
         continuation.onTermination = { _ in
-            Task { await BluetoothActor.shared.removeDiscoveryContinuation(id) }
+            Task { await self.removeDiscoveryContinuation(id) }
         }
     }
 
     private func register(peripheralsContinuation continuation: AsyncStream<[Peripheral]>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         continuation.yield(discoveredPeripherals)
         peripheralsContinuations[id] = continuation
         continuation.onTermination = { _ in
-            Task { await BluetoothActor.shared.removePeripheralsContinuation(id) }
+            Task { await self.removePeripheralsContinuation(id) }
         }
     }
 
@@ -260,10 +362,11 @@ actor BluetoothActor {
     private func removePeripheralsContinuation(_ id: UUID) { peripheralsContinuations[id] = nil }
 
     private func register(connectionStateChangeContinuation continuation: AsyncStream<ConnectionStateChange>.Continuation) {
+        guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         connectionStateChangesContinuations[id] = continuation
         continuation.onTermination = { _ in
-            Task { await BluetoothActor.shared.removeConnectionStateChangeContinuation(id) }
+            Task { await self.removeConnectionStateChangeContinuation(id) }
         }
     }
 
@@ -292,48 +395,20 @@ actor BluetoothActor {
 
     // MARK: - Configuration
 
-    func configure(log: LoggingService) {
-        self.log = log
-    }
-
-    /// Performs idempotent actor setup, funneled through by every public ``ReliaBLEManager`` entry point
-    /// before it acts — so an operation invoked immediately after `init` (whose setup runs in a
-    /// fire-and-forget `Task`) cannot race ahead of setup and silently no-op.
+    /// Creates the central manager if Bluetooth is currently authorized (`.allowedAlways`) and one
+    /// does not already exist. Idempotent and actor-serialized.
     ///
-    /// The logger is configured exactly once. On *every* call this also creates the central manager if
-    /// Bluetooth is currently authorized (`.allowedAlways`) and one does not already exist — so an
-    /// operation issued after authorization is granted out-of-band (via Settings, app lifecycle, or
-    /// another owner) still finds a live manager instead of being permanently gated by the first call's
-    /// authorization status.
-    ///
-    /// Creating the central manager remains gated on existing `.allowedAlways` authorization, preserving
+    /// Creating the central remains gated on existing `.allowedAlways` authorization, preserving
     /// the lazy-permission contract: the iOS prompt only appears when the integrating app calls
-    /// ``ReliaBLEManager/authorizeBluetooth()``. The initial state is broadcast on first setup and
-    /// whenever the manager is created, but not on every redundant call.
+    /// ``ReliaBLEManager/authorizeBluetooth()``. An operation issued after authorization is granted
+    /// out-of-band still finds a live manager because every call retries creation.
     ///
-    /// When ``restoreIdentifier`` is non-`nil` and authorization is already `.allowedAlways`, the
-    /// central is created with `CBCentralManagerOptionRestoreIdentifierKey` so CoreBluetooth can
-    /// deliver `willRestoreState` as the first callback on relaunch. Authorization is never
-    /// relaxed — if Bluetooth is not authorized there is nothing to restore.
-    func ensureInitialized(
-        log: LoggingService,
-        reconnectPolicy: ReconnectPolicy = ReconnectPolicy(),
-        restoreIdentifier: String? = nil
-    ) {
-        let firstInitialization = !isInitialized
-        if firstInitialization {
-            isInitialized = true
-            configure(log: log)
-            self.reconnectPolicy = reconnectPolicy
-            self.restoreIdentifier = restoreIdentifier
-        } else if let restoreIdentifier, restoreIdentifier != self.restoreIdentifier {
-            // The actor is process-wide; the first manager's configuration wins for the process
-            // lifetime. Surface the mismatch instead of silently ignoring the new identifier.
-            let current = self.restoreIdentifier.map { "\"\($0)\"" } ?? "nil"
-            log.warn(
-                "Ignoring restoreIdentifier \"\(restoreIdentifier)\" — Bluetooth actor already initialized with \(current)"
-            )
-        }
+    /// Stream and snapshot getters do **not** call this — only operational methods do.
+    func ensureCentralManager() {
+        guard !isShutdown else { return }
+
+        let firstEnsure = !hasEnsuredOnce
+        hasEnsuredOnce = true
 
         var createdManager = false
 
@@ -342,7 +417,7 @@ actor BluetoothActor {
             createdManager = true
         }
 
-        if firstInitialization || createdManager {
+        if firstEnsure || createdManager {
             updateState()
         }
     }
@@ -350,21 +425,25 @@ actor BluetoothActor {
     // MARK: - Central Manager Setup
 
     func setupCentralManager() {
+        guard !isShutdown else { return }
         guard centralManager == nil else { return }
 
         log?.info("Initializing CBCentralManager")
 
-        // A single `AsyncStream` carries delegate callbacks in CoreBluetooth's delivery order; the lone
-        // consumer task below drains them so ordering is preserved end-to-end. The buffer is intentionally
-        // unbounded: state-change callbacks must never be dropped (unlike the public advertisements feed),
-        // and `process(_:)` is lightweight, so the actor keeps pace with CoreBluetooth's serial callback
-        // rate in practice.
-        let (events, continuation) = AsyncStream.makeStream(
-            of: DelegateEvent.self,
-            bufferingPolicy: .unbounded
-        )
-        let shim = BluetoothDelegateShim(eventContinuation: continuation)
+        // Consumer-before-factory: start draining the (already-created) pipeline first so a
+        // synchronous `willRestoreState` inside the factory call is not lost.
+        let shim = BluetoothDelegateShim(eventContinuation: eventPipeline.continuation)
         delegateShim = shim
+
+        if delegateEventTask == nil {
+            delegateEventTask = Task { [weak self] in
+                guard let self else { return }
+                for await event in self.eventPipeline.stream {
+                    await self.process(event)
+                }
+            }
+        }
+
         // Use CBCentralManagerFactory for consistency between normal and test targets.
         // `forceMock: true` is load-bearing for the ReliaBLEMock test target — do not remove.
         centralManager = CBCentralManagerFactory.instance(
@@ -373,19 +452,14 @@ actor BluetoothActor {
             options: centralManagerCreationOptions(),
             forceMock: true
         )
-
-        delegateEventTask = Task { [weak self] in
-            for await event in events {
-                await self?.process(event)
-            }
-        }
     }
 
     /// Builds the options dictionary passed to the central-manager factory.
     ///
     /// Factored out of ``setupCentralManager()`` so unit tests can assert the restore key is
-    /// included without tearing down the process-lifetime central. End-to-end factory option
-    /// fidelity is deferred to the mock-harness work in issue #42.
+    /// included without creating a central. When a restore identifier is configured and
+    /// `CBMCentralManagerMock.simulateStateRestoration` is set, central init delivers
+    /// `willRestoreState` faithfully (see the test harness cold-relaunch helpers).
     private func centralManagerCreationOptions() -> [String: Any]? {
         guard let restoreIdentifier else { return nil }
         return [CBCentralManagerOptionRestoreIdentifierKey: restoreIdentifier]
@@ -393,6 +467,8 @@ actor BluetoothActor {
 
     /// Drains a single delegate event on the actor, preserving CoreBluetooth's callback order.
     private func process(_ event: DelegateEvent) {
+        guard !isShutdown else { return }
+
         switch event {
         case .stateUpdate:
             handleCentralManagerStateUpdate()
@@ -426,6 +502,8 @@ actor BluetoothActor {
     /// ``ReliaBLEManager`` façade, not here, to keep this actor-isolated method free of a construct the
     /// region-based isolation checker cannot yet analyze.
     func authorize(id: UUID) async throws {
+        guard !isShutdown else { throw PeripheralError.bluetoothUnavailable }
+
         log?.info("Authorizing bluetooth")
 
         switch CBCentralManager.authorization {
@@ -495,6 +573,10 @@ actor BluetoothActor {
     // MARK: - Scanning
 
     func startScanning(services: sending [CBUUID]? = nil) {
+        guard !isShutdown else {
+            log?.warn(tags: [.category(.scanning)], "Attempted to start scan after shutdown")
+            return
+        }
         guard let centralManager else {
             log?.warn(tags: [.category(.scanning)], "Attempted to start scan without a central manager")
             return
@@ -523,6 +605,10 @@ actor BluetoothActor {
     }
 
     func stopScanning() {
+        guard !isShutdown else {
+            log?.warn(tags: [.category(.scanning)], "Attempted to stop scan after shutdown")
+            return
+        }
         guard let centralManager else {
             log?.warn(tags: [.category(.scanning)], "Attempted to stop scan without a central manager")
             return
@@ -850,8 +936,7 @@ actor BluetoothActor {
         // The value snapshots hold no CoreBluetooth reference to clear; drop the live registry instead.
         cbPeripherals.removeAll()
         connectionStates.removeAll()
-        for task in reconnectTasks.values { task.cancel() }
-        reconnectTasks.removeAll()
+        taskRegistry.cancelAll()
         reconnectAttempts.removeAll()
         reconnectEnabled.removeAll()
         persistReconnectIntent()
@@ -923,6 +1008,10 @@ actor BluetoothActor {
     /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id` (a stale snapshot).
     /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
     func connect(id: String, autoReconnect: Bool = true) throws {
+        guard !isShutdown else {
+            log?.warn(tags: [.peripheral(id)], "Attempted to connect after shutdown")
+            throw PeripheralError.bluetoothUnavailable
+        }
         guard let centralManager else {
             log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
             throw PeripheralError.bluetoothUnavailable
@@ -958,6 +1047,10 @@ actor BluetoothActor {
     /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id`.
     /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
     func disconnect(id: String) throws {
+        guard !isShutdown else {
+            log?.warn(tags: [.peripheral(id)], "Attempted to disconnect after shutdown")
+            throw PeripheralError.bluetoothUnavailable
+        }
         guard let centralManager else {
             log?.warn(tags: [.peripheral(id)], "Attempted to disconnect without a central manager")
             throw PeripheralError.bluetoothUnavailable
@@ -971,8 +1064,7 @@ actor BluetoothActor {
         intentionalDisconnects.insert(id)
         reconnectEnabled.remove(id)
         persistReconnectIntent()
-        reconnectTasks[id]?.cancel()
-        reconnectTasks[id] = nil
+        taskRegistry.cancel(id)
         reconnectAttempts[id] = nil
         
         connectionStates[id] = .disconnecting
@@ -1027,8 +1119,7 @@ actor BluetoothActor {
         if payload.isReconnecting {
             // Defensively cancel any pending library ladder so Tier 0 (system) and Tier 1
             // (library) cannot overlap under odd callback ordering.
-            reconnectTasks[id]?.cancel()
-            reconnectTasks[id] = nil
+            taskRegistry.cancel(id)
 
             connectionStates[id] = .reconnecting(source: .system, attempt: nil, nextRetryAt: nil)
             log?.info(tags: [.peripheral(id), .category(.connection)], "System auto-reconnect in progress")
@@ -1089,7 +1180,7 @@ actor BluetoothActor {
     }
 
     private func scheduleReconnect(id: String, attempt: Int) {
-        reconnectTasks[id]?.cancel()
+        taskRegistry.cancel(id)
 
         // `ReconnectPolicy` is public and unvalidated; collapse any non-finite field (`nan`/`inf`)
         // to a safe value here. Beyond the UInt64 conversion below, a non-finite `jitter` would also
@@ -1114,7 +1205,7 @@ actor BluetoothActor {
         connectionStates[id] = .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)
         broadcast(ConnectionStateChange(peripheralId: id, state: .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)), to: connectionStateChangesContinuations)
 
-        reconnectTasks[id] = Task { [weak self] in
+        let task = Task { [weak self] in
             do {
                 try await Task.sleep(nanoseconds: sleepNanos)
             } catch is CancellationError {
@@ -1128,6 +1219,7 @@ actor BluetoothActor {
             
             await self.performReconnect(id: id, attempt: attempt)
         }
+        taskRegistry.insert(id, task)
     }
 
     private func performReconnect(id: String, attempt: Int) {
@@ -1152,8 +1244,7 @@ actor BluetoothActor {
     }
     
     private func clearReconnectState(for id: String) {
-        reconnectTasks[id]?.cancel()
-        reconnectTasks[id] = nil
+        taskRegistry.cancel(id)
         reconnectAttempts[id] = nil
         intentionalDisconnects.remove(id)
     }
@@ -1192,25 +1283,19 @@ actor BluetoothActor {
         intentionalDisconnects.insert(id)
     }
 
-    /// Test-only hook: drives restoration with a hand-built CoreBluetooth restore dictionary,
-    /// routing through `process(.willRestore)` the same way ``BluetoothDelegateShim`` would.
+    /// Test-only hook: invokes ``handleWillRestoreState(_:)`` directly for defensive unit tests
+    /// (e.g. empty scan filter, defer-until-powered-on, disconnected-peripheral seeding) that
+    /// cannot use the faithful mock `simulateStateRestoration` path.
     ///
-    /// Needed because CoreBluetoothMock cannot synthesize `willRestoreState`.
-    func testInvokeWillRestoreState(_ state: [String: Any]) {
-        process(.willRestore(RestorationPayload(state: state)))
-    }
-
-    /// Test-only hook: builds a restoration dictionary from actor-owned live peripherals and
-    /// drives ``testInvokeWillRestoreState(_:)``. Keeps non-`Sendable` `CBPeripheral` references
-    /// inside the actor isolation boundary.
-    func testInvokeWillRestoreState(
-        peripheralIds: [String],
-        scanServices: [CBUUID]? = nil,
-        scanOptions: [String: Any]? = nil
+    /// Does not go through the shim or event pipeline — production restoration is covered by
+    /// cold-relaunch tests that set `CBMCentralManagerMock.simulateStateRestoration`.
+    ///
+    /// - Parameter peripheralIds: Live `cbPeripherals` keys to include in the restoration dictionary.
+    func testHandleWillRestoreState(
+        peripheralIds: [String] = [],
+        scanServices: [CBUUID]? = nil
     ) {
         var state: [String: Any] = [:]
-        // Avoid compactMap/closure patterns the region-based isolation checker cannot analyze
-        // for non-Sendable CBPeripheral values.
         var peripherals: [CBPeripheral] = []
         for id in peripheralIds {
             if let peripheral = cbPeripherals[id] {
@@ -1223,10 +1308,7 @@ actor BluetoothActor {
         if let scanServices {
             state[CBCentralManagerRestoredStateScanServicesKey] = scanServices
         }
-        if let scanOptions {
-            state[CBCentralManagerRestoredStateScanOptionsKey] = scanOptions
-        }
-        testInvokeWillRestoreState(state)
+        handleWillRestoreState(RestorationPayload(state: state))
     }
 
     /// Test-only hook: whether `id` is currently in ``reconnectEnabled``.
@@ -1247,7 +1329,7 @@ actor BluetoothActor {
     /// Test-only hook: number of registered `connectionStateChanges` subscribers.
     ///
     /// Stream registration is asynchronous — the factory schedules `register(...)` on a detached
-    /// `@BluetoothActor` hop (see ``connectionStateChangesStream()``). Tests that must observe a
+    /// actor hop (see ``connectionStateChangesStream()``). Tests that must observe a
     /// broadcast emitted *right after* subscribing (e.g. the restore path) poll this until their
     /// subscription has landed, otherwise a non-replaying broadcast can be missed entirely.
     func testConnectionStateSubscriberCount() -> Int {
@@ -1271,8 +1353,7 @@ actor BluetoothActor {
     }
 
     /// Test-only hook: keys of the options dictionary ``setupCentralManager()`` would pass to the
-    /// factory right now. Verifies restore-key wiring at the unit level; end-to-end factory option
-    /// fidelity is deferred to issue #42.
+    /// factory right now. Verifies restore-key wiring at the unit level.
     func testCentralCreationOptionKeys() -> [String] {
         centralManagerCreationOptions().map { Array($0.keys) } ?? []
     }
@@ -1288,35 +1369,15 @@ actor BluetoothActor {
         UserDefaults.standard.removeObject(forKey: key)
     }
 
-    /// Test-only hook: overwrites the stored restore identifier (process-lifetime actor may already
-    /// have been initialized by an earlier test without one).
-    func testSetRestoreIdentifier(_ id: String?) {
-        restoreIdentifier = id
     }
-
-    /// Test-only hook: clears discovery snapshots and connection intent so a subsequent restore can
-    /// exercise the cold-relaunch (append-new) identity branch, while keeping live `CBPeripheral`
-    /// references available for ``testInvokeWillRestoreState(peripheralIds:scanServices:scanOptions:)``.
-    ///
-    /// Deliberately does **not** touch persisted reconnect intent — this simulates process death,
-    /// where in-memory state is lost but `UserDefaults` survives.
-    func testClearDiscoveredSnapshotsPreservingLiveReferences() {
-        discoveredPeripherals.removeAll()
-        connectionStates.removeAll()
-        reconnectEnabled.removeAll()
-        pendingRestoredScanServices = nil
-        pendingRestoredScanOptions = nil
-    }
-}
 
 // MARK: - BluetoothDelegateShim
 
 /// Bridges `CBCentralManagerDelegate` callbacks—which arrive on CoreBluetooth's internal
-/// queue—into ``BluetoothActor``-isolated handlers via unstructured `Task` hops.
+/// queue—into the owning ``BluetoothActor``'s ordered event pipeline.
 ///
-/// The shim holds no mutable state. All meaningful work happens inside ``BluetoothActor``.
-/// No weak/unowned reference is needed because ``BluetoothActor/shared`` is a
-/// process-lifetime singleton.
+/// The shim holds no actor reference (only the pipeline continuation), avoiding retain cycles.
+/// All meaningful work happens inside ``BluetoothActor``.
 final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
 
     /// Sink for delegate callbacks, drained in order by ``BluetoothActor``'s consumer task.
