@@ -1419,9 +1419,16 @@ struct ReliaBLEManagerTests {
 
         await Mock.ensureReady(manager)
         #expect(await manager.bluetooth.hasCentralManager)
+        // Restore-id option and restoring peer shim are installed together (never disagree).
+        #expect(await manager.bluetooth.testDelegateIsRestoringShim())
+        #expect(!(await manager.bluetooth.testDelegateIsNonRestoringShim()))
 
         let noRestore = await Mock.makeManager(restoreIdentifier: nil)
         #expect(await noRestore.bluetooth.testCentralCreationOptionKeys().isEmpty)
+        await Mock.ensureReady(noRestore)
+        #expect(await noRestore.bluetooth.hasCentralManager)
+        #expect(await noRestore.bluetooth.testDelegateIsNonRestoringShim())
+        #expect(!(await noRestore.bluetooth.testDelegateIsRestoringShim()))
     }
 
     @Test func willRestoreRepopulatesMapsSeedsConnectionStateAndBroadcasts() async throws {

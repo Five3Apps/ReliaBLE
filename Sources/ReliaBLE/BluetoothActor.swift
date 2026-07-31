@@ -70,10 +70,11 @@ private struct RestoredScanOptions: @unchecked Sendable {
 /// A single CoreBluetooth delegate callback, carried in delivery order across the nonisolated
 /// delegate-queue → ``BluetoothActor`` hop.
 ///
-/// CoreBluetooth invokes delegate methods serially on its dispatch queue. ``BluetoothDelegateShim``
-/// yields one of these per callback into a single `AsyncStream`, and ``BluetoothActor`` drains them
-/// with a single consumer so the original callback ordering is preserved — independent per-callback
-/// `Task`s could be reordered before reaching the actor.
+/// CoreBluetooth invokes delegate methods serially on its dispatch queue. The nonisolated delegate
+/// shim (``BluetoothDelegateShim`` or ``RestoringBluetoothDelegateShim``) forwards each callback
+/// through ``DelegateEventForwarder`` into a single `AsyncStream`, and ``BluetoothActor`` drains
+/// them with a single consumer so the original callback ordering is preserved — independent
+/// per-callback `Task`s could be reordered before reaching the actor.
 private enum DelegateEvent: Sendable {
     case stateUpdate
     case discovered(DiscoveryPayload)
@@ -137,7 +138,7 @@ fileprivate final class TaskRegistry: @unchecked Sendable {
 /// discovered peripherals—are owned exclusively by this actor. Each manager owns its own instance.
 ///
 /// Delegate callbacks arrive on CoreBluetooth's internal queue and are yielded into
-/// ``EventPipeline`` by the nonisolated ``BluetoothDelegateShim``.
+/// ``EventPipeline`` by the nonisolated shim via ``DelegateEventForwarder``.
 actor BluetoothActor {
 
     // MARK: - Nonisolated Teardown
@@ -152,7 +153,8 @@ actor BluetoothActor {
     private let centralManagerQueue = DispatchQueue(label: "com.five3apps.relia-ble.bluetoothmanager", qos: .userInitiated)
 
     var centralManager: CBCentralManager?
-    private var delegateShim: BluetoothDelegateShim?
+    /// Retained for the central's weak delegate; concrete type is a non-restoring or restoring shim.
+    private var delegateShim: (any CBCentralManagerDelegate)?
 
     /// Drains delegate callbacks in order from ``eventPipeline``.
     private var delegateEventTask: Task<Void, Never>?
@@ -432,7 +434,26 @@ actor BluetoothActor {
 
         // Consumer-before-factory: start draining the (already-created) pipeline first so a
         // synchronous `willRestoreState` inside the factory call is not lost.
-        let shim = BluetoothDelegateShim(eventContinuation: eventPipeline.continuation)
+        //
+        // Shim choice is gated by the same `restoreIdentifier != nil` condition that adds
+        // `CBCentralManagerOptionRestoreIdentifierKey` below, so delegate and options never
+        // disagree. Two peer types (not inheritance) are required for *both* stacks:
+        //
+        // - **Real CoreBluetooth (ObjC):** uses `responds(to:)` and logs API MISUSE when the
+        //   delegate implements `willRestoreState` without a restore identifier. The non-restoring
+        //   shim must not declare that method at all (same pattern Nordic uses in
+        //   `CBMCentralManagerNative`).
+        // - **CoreBluetoothMock (Swift):** `CBMCentralManagerMock` calls
+        //   `delegate?.centralManager(_:willRestoreState:)` **unconditionally** via the Swift
+        //   protocol (extension default is a no-op). Each peer class needs its own witness table
+        //   so the restoring type's implementation is dispatched; a subclass of a base that omits
+        //   the method would still hit the empty protocol-extension default.
+        let forwarder = DelegateEventForwarder(eventContinuation: eventPipeline.continuation)
+        let shim: any CBCentralManagerDelegate = if restoreIdentifier != nil {
+            RestoringBluetoothDelegateShim(forwarder: forwarder)
+        } else {
+            BluetoothDelegateShim(forwarder: forwarder)
+        }
         delegateShim = shim
 
         if delegateEventTask == nil {
@@ -668,7 +689,7 @@ actor BluetoothActor {
         broadcast(state, to: stateContinuations)
     }
 
-    // MARK: - Delegate Entry Points (called by BluetoothDelegateShim)
+    // MARK: - Delegate Entry Points (called via DelegateEventForwarder)
 
     /// Rehydrates scan and connection state delivered by CoreBluetooth on app relaunch.
     ///
@@ -1358,6 +1379,19 @@ actor BluetoothActor {
         centralManagerCreationOptions().map { Array($0.keys) } ?? []
     }
 
+    /// Test-only hook: whether the installed delegate is the restoring peer shim.
+    ///
+    /// Paired with ``testCentralCreationOptionKeys()`` so tests can assert that the restore-id
+    /// option and the restoring delegate are always installed together.
+    func testDelegateIsRestoringShim() -> Bool {
+        delegateShim is RestoringBluetoothDelegateShim
+    }
+
+    /// Test-only hook: whether the installed delegate is the non-restoring peer shim.
+    func testDelegateIsNonRestoringShim() -> Bool {
+        delegateShim is BluetoothDelegateShim
+    }
+
     /// Test-only hook: reconnect intent persisted for the current restore identifier.
     func testPersistedReconnectIntent() -> Set<String> {
         persistedReconnectIntent()
@@ -1373,25 +1407,78 @@ actor BluetoothActor {
 
 // MARK: - BluetoothDelegateShim
 
-/// Bridges `CBCentralManagerDelegate` callbacks—which arrive on CoreBluetooth's internal
-/// queue—into the owning ``BluetoothActor``'s ordered event pipeline.
+/// Yields CoreBluetooth delegate callbacks into ``BluetoothActor``'s ordered event pipeline.
 ///
-/// The shim holds no actor reference (only the pipeline continuation), avoiding retain cycles.
-/// All meaningful work happens inside ``BluetoothActor``.
-final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
-
-    /// Sink for delegate callbacks, drained in order by ``BluetoothActor``'s consumer task.
+/// Shared by both shims so callback ferrying stays in one place. Holds no actor reference (only
+/// the pipeline continuation), avoiding retain cycles.
+fileprivate final class DelegateEventForwarder: @unchecked Sendable {
     private let eventContinuation: AsyncStream<DelegateEvent>.Continuation
 
-    fileprivate init(eventContinuation: AsyncStream<DelegateEvent>.Continuation) {
+    init(eventContinuation: AsyncStream<DelegateEvent>.Continuation) {
         self.eventContinuation = eventContinuation
-        super.init()
     }
 
-    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    func stateUpdate() {
         // Yielding is synchronous and thread-safe; ordering is preserved because CoreBluetooth
         // invokes delegate methods serially on its dispatch queue.
         eventContinuation.yield(.stateUpdate)
+    }
+
+    func discovered(
+        peripheral: CBPeripheral,
+        advertisementData: [String: Any],
+        rssi: Int
+    ) {
+        // Ferry the non-Sendable CBPeripheral and advertisement dictionary across the actor isolation hop in a
+        // single-purpose payload. They are extracted into Sendable types (Peripheral / AdvertisementData) inside
+        // the actor.
+        let payload = DiscoveryPayload(peripheral: peripheral, advertisementData: advertisementData, rssi: rssi)
+        eventContinuation.yield(.discovered(payload))
+    }
+
+    func connected(peripheral: CBPeripheral) {
+        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: false, error: nil)
+        eventContinuation.yield(.connected(payload))
+    }
+
+    func connectFailed(peripheral: CBPeripheral, error: Error?) {
+        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: false, error: error)
+        eventContinuation.yield(.connectFailed(payload))
+    }
+
+    func disconnected(peripheral: CBPeripheral, isReconnecting: Bool, error: Error?) {
+        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: isReconnecting, error: error)
+        eventContinuation.yield(.disconnected(payload))
+    }
+
+    func willRestore(state: [String: Any]) {
+        // First callback on relaunch when a restore identifier was used. Ferry the non-Sendable
+        // restoration dictionary across the actor hop; extraction happens inside the actor.
+        eventContinuation.yield(.willRestore(RestorationPayload(state: state)))
+    }
+}
+
+/// Non-restoring `CBCentralManagerDelegate` bridge into ``DelegateEventForwarder``.
+///
+/// Intentionally does **not** implement `centralManager(_:willRestoreState:)`. Real CoreBluetooth
+/// uses ObjC `responds(to:)` and logs API MISUSE when that method is present without a restore
+/// identifier. Use ``RestoringBluetoothDelegateShim`` when restoration is enabled.
+///
+/// - Important: Keep the five shared callbacks below in lockstep with
+///   ``RestoringBluetoothDelegateShim`` (same signatures, same forwarder calls). Drift silently
+///   drops events on one path. Shared ferrying lives only in ``DelegateEventForwarder``.
+final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
+    private let forwarder: DelegateEventForwarder
+
+    fileprivate init(forwarder: DelegateEventForwarder) {
+        self.forwarder = forwarder
+        super.init()
+    }
+
+    // MARK: Shared callbacks — keep in sync with RestoringBluetoothDelegateShim
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        forwarder.stateUpdate()
     }
 
     func centralManager(
@@ -1400,31 +1487,84 @@ final class BluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
-        // Ferry the non-Sendable CBPeripheral and advertisement dictionary across the actor isolation hop in a
-        // single-purpose payload. They are extracted into Sendable types (Peripheral / AdvertisementData) inside
-        // the actor.
-        let payload = DiscoveryPayload(peripheral: peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
-        eventContinuation.yield(.discovered(payload))
+        forwarder.discovered(peripheral: peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: false, error: nil)
-        eventContinuation.yield(.connected(payload))
-    }
-    
-    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: false, error: error)
-        eventContinuation.yield(.connectFailed(payload))
+        forwarder.connected(peripheral: peripheral)
     }
 
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: Error?) {
-        let payload = ConnectionPayload(peripheral: peripheral, isReconnecting: isReconnecting, error: error)
-        eventContinuation.yield(.disconnected(payload))
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        forwarder.connectFailed(peripheral: peripheral, error: error)
     }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDisconnectPeripheral peripheral: CBPeripheral,
+        timestamp: CFAbsoluteTime,
+        isReconnecting: Bool,
+        error: Error?
+    ) {
+        forwarder.disconnected(peripheral: peripheral, isReconnecting: isReconnecting, error: error)
+    }
+}
+
+/// Restoring `CBCentralManagerDelegate` bridge into ``DelegateEventForwarder``.
+///
+/// Only installed when ``ReliaBLEConfig/restoreIdentifier`` is non-`nil`, so the central is always
+/// created with a matching `CBCentralManagerOptionRestoreIdentifierKey`.
+///
+/// Peer of ``BluetoothDelegateShim`` (not a subclass): CoreBluetoothMock dispatches
+/// `willRestoreState` via an unconditional Swift protocol call (extension default is a no-op), so
+/// each type needs its own witness table. Real CoreBluetooth additionally needs the method absent
+/// on the non-restoring peer for ObjC `responds(to:)` / API MISUSE.
+///
+/// - Important: Keep the five shared callbacks below in lockstep with ``BluetoothDelegateShim``
+///   (same signatures, same forwarder calls). Drift silently drops events on one path.
+final class RestoringBluetoothDelegateShim: NSObject, CBCentralManagerDelegate {
+    private let forwarder: DelegateEventForwarder
+
+    fileprivate init(forwarder: DelegateEventForwarder) {
+        self.forwarder = forwarder
+        super.init()
+    }
+
+    // MARK: Shared callbacks — keep in sync with BluetoothDelegateShim
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        forwarder.stateUpdate()
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDiscover peripheral: CBPeripheral,
+        advertisementData: [String: Any],
+        rssi RSSI: NSNumber
+    ) {
+        forwarder.discovered(peripheral: peripheral, advertisementData: advertisementData, rssi: RSSI.intValue)
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        forwarder.connected(peripheral: peripheral)
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        forwarder.connectFailed(peripheral: peripheral, error: error)
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDisconnectPeripheral peripheral: CBPeripheral,
+        timestamp: CFAbsoluteTime,
+        isReconnecting: Bool,
+        error: Error?
+    ) {
+        forwarder.disconnected(peripheral: peripheral, isReconnecting: isReconnecting, error: error)
+    }
+
+    // MARK: Restoration-only
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
-        // First callback on relaunch when a restore identifier was used. Ferry the non-Sendable
-        // restoration dictionary across the actor hop; extraction happens inside the actor.
-        eventContinuation.yield(.willRestore(RestorationPayload(state: dict)))
+        forwarder.willRestore(state: dict)
     }
 }

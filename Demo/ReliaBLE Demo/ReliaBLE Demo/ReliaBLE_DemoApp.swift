@@ -27,11 +27,20 @@ import SwiftData
 import ReliaBLE
 
 private struct BLEManagerKey: EnvironmentKey {
-    static let defaultValue: ReliaBLEManager = ReliaBLEManager(config: ReliaBLEConfig())
+    /// Must stay cheap and side-effect free.
+    ///
+    /// SwiftUI evaluates `defaultValue` while wiring environments (including when *setting*
+    /// `.environment(\.bleManager, …)` via a writable key path) — not only when a view reads a
+    /// missing value. So this must never `fatalError` and must never construct a
+    /// ``ReliaBLEManager`` (that would spin up a second `CBCentralManager` stack, often without
+    /// the app's `restoreIdentifier`).
+    ///
+    /// The real manager is injected once from ``ReliaBLE_DemoApp``.
+    static let defaultValue: ReliaBLEManager? = nil
 }
 
 extension EnvironmentValues {
-    var bleManager: ReliaBLEManager {
+    var bleManager: ReliaBLEManager? {
         get { self[BLEManagerKey.self] }
         set { self[BLEManagerKey.self] = newValue }
     }
@@ -77,8 +86,10 @@ struct ReliaBLE_DemoApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                // Inject on the root content (not only the Scene) so descendants always see the
+                // real manager after the scene graph materializes.
+                .environment(\.bleManager, reliaBLE)
         }
         .modelContainer(sharedModelContainer)
-        .environment(\.bleManager, reliaBLE)
     }
 }

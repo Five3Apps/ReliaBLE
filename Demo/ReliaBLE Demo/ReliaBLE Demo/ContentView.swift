@@ -23,6 +23,7 @@
 //  SOFTWARE.
 
 import SwiftUI
+import ReliaBLE
 
 struct ContentView: View {
     var body: some View {
@@ -47,4 +48,9 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
+        .environment(\.bleManager, {
+            var config = ReliaBLEConfig()
+            config.restoreIdentifier = "com.five3apps.relia-ble-demo.preview"
+            return ReliaBLEManager(config: config)
+        }())
 }

@@ -29,7 +29,9 @@ import SwiftUI
 import ReliaBLE
 
 struct SettingsView: View {
-    @Environment(\.bleManager) private var reliaBLE
+    /// Optional because SwiftUI evaluates `EnvironmentKey.defaultValue` while wiring keys;
+    /// App injects the real manager on the root content view.
+    @Environment(\.bleManager) private var bleManager
     @State private var isLoggingEnabled: Bool = false
 
     @AppStorage("reconnectPolicy.maxAttempts") private var maxAttempts = 5
@@ -41,7 +43,9 @@ struct SettingsView: View {
         NavigationView {
             Form {
                 Section("Logging") {
+                    // Defensive only: App/previews always inject; disable is not a product UX path.
                     Toggle("Enable Logging", isOn: $isLoggingEnabled)
+                        .disabled(bleManager == nil)
                 }
 
                 Section {
@@ -72,14 +76,21 @@ struct SettingsView: View {
             .navigationTitle("Settings")
         }
         .onAppear {
-            isLoggingEnabled = reliaBLE.loggingService.enabled
+            if let bleManager {
+                isLoggingEnabled = bleManager.loggingService.enabled
+            }
         }
         .onChange(of: isLoggingEnabled) { _, newValue in
-            reliaBLE.loggingService.enabled = newValue
+            bleManager?.loggingService.enabled = newValue
         }
     }
 }
 
 #Preview {
     SettingsView()
+        .environment(\.bleManager, {
+            var config = ReliaBLEConfig()
+            config.restoreIdentifier = "com.five3apps.relia-ble-demo.preview"
+            return ReliaBLEManager(config: config)
+        }())
 }
