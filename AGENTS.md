@@ -41,18 +41,19 @@ The package declares **three targets** that share a single source tree to make `
 
 ### Swift Concurrency
 
-The library is built with Swift 6 and **complete concurrency checking**. The `ReliaBLEManager` public API should be callable from `@MainActor`, but the library itself should avoid `@MainActor` and instead use `@BluetoothActor` (a custom actor defined in `BluetoothActor.swift`) to serialize all Bluetooth interactions. This keeps the library thread-safe and allows the integrating app to decide how to bridge to the main thread for UI updates.
+The library is built with Swift 6 and **complete concurrency checking**. The `ReliaBLEManager` public API should be callable from `@MainActor`, but the library itself should avoid `@MainActor` and instead serialize all Bluetooth interactions on `BluetoothActor` (a plain `actor` defined in `BluetoothActor.swift`). This keeps the library thread-safe and allows the integrating app to decide how to bridge to the main thread for UI updates.
+
+`BluetoothActor` is **not** a `@globalActor` and has no shared singleton. Each `ReliaBLEManager` **owns its own** `BluetoothActor` instance, created synchronously in the manager's `init` (`BluetoothActor(log:reconnectPolicy:restoreIdentifier:)`). There is no `@BluetoothActor` annotation, no `.shared`, and no process-wide state — do not reintroduce any of these.
+
+**One stack per manager.** Each `ReliaBLEManager` is a fully isolated stack: its own actor, `CBCentralManager`, discovered-peripheral snapshots, connection state, and streams. Constructing a second manager yields a second, independent stack — config (logging, `reconnectPolicy`) applies per manager, not first-wins.
 
 ### Logging
 
 `LoggingService` wraps Willow's `Logger` with an async execution queue. The service is `Sendable` and passed by reference into both managers. Default writer is an `OSLogWriter` (`subsystem: com.five3apps.relia-ble`, `category: BLE`), configurable via `ReliaBLEConfig`. Logging is **disabled by default** — `config.loggingEnabled` must be set to true. Log calls take a `tags: [LogTag]` array; use `.category(.scanning)`, `.peripheral(id)`, etc. rather than embedding the category in the message.
 
-### Authorization flow
-
-`ReliaBLEManager.init` does **not** instantiate `CBCentralManager` unless the user has already granted `.allowedAlways`. This is deliberate so the integrating app controls when the iOS permission prompt appears — callers invoke `authorizeBluetooth()` when they want the prompt. Preserve this lazy-init behavior when touching `BluetoothActor.setupCentralManager()`.
-
 ## Notes for editing
 
+- **This library is in pre-release development stage.** Breaking changes are expected. Do not reference behavior history in any library documentation or code comments (noting in planning docs is acceptable and expected). Do not waste time thinking about mitigating breaking changes. Focus on the current design and implementation.
 - Public API on `ReliaBLEManager` is the supported surface for external consumers. Adding/removing methods there is a breaking change.
 - `forceMock: true` is currently passed to `CBCentralManagerFactory.instance(...)` in `BluetoothActor`. The production factory ignores this parameter; the mock factory honors it. Don't "clean it up" — it's load-bearing for the test target.
 - DocC catalog lives at `Sources/ReliaBLE/Documentation.docc/`. The `swift-docc-plugin` is a package dep so `swift package generate-documentation` works. This documentation **must** be kept up to date with the public API on `ReliaBLEManager` and the overall architecture and usage patterns.

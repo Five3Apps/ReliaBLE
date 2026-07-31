@@ -13,16 +13,22 @@ without manual locking or forced actor hops.
 
 ``ReliaBLEManager`` is a `nonisolated`, `Sendable` `final class`. It owns no
 mutable state itself; instead it forwards every operation to an internal
-`@globalActor` (`BluetoothActor`) that serializes all Core Bluetooth
-interactions. Because the manager is `Sendable` and nonisolated, you can hold a
-single instance and share it freely across isolation domains — there is no
-implicit `@MainActor` requirement and no forced main-thread hop.
+`actor` (`BluetoothActor`) that serializes all Core Bluetooth interactions.
+Because the manager is `Sendable` and nonisolated, you can hold a single
+instance and share it freely across isolation domains — there is no implicit
+`@MainActor` requirement and no forced main-thread hop.
+
+`BluetoothActor` is a plain `actor` **instance owned by each manager** — not a
+`@globalActor` and not a shared singleton. Every ``ReliaBLEManager`` creates and
+holds its own actor, so concurrent calls into one manager are serialized on that
+manager's actor alone. For running more than one manager at once, see
+<doc:Multi-Manager>.
 
 ```
 ReliaBLEManager (nonisolated, Sendable)
         │  forwards async calls
         ▼
-BluetoothActor (@globalActor, internal)
+BluetoothActor (per-manager actor instance, internal)
         │  serializes all access
         ▼
 CBCentralManager delegate shim
@@ -34,13 +40,16 @@ CoreBluetooth
 `BluetoothActor` is an **internal** implementation detail. Consumers must not
 reference it; interact only through ``ReliaBLEManager``.
 
-> Note: The internal central manager is created lazily and only once Bluetooth
-> authorization is `.allowedAlways` — the permission prompt stays under your
-> app's control via ``ReliaBLEManager/authorizeBluetooth()``. The one exception:
-> when ``ReliaBLEConfig/restoreIdentifier`` is set and authorization was already
-> granted, the central is created eagerly at ``ReliaBLEManager`` init so state
-> restoration can deliver its `willRestoreState` callback on relaunch. See
-> <doc:Background> for details.
+> Note: `ReliaBLEManager` init never prompts for Bluetooth permission. Creating
+> the internal central stays gated on existing `.allowedAlways` authorization so
+> the prompt remains under your app's control via
+> ``ReliaBLEManager/authorizeBluetooth()``. When authorization is already
+> `.allowedAlways`, init eagerly creates the central (via a fire-and-forget
+> `Task` into `BluetoothActor`) so a live stack is ready immediately.
+> ``ReliaBLEConfig/restoreIdentifier`` only affects the options passed at that
+> creation — it does not change *when* the central is created — so
+> `willRestoreState` can be delivered on relaunch. See <doc:Background> for
+> details.
 
 ### Calling actions
 

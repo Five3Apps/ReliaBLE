@@ -79,7 +79,9 @@ extension ConnectionState {
 
 struct CentralView: View {
     @Environment(\.modelContext) private var modelContext
-    @Environment(\.bleManager) private var reliaBLE
+    /// Optional because SwiftUI evaluates `EnvironmentKey.defaultValue` while wiring keys;
+    /// App injects the real manager on the root content view.
+    @Environment(\.bleManager) private var bleManager
 
     @Query private var discoveries: [DiscoveryEvent]
     @Query private var devices: [Device]
@@ -88,6 +90,22 @@ struct CentralView: View {
     @State private var selectedView: String = "Devices"
 
     var body: some View {
+        Group {
+            if let reliaBLE = bleManager {
+                centralContent(reliaBLE: reliaBLE)
+            } else {
+                // Defensive only: App/previews always inject. Not a product UX state to design around.
+                ContentUnavailableView(
+                    "Bluetooth Manager Missing",
+                    systemImage: "antenna.radiowaves.left.and.right.slash",
+                    description: Text("Inject ReliaBLEManager via .environment(\\.bleManager, …).")
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func centralContent(reliaBLE: ReliaBLEManager) -> some View {
         NavigationSplitView {
             Text("ReliaBLE state: \(viewModel.currentState.description)")
 
@@ -131,7 +149,7 @@ struct CentralView: View {
 
             Group {
                 if selectedView == "Devices" {
-                    deviceList
+                    deviceList(reliaBLE: reliaBLE)
                 } else {
                     discoveriesList
                 }
@@ -152,28 +170,27 @@ struct CentralView: View {
             Text("Select a device")
         }
         .task {
-            let manager = reliaBLE
             let store = await DeviceStoreActor.create(container: modelContext.container)
-            viewModel.setDependencies(deviceStore: store, reliaBLE: manager)
+            viewModel.setDependencies(deviceStore: store, reliaBLE: reliaBLE)
 
             await withTaskGroup(of: Void.self) { group in
                 group.addTask {
-                    for await state in manager.state {
+                    for await state in reliaBLE.state {
                         await viewModel.updateState(state)
                     }
                 }
                 group.addTask {
-                    for await discoveryEvent in manager.peripheralDiscoveries {
+                    for await discoveryEvent in reliaBLE.peripheralDiscoveries {
                         await store.insertDiscovery(discoveryEvent)
                     }
                 }
                 group.addTask {
-                    for await peripherals in manager.discoveredPeripherals {
+                    for await peripherals in reliaBLE.discoveredPeripherals {
                         await store.syncDevices(peripherals)
                     }
                 }
                 group.addTask {
-                    for await change in manager.connectionStateChanges {
+                    for await change in reliaBLE.connectionStateChanges {
                         await viewModel.updateConnectionState(change)
                     }
                 }
@@ -181,7 +198,7 @@ struct CentralView: View {
         }
     }
 
-    private var deviceList: some View {
+    private func deviceList(reliaBLE: ReliaBLEManager) -> some View {
         List {
             ForEach(devices, id: \.persistentModelID) { device in
                 NavigationLink {
@@ -313,4 +330,9 @@ private struct CountdownView: View {
             for: [Device.self, DiscoveryEvent.self],
             inMemory: true
         )
+        .environment(\.bleManager, {
+            var config = ReliaBLEConfig()
+            config.restoreIdentifier = "com.five3apps.relia-ble-demo.preview"
+            return ReliaBLEManager(config: config)
+        }())
 }
