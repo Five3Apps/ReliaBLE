@@ -73,7 +73,10 @@ public enum ReconnectSource: Sendable, Equatable, Hashable {
 /// A subscriber that only cares about one peripheral filters with
 /// `where $0.peripheralId == targetId`.
 public struct ConnectionStateChange: Sendable, Equatable, Hashable {
-    /// The ``Peripheral/id`` of the peripheral whose connection state changed.
+    /// The ``Peripheral/id`` of the handle whose connection state changed.
+///
+/// Filter the stream with `change.peripheralId == peripheral.id` to observe a single
+/// peripheral.
     public let peripheralId: String
     /// The new connection state.
     public let state: ConnectionState

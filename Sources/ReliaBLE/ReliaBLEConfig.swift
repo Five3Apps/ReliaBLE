@@ -48,8 +48,8 @@ public struct ReliaBLEConfig: Sendable {
     public var loggingEnabled = false
     
     /// Policy controlling the behavior of the library-side exponential backoff supplement
-    /// for automatic reconnection. Enable/disable is a per-connect choice on
-    /// ``ReliaBLEManager/connect(to:autoReconnect:)``; this policy governs *how* the
+    /// for automatic reconnection. The enable/disable decision is a per-connect choice on
+    /// ``Peripheral/connect(autoReconnect:)``; this policy governs *how* the
     /// library retries when auto-reconnect is active.
     public var reconnectPolicy = ReconnectPolicy()
 

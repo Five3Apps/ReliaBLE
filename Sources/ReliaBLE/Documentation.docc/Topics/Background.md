@@ -70,8 +70,8 @@ those connections are restored automatically. You do **not** call a separate
 restoration API — restored peripherals appear on the same streams you already
 use:
 
-- ``ReliaBLEManager/discoveredPeripherals`` emits restored peripherals (along
-  with any newly discovered ones).
+- ``ReliaBLEManager/discoveredPeripherals`` emits restored devices as
+  ``DiscoveredPeripheral`` snapshots (alongside newly discovered ones).
 - ``ReliaBLEManager/connectionStateChanges`` emits the rehydrated connection
   states — ``ConnectionState/connected`` for preserved connections,
   ``ConnectionState/connecting`` for in-progress attempts.
@@ -84,8 +84,8 @@ advertisements.
 The Tier-0 system-managed reconnection (``ReconnectSource/system``) survives
 app termination because it runs in the iOS daemon. Tier-1 library-managed
 reconnection (``ReconnectSource/library``) does not, so ReliaBLE persists your
-per-connect intent: when you call ``ReliaBLEManager/connect(to:autoReconnect:)``
-with `autoReconnect: true` (and a ``ReliaBLEConfig/restoreIdentifier`` is
+per-connect intent: when you call ``Peripheral/connect(autoReconnect:)`` with
+`autoReconnect: true` (and a ``ReliaBLEConfig/restoreIdentifier`` is
 configured), that intent is stored in `UserDefaults` and re-armed for the
 restored connection on relaunch, so a post-relaunch drop still triggers the
 exponential-backoff ladder governed by ``ReconnectPolicy``. Connections made
@@ -103,3 +103,11 @@ rehydrated — but reconnection stays disarmed.
 > post a system alert when your app is not running and a connection or
 > disconnection occurs. They can be added non-breakingly in a future release
 > if a use case emerges.
+
+> Important: Background scanning and state restoration are constrained on
+> tvOS and watchOS. tvOS has no `bluetooth-central` background mode;
+> watchOS background BLE is limited. ``ReliaBLEConfig/restoreIdentifier``
+> will not deliver the same background behavior on those platforms as it
+> does on iOS and macOS. The library's central-role API compiles for all
+> five platforms, but apps targeting tvOS or watchOS should not rely on
+> background-preserved connections or relaunch-restored sessions.

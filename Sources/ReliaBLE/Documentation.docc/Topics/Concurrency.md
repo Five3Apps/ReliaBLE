@@ -58,7 +58,8 @@ All mutating actions are `async` and hop onto the Bluetooth actor for you:
 - ``ReliaBLEManager/authorizeBluetooth()``
 - ``ReliaBLEManager/startScanning(services:)``
 - ``ReliaBLEManager/stopScanning()``
-- ``ReliaBLEManager/connect(to:autoReconnect:)``
+- ``Peripheral/connect(autoReconnect:)``
+- ``Peripheral/disconnect()``
 
 The current Bluetooth state is exposed as an `async` getter,
 ``ReliaBLEManager/currentState``:
@@ -95,8 +96,25 @@ Replay semantics differ per stream:
 Because each call returns an independent stream, multiple parts of your app can
 observe the same surface concurrently without interfering with one another.
 
-### Value types
+### Value types and handles
 
-The model types you receive — ``Peripheral``, ``AdvertisementData``, and
-``PeripheralDiscoveryEvent`` — are `Sendable` value structs, so they cross
+The value types you receive from streams — ``DiscoveredPeripheral``, ``AdvertisementData``,
+and ``PeripheralDiscoveryEvent`` — are `Sendable` value types, so they cross
 isolation boundaries freely.
+
+``Peripheral`` is a checked `Sendable` `final class`, *not* a value type. It is
+interned one-per-id-per-manager and carries synchronous, cached, last-known
+metadata behind a single `Mutex`. The contract:
+
+- No `CBPeripheral` or other CoreBluetooth object is ever stored on a handle.
+- Metadata writes happen only from library-ordered paths (the Bluetooth actor's
+  discovery and restore pipelines); the lock exists to make *reads* safe from any
+  concurrency domain, not to order writes.
+- The lock is never held across a suspension — `withLock` closures are
+  non-`async`, and no CoreBluetooth call or `Task` creation occurs inside them.
+- Per-property reads are **not** one atomic snapshot: reading ``Peripheral/name``
+  then ``Peripheral/rssi`` can straddle two discovery updates.
+
+Handles are not `@Observable` and publish nothing. Use
+``ReliaBLEManager/discoveredPeripherals`` as the change-signal tick and re-read
+handle metadata inside that loop.

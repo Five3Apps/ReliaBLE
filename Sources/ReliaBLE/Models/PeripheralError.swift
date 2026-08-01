@@ -27,21 +27,24 @@
 
 import CoreBluetooth
 
-/// Errors thrown by peripheral operations such as ``ReliaBLEManager/connect(to:autoReconnect:)``.
+/// Errors thrown by peripheral operations on ``Peripheral`` handles, such as
+/// ``Peripheral/connect(autoReconnect:)`` and ``Peripheral/disconnect()``.
 public enum PeripheralError: Error, Sendable, Equatable {
     /// The peripheral is no longer known to the library.
     ///
-    /// A ``Peripheral`` is a value snapshot captured at discovery time. The live CoreBluetooth peripheral it refers to
-    /// is held internally by the library keyed by ``Peripheral/id``. If that reference has since been invalidated (for
-    /// example, after Bluetooth reset) the snapshot is stale and operations that require the live peripheral throw
-    /// this error.
+    /// Thrown from ``Peripheral/connect(autoReconnect:)`` and ``Peripheral/disconnect()`` when
+    /// the library holds no live `CBPeripheral` reference for this handle's ``Peripheral/id`` —
+    /// either the device has never been discovered, or its reference was invalidated (for
+    /// example, after a Bluetooth reset).
     case notFound
 
     /// Bluetooth is unavailable, so the operation could not be performed.
     ///
-    /// Thrown when a peripheral operation is attempted before the underlying `CBCentralManager` exists — for example,
-    /// because Bluetooth has not been authorized yet. Call ``ReliaBLEManager/authorizeBluetooth()`` and wait for a
-    /// ready state before retrying.
+    /// Thrown when a peripheral operation is attempted before the underlying `CBCentralManager`
+    /// exists — for example, because Bluetooth has not been authorized yet — **or** when the
+    /// ``ReliaBLEManager`` that vended the ``Peripheral`` handle has been deallocated or shut
+    /// down. Call ``ReliaBLEManager/authorizeBluetooth()`` and wait for a ready state before
+    /// retrying; if the manager is gone, create a new one and obtain a fresh handle.
     case bluetoothUnavailable
 
     /// The connection to the peripheral failed.
