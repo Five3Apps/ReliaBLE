@@ -643,12 +643,12 @@ swift test --filter ReliaBLETests.peripheralIdInternsSingleInstance
 swift test --filter ReliaBLETests.handleOrphansWhenManagerDeallocates
 
 # DocC gate — same invocation CI uses (.github/workflows/ci.yml:65-72)
-swift package --allow-writing-to-directory ./docs \
+swift package --allow-writing-to-directory ./user-docs \
   generate-documentation --target ReliaBLE \
   --disable-indexing \
   --transform-for-static-hosting \
   --hosting-base-path ReliaBLE \
-  --output-path ./docs \
+  --output-path ./user-docs \
   --warnings-as-errors
 ```
 
