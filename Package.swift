@@ -4,9 +4,16 @@ import PackageDescription
 
 let package = Package(
     name: "ReliaBLE",
+    // Every platform is pinned to the lowest OS version that ships the `Synchronization` module, because
+    // `Peripheral` and `PeripheralHandleRegistry` guard their mutable state with `Synchronization.Mutex`.
+    // Declaring each platform explicitly is what makes that safe: an undeclared platform would otherwise
+    // inherit SPM's default floor and fail on `import Synchronization`.
     platforms: [
         .iOS(.v18),
-        .macOS(.v10_15)
+        .macOS(.v15),
+        .tvOS(.v18),
+        .watchOS(.v11),
+        .visionOS(.v2)
     ],
     products: [
         .library(
