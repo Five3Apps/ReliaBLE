@@ -62,12 +62,15 @@ struct ReliaBLEManagerTests {
             // Compile-time proof that stream factories stay `nonisolated` — sync getters must not require `await`.
             let _: AsyncStream<BluetoothState> = manager.state
             let _: AsyncStream<PeripheralDiscoveryEvent> = manager.peripheralDiscoveries
-            let _: AsyncStream<[Peripheral]> = manager.discoveredPeripherals
+            let _: AsyncStream<[DiscoveredPeripheral]> = manager.discoveredPeripherals
             let _: AsyncStream<ConnectionStateChange> = manager.connectionStateChanges
+
+            // `peripheral(id:)` is synchronous and nonisolated — callable from any isolation domain.
+            _ = manager.peripheral(id: "unused")
+
             await manager.startScanning()
             await manager.startScanning(services: [])
             await manager.stopScanning()
-            try? await manager.connect(to: Peripheral(id: "unused"))
 
             // `authorizeBluetooth()` suspends until the authorization decision resolves; under the mock's
             // undetermined default that never happens, so drive it from a child task and cancel after a
@@ -81,9 +84,10 @@ struct ReliaBLEManagerTests {
     }
 
     @Test func peripheralIsSendable() async throws {
-        let peripheral = Peripheral(id: "sendable-id")
+        let manager = await Mock.makeManager()
+        let peripheral = manager.peripheral(id: "sendable-id")
 
-        // Capturing the value in a `Task.detached` closure is a compile-time proof that
+        // Capturing the class handle in a `Task.detached` closure is a compile-time proof that
         // `Peripheral` is `Sendable` — the closure crosses an isolation boundary.
         let capturedId = await Task.detached { peripheral.id }.value
 
@@ -106,25 +110,22 @@ struct ReliaBLEManagerTests {
         #expect(BluetoothState.unauthorized(.allowedAlways).description == "Unauthorized")
     }
 
-    @Test func peripheralEqualityAndHashKeyOnIDOnly() {
-        let a = Peripheral(id: "shared-id")
-        let b = Peripheral(id: "shared-id")
-        let c = Peripheral(id: "other-id")
+    @Test func peripheralIdInternsSingleInstance() async {
+        let manager = await Mock.makeManager()
 
-        // `init(id:)` leaves every discovery-populated field empty.
+        // Under interning, repeated calls with the same id return the identical object.
+        let a = manager.peripheral(id: "shared-id")
+        let b = manager.peripheral(id: "shared-id")
+        #expect(a === b)
+        #expect(a.id == "shared-id")
+        #expect(b.id == "shared-id")
+
+        // Fresh handle carries empty metadata.
         #expect(a.cbIdentifier == nil)
         #expect(a.name == nil)
         #expect(a.rssi == nil)
         #expect(a.lastSeen == nil)
         #expect(a.advertisement == nil)
-
-        // Equality and hashing key on `id` only.
-        #expect(a == b)
-        #expect(a != c)
-        #expect(a.hashValue == b.hashValue)
-
-        let set: Set<Peripheral> = [a, b, c]
-        #expect(set.count == 2)
     }
 
     @Test func advertisementDataExtractsTypedValues() {
@@ -327,14 +328,15 @@ struct ReliaBLEManagerTests {
 
         await manager.startScanning()
 
-        let peripheral = await Mock.waitForPeripheral(
+        let discovered = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        #expect(peripheral?.id == Mock.testPeripheralID)
-        #expect(peripheral?.advertisement?.localName == Mock.testPeripheralID)
-        #expect(peripheral?.cbIdentifier != nil)
+        #expect(discovered?.id == Mock.testPeripheralID)
+        // Preserve at least one assertion against snapshot fields — the snapshot the stream emitted.
+        #expect(discovered?.advertisement?.localName == Mock.testPeripheralID)
+        #expect(discovered?.cbIdentifier != nil)
 
         // The mock's connection-lifecycle peripheral advertises concurrently on the same shared
         // central, so filter for this test's peripheral rather than racing on whichever arrives first.
@@ -377,7 +379,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager)
 
         await manager.startScanning()
-        _ = await Mock.waitForPeripheral(
+        _ = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
@@ -408,7 +410,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager)
 
         await manager.startScanning()
-        _ = await Mock.waitForPeripheral(
+        _ = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
@@ -424,6 +426,93 @@ struct ReliaBLEManagerTests {
         #expect(await Mock.waitForState("Ready", on: manager))
     }
 
+    @Test func discoveredPeripheralSugarReturnsInternedHandle() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let snapshot = try #require(snap)
+        await manager.stopScanning()
+
+        // The `.peripheral` sugar returns the very same instance `peripheral(id:)` would.
+        let fromSugar = snapshot.peripheral
+        let fromManager = manager.peripheral(id: snapshot.id)
+        #expect(fromSugar === fromManager)
+        #expect(fromSugar.id == Mock.testPeripheralID)
+    }
+
+    @Test func knownIdHandleReceivesMetadataOnDiscovery() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        // Create the handle first — before any discovery.
+        let handle = manager.peripheral(id: Mock.testPeripheralID)
+        #expect(handle.rssi == nil)
+        #expect(handle.lastSeen == nil)
+        #expect(handle.advertisement == nil)
+
+        await manager.startScanning()
+        _ = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        await manager.stopScanning()
+
+        // The same instance now carries metadata from discovery.
+        #expect(handle.rssi != nil)
+        #expect(handle.lastSeen != nil)
+        #expect(handle.advertisement != nil)
+        #expect(handle.advertisement?.localName == Mock.testPeripheralID)
+    }
+
+    @Test func discoveredPeripheralsStreamElementType() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        await manager.startScanning()
+        _ = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        await manager.stopScanning()
+
+        // The replayed list element type is [DiscoveredPeripheral].
+        var iterator = manager.discoveredPeripherals.makeAsyncIterator()
+        let replayed: [DiscoveredPeripheral]? = await iterator.next()
+        #expect(replayed?.contains(where: { $0.id == Mock.testPeripheralID }) == true)
+    }
+
+    @Test func handleMetadataAppliedBeforeBroadcast() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let handle = manager.peripheral(id: Mock.testPeripheralID)
+        let stream = manager.discoveredPeripherals
+
+        await manager.startScanning()
+
+        // On the first element containing the test id, immediately assert the handle
+        // carries metadata — no polling, just a direct assertion after the element arrives.
+        var found = false
+        for await list in stream {
+            if list.contains(where: { $0.id == Mock.testPeripheralID }) {
+                #expect(handle.rssi != nil)
+                found = true
+                break
+            }
+        }
+        #expect(found)
+
+        await manager.stopScanning()
+    }
+
     // MARK: - Connection
 
     @Test func connectToDiscoveredPeripheralSucceeds() async throws {
@@ -431,7 +520,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager)
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let discovered = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
@@ -440,25 +529,64 @@ struct ReliaBLEManagerTests {
         // Stop scanning before any potential throw so leaked scan state can't affect later tests.
         await manager.stopScanning()
 
-        let discovered = try #require(peripheral)
+        let handle = try #require(discovered).peripheral
         // The live `CBPeripheral` is registered under this snapshot's id, so connect must not throw.
-        try await manager.connect(to: discovered)
+        try await handle.connect()
     }
 
     @Test func connectToUnknownPeripheralThrows() async throws {
         let manager = await Mock.makeManager()
-        let staleSnapshot = Peripheral(id: "never-discovered")
+        // ensureReady brings the central online so `.notFound` is deterministic.
+        await Mock.ensureReady(manager)
+        let handle = manager.peripheral(id: "never-discovered")
 
-        // Connecting to a peripheral that was never discovered must throw. Which `PeripheralError` is
-        // thrown depends on whether a central manager exists in the shared actor at the time: `.notFound`
-        // when it does (the id is simply not in the live registry) or `.bluetoothUnavailable` when it
-        // does not (Bluetooth was never set up). Either is a correct outcome.
         do {
-            try await manager.connect(to: staleSnapshot)
-            Issue.record("Expected connect(to:) to throw for an unknown peripheral")
+            try await handle.connect()
+            Issue.record("Expected connect() to throw for an unknown peripheral")
         } catch let error as PeripheralError {
-            #expect(error == .notFound || error == .bluetoothUnavailable)
+            #expect(error == .notFound)
         }
+    }
+
+    @Test func handleConnectDisconnectLifecycle() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        var changes = manager.connectionStateChanges.makeAsyncIterator()
+        await manager.bluetooth.updateState()
+
+        await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+
+        let connecting = await changes.next()
+        #expect(connecting?.peripheralId == handle.id)
+        #expect(connecting?.state == .connecting)
+        #expect(handle.connectionState == .connecting)
+
+        let connected = await changes.next()
+        #expect(connected?.peripheralId == handle.id)
+        #expect(connected?.state == .connected)
+        #expect(handle.connectionState == .connected)
+
+        try await handle.disconnect()
+
+        let disconnecting = await changes.next()
+        #expect(disconnecting?.state == .disconnecting)
+        #expect(handle.connectionState == .disconnecting)
+
+        let disconnected = await changes.next()
+        #expect(disconnected?.state == .disconnected(reason: nil))
+        #expect(handle.connectionState == .disconnected(reason: nil))
     }
 
     // MARK: - Logging
@@ -574,22 +702,22 @@ struct ReliaBLEManagerTests {
 
         // Discover the connectable test peripheral.
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let discovered = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(discovered).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         let connecting = await changes.next()
-        #expect(connecting?.peripheralId == discovered.id)
+        #expect(connecting?.peripheralId == handle.id)
         #expect(connecting?.state == .connecting)
 
         let connected = await changes.next()
-        #expect(connected?.peripheralId == discovered.id)
+        #expect(connected?.peripheralId == handle.id)
         #expect(connected?.state == .connected)
     }
 
@@ -603,28 +731,28 @@ struct ReliaBLEManagerTests {
         await manager.bluetooth.updateState()
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let discovered = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(discovered).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         // Drain .connecting and .connected.
         _ = await changes.next()
         _ = await changes.next()
 
-        try await manager.disconnect(from: discovered)
+        try await handle.disconnect()
 
         let disconnecting = await changes.next()
-        #expect(disconnecting?.peripheralId == discovered.id)
+        #expect(disconnecting?.peripheralId == handle.id)
         #expect(disconnecting?.state == .disconnecting)
 
         let disconnected = await changes.next()
-        #expect(disconnected?.peripheralId == discovered.id)
+        #expect(disconnected?.peripheralId == handle.id)
         #expect(disconnected?.state == .disconnected(reason: nil))
     }
 
@@ -641,12 +769,12 @@ struct ReliaBLEManagerTests {
         await manager.bluetooth.updateState()
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
         // Force a clean disconnection on the spec to reset any lingering
@@ -658,14 +786,14 @@ struct ReliaBLEManagerTests {
         // interfere with mock advertising while the previous stack tears down.
         Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         let connecting = await changes.next()
         let failed = await changes.next()
 
-        #expect(connecting?.peripheralId == discovered.id)
+        #expect(connecting?.peripheralId == handle.id)
         #expect(connecting?.state == .connecting)
-        #expect(failed?.peripheralId == discovered.id)
+        #expect(failed?.peripheralId == handle.id)
         #expect(failed?.state == .failed(reason: .connectionTimeout))
     }
 
@@ -683,15 +811,15 @@ struct ReliaBLEManagerTests {
         _ = await manager.currentConnectionStates
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         // Both subscribers see the .connecting event.
         let a1 = await subscriberA.next()
@@ -727,15 +855,15 @@ struct ReliaBLEManagerTests {
         await manager.bluetooth.updateState()
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         // Drain .connecting and .connected.
         let c1 = await changes.next()
@@ -767,7 +895,7 @@ struct ReliaBLEManagerTests {
         #expect(!libraryActive, "Expected no .library reconnect state, got \(states)")
 
         // Cleanup: explicit disconnect to cancel any pending reconnect state.
-        try? await manager.disconnect(from: discovered)
+        try? await handle.disconnect()
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
 
@@ -789,19 +917,19 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
         // Force a clean disconnection to reset any lingering mock state.
         Mock.connectionTestSpec.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 5_000_000_000)
         let states = events.map { $0.state }
@@ -850,7 +978,7 @@ struct ReliaBLEManagerTests {
 
         // Cleanup: the ladder has exhausted its attempts, but an explicit disconnect
         // removes the id from reconnectEnabled so no stray event can re-arm it.
-        try? await manager.disconnect(from: discovered)
+        try? await handle.disconnect()
         var cleanup = ReconnectPolicy()
         cleanup.maxAttempts = 0
         await manager.bluetooth.setReconnectPolicy(cleanup)
@@ -867,22 +995,22 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         // Drain .connecting and .connected.
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
 
         // Explicit disconnect.
-        try await manager.disconnect(from: discovered)
+        try await handle.disconnect()
 
         let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 3_000_000_000)
         let states = events.map { $0.state }
@@ -920,19 +1048,19 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
         // Force a clean disconnection to reset any lingering mock state.
         Mock.connectionTestSpec.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 5_000_000_000)
         let states = events.map { $0.state }
@@ -954,7 +1082,7 @@ struct ReliaBLEManagerTests {
 
         // Cleanup: cancel the pending reconnect task via explicit disconnect, then
         // prevent further arming so no stray reconnect fires during subsequent tests.
-        try? await manager.disconnect(from: discovered)
+        try? await handle.disconnect()
         var cleanup = ReconnectPolicy()
         cleanup.maxAttempts = 0
         await manager.bluetooth.setReconnectPolicy(cleanup)
@@ -977,17 +1105,17 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
         // Connect with autoReconnect: false — the OS option is NOT passed, and the
         // library ladder is NOT armed.
-        try await manager.connect(to: discovered, autoReconnect: false)
+        try await handle.connect(autoReconnect: false)
 
         // Drain .connecting and .connected.
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
@@ -995,7 +1123,7 @@ struct ReliaBLEManagerTests {
 
         // Inject an unexpected drop via the test hook (mock would emit isReconnecting: false anyway
         // since the OS option wasn't passed, but we use the hook for explicitness).
-        await manager.bluetooth.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
 
         let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 3_000_000_000)
         let states = events.map { $0.state }
@@ -1012,7 +1140,7 @@ struct ReliaBLEManagerTests {
         #expect(!hasReconnecting, "Expected no .reconnecting events when autoReconnect is false")
 
         // Cleanup: explicit disconnect and prevent further reconnect attempts.
-        try? await manager.disconnect(from: discovered)
+        try? await handle.disconnect()
         var cleanup = ReconnectPolicy()
         cleanup.maxAttempts = 0
         await manager.bluetooth.setReconnectPolicy(cleanup)
@@ -1029,25 +1157,25 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
         // Connect with autoReconnect: true (default). The library ladder is armed
         // and the OS option is passed. We inject an OS give-up (isReconnecting: false)
         // via the test hook to simulate the OS giving up on its own reconnect.
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         // Drain .connecting and .connected.
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
 
         // Inject OS give-up: isReconnecting: false unexpected disconnect.
-        await manager.bluetooth.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
 
         // Observe .disconnected(reason:).
         let c1 = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
@@ -1067,7 +1195,7 @@ struct ReliaBLEManagerTests {
         #expect(nextRetryAt != nil)
 
         // Cleanup: cancel the pending reconnect task via explicit disconnect.
-        try? await manager.disconnect(from: discovered)
+        try? await handle.disconnect()
         var cleanup = ReconnectPolicy()
         cleanup.maxAttempts = 0
         await manager.bluetooth.setReconnectPolicy(cleanup)
@@ -1093,21 +1221,21 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
 
         // Arm the library ladder, then cancel it mid-sleep with an explicit disconnect.
-        await manager.bluetooth.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
 
         let disconnected = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
         guard case .disconnected = disconnected?.state else {
@@ -1122,7 +1250,7 @@ struct ReliaBLEManagerTests {
         }
         #expect(attempt == 1)
 
-        try await manager.disconnect(from: discovered)
+        try await handle.disconnect()
 
         let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 1_000_000_000)
         let states = events.map(\.state)
@@ -1152,23 +1280,23 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connecting
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connected
 
         // Simulate an explicit disconnect that CoreBluetooth reports WITH a benign underlying error.
         // The contract is that an app-initiated disconnect reports `reason: nil` regardless.
-        await manager.bluetooth.testSeedIntentionalDisconnect(discovered.id)
+        await manager.bluetooth.testSeedIntentionalDisconnect(handle.id)
         await manager.bluetooth.testInjectDisconnect(
-            for: discovered.id,
+            for: handle.id,
             isReconnecting: false,
             error: NSError(domain: "test.explicit", code: 1)
         )
@@ -1202,20 +1330,20 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connecting
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connected
 
         // Unexpected drop arms the library ladder; scheduling must survive the non-finite delay.
-        await manager.bluetooth.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
 
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .disconnected
         let reconnecting = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
@@ -1225,7 +1353,7 @@ struct ReliaBLEManagerTests {
         }
         #expect(attempt == 1)
 
-        try await manager.disconnect(from: discovered)
+        try await handle.disconnect()
         await manager.bluetooth.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
@@ -1240,21 +1368,21 @@ struct ReliaBLEManagerTests {
         let changes = manager.connectionStateChanges
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
 
         // First unexpected drop → ladder attempt 1, then successful reconnect.
-        await manager.bluetooth.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
 
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .disconnected
         let firstLadder = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
@@ -1271,7 +1399,7 @@ struct ReliaBLEManagerTests {
         #expect(reconnectConnected?.state == .connected)
 
         // Second unexpected drop must start a fresh ladder at attempt 1, not continue at 2.
-        await manager.bluetooth.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
 
         _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .disconnected
         let secondLadder = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000)
@@ -1281,7 +1409,7 @@ struct ReliaBLEManagerTests {
         }
         #expect(secondAttempt == 1)
 
-        try? await manager.disconnect(from: discovered)
+        try? await handle.disconnect()
         await manager.bluetooth.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
@@ -1318,18 +1446,18 @@ struct ReliaBLEManagerTests {
         _ = await manager.currentConnectionStates
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
         Mock.connectionTestSpec.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
-        try await manager.connect(to: discovered)
+        try await handle.connect()
 
         // Exhaust the single-attempt ladder:
         // connecting → failed → reconnecting(1) → connecting → failed (give-up).
@@ -1359,7 +1487,7 @@ struct ReliaBLEManagerTests {
         }
 
         // Intent survives give-up: a later unexpected drop must arm a fresh ladder at attempt 1.
-        await manager.bluetooth.testInjectDisconnect(for: discovered.id, isReconnecting: false)
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
 
         let s5 = await changes.next()
         guard case .disconnected = s5?.state else {
@@ -1374,7 +1502,7 @@ struct ReliaBLEManagerTests {
         }
         #expect(a2 == 1)
 
-        try? await manager.disconnect(from: discovered)
+        try? await handle.disconnect()
         await manager.bluetooth.setReconnectPolicy(ReconnectPolicy(maxAttempts: 0))
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
@@ -1444,19 +1572,19 @@ struct ReliaBLEManagerTests {
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
         await manager1.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager1.stopScanning()
 
-        try await manager1.connect(to: discovered)
+        try await handle.connect()
         _ = await pollUntil(timeout: 3.0) {
-            await manager1.currentConnectionStates[discovered.id] == .connected
+            await manager1.currentConnectionStates[handle.id] == .connected
         }
-        #expect(await manager1.bluetooth.testPersistedReconnectIntent().contains(discovered.id))
+        #expect(await manager1.bluetooth.testPersistedReconnectIntent().contains(handle.id))
 
         // Cold relaunch: shut down stack 1. Central deinit may zero virtualConnections, so
         // re-mark the spec connected before install — persisted intent survives in UserDefaults.
@@ -1539,15 +1667,15 @@ struct ReliaBLEManagerTests {
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
         await manager1.startScanning()
-        let connectionPeripheral = await Mock.waitForPeripheral(
+        let connectionPeripheral = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
             withinNanoseconds: 3_000_000_000
         )
-        let connected = try #require(connectionPeripheral)
+        let connected = try #require(connectionPeripheral).peripheral
         await manager1.stopScanning()
 
-        try await manager1.connect(to: connected)
+        try await connected.connect()
         _ = await pollUntil(timeout: 3.0) {
             await manager1.currentConnectionStates[connected.id] == .connected
         }
@@ -1585,19 +1713,19 @@ struct ReliaBLEManagerTests {
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
         await manager1.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager1.stopScanning()
 
-        try await manager1.connect(to: discovered, autoReconnect: false)
+        try await handle.connect(autoReconnect: false)
         _ = await pollUntil(timeout: 3.0) {
-            await manager1.currentConnectionStates[discovered.id] == .connected
+            await manager1.currentConnectionStates[handle.id] == .connected
         }
-        #expect(!(await manager1.bluetooth.testPersistedReconnectIntent().contains(discovered.id)))
+        #expect(!(await manager1.bluetooth.testPersistedReconnectIntent().contains(handle.id)))
 
         await Mock.tearDown(manager1, resetMockConnections: false)
         Mock.connectionTestSpec.simulateConnection()
@@ -1644,17 +1772,17 @@ struct ReliaBLEManagerTests {
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
         await manager1.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager1.stopScanning()
 
-        try await manager1.connect(to: discovered)
+        try await handle.connect()
         _ = await pollUntil(timeout: 3.0) {
-            await manager1.currentConnectionStates[discovered.id] == .connected
+            await manager1.currentConnectionStates[handle.id] == .connected
         }
 
         await Mock.tearDown(manager1, resetMockConnections: false)
@@ -1688,6 +1816,40 @@ struct ReliaBLEManagerTests {
         CBMCentralManagerMock.simulatePowerOn()
         await manager2.bluetooth.testClearPersistedReconnectIntent()
         await Mock.tearDown(manager2)
+    }
+
+    @Test func invalidatePeripheralsClearsHandleConnectionStateButKeepsMetadata() async throws {
+        // The two halves of a radio reset pull in opposite directions, and the handle must honor both:
+        // last-known metadata survives (it is still the best thing known about the device), while connection
+        // state must NOT — a handle stuck reporting `.connected` after the library tore the connection down is
+        // not stale, it is false.
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        #expect(await pollUntil(timeout: 3.0) { handle.connectionState == .connected })
+
+        let priorName = handle.name
+        let priorRSSI = try #require(handle.rssi)
+
+        await manager.bluetooth.testInvalidatePeripherals()
+
+        #expect(handle.connectionState == nil)
+        #expect(await manager.currentConnectionStates[handle.id] == nil)
+        #expect(handle.name == priorName)
+        #expect(handle.rssi == priorRSSI)
     }
 
     @Test func willRestoreDefersScanUntilPoweredOn() async throws {
@@ -1731,23 +1893,61 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager)
 
         await manager.startScanning()
-        let peripheral = await Mock.waitForPeripheral(
+        let snap = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
             withinNanoseconds: 3_000_000_000
         )
-        let discovered = try #require(peripheral)
+        let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        #expect(await manager.currentConnectionStates[discovered.id] == nil)
-        #expect(!(await manager.bluetooth.testIsReconnectEnabled(discovered.id)))
+        #expect(await manager.currentConnectionStates[handle.id] == nil)
+        #expect(!(await manager.bluetooth.testIsReconnectEnabled(handle.id)))
 
-        await manager.bluetooth.testHandleWillRestoreState(peripheralIds: [discovered.id])
+        await manager.bluetooth.testHandleWillRestoreState(peripheralIds: [handle.id])
 
-        #expect(await manager.currentConnectionStates[discovered.id] == nil)
-        #expect(!(await manager.bluetooth.testIsReconnectEnabled(discovered.id)))
+        #expect(await manager.currentConnectionStates[handle.id] == nil)
+        #expect(!(await manager.bluetooth.testIsReconnectEnabled(handle.id)))
         // Live reference remains registered from discovery.
-        #expect(await manager.bluetooth.testContainsCBPeripheral(discovered.id))
+        #expect(await manager.bluetooth.testContainsCBPeripheral(handle.id))
+    }
+
+    @Test func restorePathInternsSameHandle() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        // Pre-create the handle — before any discovery or restore.
+        let handle = manager.peripheral(id: Mock.testPeripheralID)
+        #expect(handle.cbIdentifier == nil)
+
+        // First discover so live refs and prior metadata exist.
+        await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let discovered = try #require(snap)
+        await manager.stopScanning()
+        let priorRSSI = discovered.rssi
+        let priorAd = discovered.advertisement
+        #expect(handle.rssi != nil)
+
+        // Drive restore via the test hook — this re-binds the live CBPeripheral.
+        await manager.bluetooth.testHandleWillRestoreState(peripheralIds: [Mock.testPeripheralID])
+
+        // The same handle instance received cbIdentifier metadata from restore.
+        #expect(handle.cbIdentifier != nil)
+        #expect(await manager.bluetooth.testContainsCBPeripheral(Mock.testPeripheralID))
+
+        // Regression guard for the shared-helper merge rule: restoration carries no advertisement payload and no
+        // RSSI, so it must KEEP the values the earlier discovery established rather than wiping them. `#require`
+        // rather than `if let` — if discovery stopped producing these, the guard would silently pass and stop
+        // protecting anything.
+        let requiredRSSI = try #require(priorRSSI)
+        let requiredAd = try #require(priorAd)
+        #expect(handle.rssi == requiredRSSI)
+        #expect(handle.advertisement == requiredAd)
     }
 
     // MARK: - Multi-Manager Isolation
@@ -1773,7 +1973,7 @@ struct ReliaBLEManagerTests {
 
         // A discovers while B is idle — B's discovered list must stay empty.
         await managerA.startScanning()
-        let discoveredOnA = await Mock.waitForPeripheral(
+        let discoveredOnA = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: managerA,
             withinNanoseconds: 3_000_000_000
@@ -1786,7 +1986,7 @@ struct ReliaBLEManagerTests {
 
         // B discovers independently into its own maps.
         await managerB.startScanning()
-        let discoveredOnB = await Mock.waitForPeripheral(
+        let discoveredOnB = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: managerB,
             withinNanoseconds: 3_000_000_000
@@ -1797,15 +1997,15 @@ struct ReliaBLEManagerTests {
 
         // Connect only on A; B must not observe connection state for that peripheral.
         await managerA.startScanning()
-        let connectableA = await Mock.waitForPeripheral(
+        let connectableA = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: managerA,
             withinNanoseconds: 3_000_000_000
         )
-        let peripheralA = try #require(connectableA)
+        let peripheralA = try #require(connectableA).peripheral
         await managerA.stopScanning()
 
-        try await managerA.connect(to: peripheralA)
+        try await peripheralA.connect()
         #expect(await pollUntil(timeout: 3.0) {
             await managerA.currentConnectionStates[peripheralA.id] == .connected
         })
@@ -1854,6 +2054,46 @@ struct ReliaBLEManagerTests {
         await Mock.tearDown(managerB)
     }
 
+    @Test func twoManagersIndependentHandleRegistries() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let managerA = await Mock.makeManager(tearDownPrevious: true)
+        await Mock.ensureReady(managerA)
+
+        let managerB = await Mock.makeManager(tearDownPrevious: false)
+        await Mock.ensureReady(managerB)
+
+        // Same id string → two distinct handle instances.
+        let handleA = managerA.peripheral(id: Mock.testPeripheralID)
+        let handleB = managerB.peripheral(id: Mock.testPeripheralID)
+        #expect(handleA !== handleB)
+        #expect(handleA == handleB)
+        #expect(handleA.hashValue == handleB.hashValue)
+
+        let set: Set<Peripheral> = [handleA, handleB]
+        #expect(set.count == 1, "id-only equality means same-id handles from different managers count as one in a Set")
+
+        // Discover only on A.
+        await managerA.startScanning()
+        _ = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: managerA,
+            withinNanoseconds: 3_000_000_000
+        )
+        await managerA.stopScanning()
+
+        #expect(await managerA.bluetooth.testContainsCBPeripheral(Mock.testPeripheralID))
+        #expect(!(await managerB.bluetooth.testContainsCBPeripheral(Mock.testPeripheralID)))
+
+        // Only A's handle has live metadata.
+        #expect(handleA.rssi != nil)
+        #expect(handleB.rssi == nil)
+
+        await Mock.tearDown(managerA)
+        await Mock.tearDown(managerB)
+    }
+
     // MARK: - Event Stream Broadcaster
 
     @Test func stateStreamReplaysToConcurrentSubscribers() async throws {
@@ -1891,6 +2131,35 @@ struct ReliaBLEManagerTests {
 
         #expect(broadcastA != nil)
         #expect(broadcastB != nil)
+    }
+
+    @Test func handleOrphansWhenManagerDeallocates() async throws {
+        // This test is the retain-graph leak detector: if anything reachable from the
+        // actor holds the manager strongly, the manager won't deallocate and this fails.
+
+        let orphanedHandle: Peripheral = await Task {
+            let manager = await Mock.makeManager(tearDownPrevious: true)
+            let handle = manager.peripheral(id: "orphaned-by-deinit")
+            // Shut down the actor so every stream subscription ends — a live subscriber retains the actor by
+            // design, and the actor is the thing that would drag the manager along if the retain graph were wrong.
+            await manager.bluetooth.shutdown()
+            // Drop the harness's own strong reference; otherwise `activeManager` alone keeps the manager alive and
+            // this test would silently prove nothing.
+            Mock.releaseActiveManager()
+
+            return handle
+        }.value
+
+        // The manager has now fallen out of every scope that held it. If it deallocated, the handle's weak manager
+        // reference is nil and `connect()` reports `.bluetoothUnavailable`. Anything else — notably `.notFound`,
+        // which means the manager is somehow still alive and reachable — indicates something reachable from the
+        // actor is retaining the manager strongly, which is the leak this test exists to catch.
+        do {
+            try await orphanedHandle.connect()
+            Issue.record("Expected connect() on orphaned handle to throw")
+        } catch let error as PeripheralError {
+            #expect(error == .bluetoothUnavailable)
+        }
     }
 }
 
@@ -1989,6 +2258,16 @@ enum Mock {
     ///   they advertise again for the next test. Pass `false` for cold-relaunch so
     ///   `CBMPeripheralSpec.virtualConnections` stays set and `simulateStateRestoration` can
     ///   restore peripherals as `.connected`.
+    /// Drops the suite's strong reference to the active stack **without** shutting it down.
+    ///
+    /// ``makeManager(loggingEnabled:reconnectPolicy:restoreIdentifier:tearDownPrevious:)`` parks every manager it
+    /// creates in ``activeManager`` for serialized-suite teardown. That reference is a harness artifact, and it is
+    /// enough on its own to keep a manager alive — which would defeat any test that needs one to actually
+    /// deallocate. Call this to hand sole ownership back to the caller.
+    static func releaseActiveManager() {
+        activeManager = nil
+    }
+
     static func tearDown(_ manager: ReliaBLEManager, resetMockConnections: Bool = true) async {
         if resetMockConnections {
             connectionTestSpec.simulateDisconnection()
@@ -2167,12 +2446,12 @@ enum Mock {
     }
 
     /// Waits for `discoveredPeripherals` to contain a peripheral with the given `id`.
-    static func waitForPeripheral(
+    static func waitForDiscovered(
         id: String,
         on manager: ReliaBLEManager,
         withinNanoseconds nanoseconds: UInt64
-    ) async -> Peripheral? {
-        await withTaskGroup(of: Peripheral?.self) { group in
+    ) async -> DiscoveredPeripheral? {
+        await withTaskGroup(of: DiscoveredPeripheral?.self) { group in
             group.addTask {
                 for await list in manager.discoveredPeripherals {
                     if let match = list.first(where: { $0.id == id }) {
