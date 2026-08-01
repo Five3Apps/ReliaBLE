@@ -90,9 +90,12 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
 - FR-2.4: **Public type model:**
     - FR-2.4.1: **`Peripheral`** is a long-lived handle interned by id per manager. It is the unit of connection policy, GATT discovery filter, readiness, subscriptions, command queue, and Advanced connect/disconnect.
     - FR-2.4.2: **`DiscoveredPeripheral`** is a Sendable scan snapshot (advertisement metadata). It must not be the only way to obtain a `Peripheral`.
-    - FR-2.4.3: **`DiscoveredPeripheral.peripheral`** (or equivalent sugar) resolves to the interned handle via the vending manager (manager-stamped discovery).
+    - FR-2.4.3: **`DiscoveredPeripheral.peripheral`** (or equivalent sugar) resolves to the interned handle through the vending manager's registry. Repeated advertisements for the same device must resolve to the same handle, and a snapshot vended by one manager must never resolve against another manager's registry. The mechanism that carries the manager association is an implementation choice.
     - FR-2.4.4: **`manager.peripheral(id:)`** (or equivalent) creates or returns a handle for a known id before any advertisement is seen; later discovery binds the live radio to that handle.
-    - FR-2.4.5: Support a **tracked / “my devices”** view of handles with last-discovery metadata on `Peripheral` (rssi, lastSeen, optional last advertisement). Do not invent fake `DiscoveredPeripheral` entries for offline devices. Raw discovery streams remain for nearby/scanner UX.
+    - FR-2.4.5: Support a **tracked / “my devices”** view of handles built from last-discovery metadata on `Peripheral` (rssi, lastSeen, optional last advertisement). Do not invent fake `DiscoveredPeripheral` entries for offline devices. Raw discovery streams remain for nearby/scanner UX:
+        - FR-2.4.5.1: Last-discovery metadata is carried on the `Peripheral` handle itself and must be readable without awaiting the Bluetooth isolation domain, so a single long-lived object can back synchronous list rendering. This is the substrate the tracked view is built on.
+        - FR-2.4.5.2: A dedicated tracked-handles feed is **not** required. Apps may compose the view from `manager.peripheral(id:)` and `DiscoveredPeripheral.peripheral`, which is what keeps offline devices representable without fake discoveries. A first-class tracked feed remains open.
+        - FR-2.4.5.3: Because handle metadata mutates in place on a long-lived reference rather than arriving as fresh values, a **change-notification affordance is required for the view to update**. Until a first-class one exists, the documented contract is that the discovery stream doubles as the change signal and apps re-read handle metadata within it. A per-handle notification (e.g. a metadata-update stream, or the `PeripheralUpdate` shape in `docs/designs/discovered-peripheral-vs-peripheral-2026-07-15.md`) remains open; documentation must not present the interim contract as if the view self-updates.
     - FR-2.4.6: Do not use the public type name **`Device`** for library types (reserved for integrating apps, e.g. multi-transport).
     - FR-2.4.7: Never expose live CoreBluetooth objects (`CBPeripheral`, `CBService`, `CBCharacteristic`, etc.) in the public API.
 - FR-2.5: **API placement:** Connect, disconnect, discovery filter, readiness observation, subscriptions, and command `run` are exposed on **`Peripheral`**. `ReliaBLEManager` owns authorization, Bluetooth state, scanning start/stop, and handle registry. Manager-only connect as the primary documented path is a temporary milestone to be refactored away.
@@ -154,6 +157,7 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - FR-8.1.1: Allow scanning to be targeted at specific BLE services by providing UUIDs.
     - FR-8.1.2: Provide an API to start, stop, and update the list of services for which to scan, allowing dynamic adjustment during runtime.
     - FR-8.1.3: Option to enable reporting of every advertisement packet (discovery) for detailed tracking, which can be toggled on or off by the integrating app.
+    - FR-8.1.4: The per-advertisement feed is keyed by the CoreBluetooth peripheral identifier, which is deliberately **not** the app-facing peripheral identity used by `Peripheral` / `DiscoveredPeripheral`. This distinction must be documented in the public API. Correlating the raw feed to a handle is settled by FR-8.5.4.
 
 - FR-8.2: Support continuous scanning:
     - FR-8.2.1: Allow the library to scan continuously for BLE peripherals, providing real-time updates about nearby devices as **`DiscoveredPeripheral`** values (and/or equivalent), each resolvable to a `Peripheral` handle.
@@ -171,6 +175,7 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - FR-8.5.1: Provide an option for the integrating app to process manufacturing data to derive a unique identifier for each peripheral.
     - FR-8.5.2: Include an API method or property where the integrating app can return this identifier back to the library for more accurate peripheral identification and management.
     - FR-8.5.3: Once identified, maintain this mapping of the unique identifier to the peripheral's BLE address or other identifying characteristics to ensure consistent tracking across sessions or reconnections. Handle interning and discovery matching (FR-2.4, FR-10.6.2) must adopt this identity model when available.
+    - FR-8.5.4: Settle how the raw advertisement feed (FR-8.1.3, FR-8.1.4) correlates to the identity model — specifically whether `PeripheralDiscoveryEvent` (or equivalent) exposes the app-facing peripheral id alongside the CoreBluetooth identifier. This is deferred here deliberately: resolving it before FR-8.5 would bake in the interim name-derived identity (`name → localName → uuidString`) and force a second breaking change once manufacturer-data identity lands.
 
 - FR-8.6: Scanning respects FR-1.4 (await PoweredOn / fail terminal states)—no silent no-op when the radio is not ready.
 
