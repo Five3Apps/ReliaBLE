@@ -83,6 +83,10 @@ public struct DiscoveredPeripheral: Sendable, Identifiable, Hashable {
     /// the interning guarantee — alive, so `snapshot.peripheral === snapshot.peripheral` still holds. The handle's
     /// own manager reference is weak, so connecting through an orphaned snapshot fails cleanly with
     /// ``PeripheralError/bluetoothUnavailable`` rather than silently minting fresh handles.
+    ///
+    /// The guarantee is scoped to a registry generation. `BluetoothActor.shutdown()` empties the handle table, so a
+    /// handle resolved before a shutdown is *not* `===` the one re-minted after it. Interning still holds on either
+    /// side of that boundary; only identity across it is given up, along with the stack the handles belonged to.
     let registry: any PeripheralRegistryBridge
 
     /// The interned control handle for this peripheral, on the manager that produced the snapshot.

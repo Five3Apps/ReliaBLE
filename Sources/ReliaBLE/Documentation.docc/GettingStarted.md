@@ -127,7 +127,7 @@ You can monitor the ``ReliaBLEManager/state`` stream (as shown in the Authorizin
 While scanning, ReliaBLE surfaces results two ways:
 
 - ``ReliaBLEManager/peripheralDiscoveries`` emits a lightweight ``PeripheralDiscoveryEvent`` for every advertisement received — useful when you need to process individual advertisement packets.
-- ``ReliaBLEManager/discoveredPeripherals`` emits the current de-duplicated list of ``Peripheral`` values each time it changes.
+- ``ReliaBLEManager/discoveredPeripherals`` emits the current de-duplicated list of ``DiscoveredPeripheral`` snapshots each time it changes.
 
 Both are `AsyncStream`s. Each property access returns a *fresh, independent* stream, so multiple subscribers are supported by design — consume each with `for await`, typically inside a SwiftUI `.task { … }` (which cancels the loop automatically when the view disappears). ``ReliaBLEManager/state`` and ``ReliaBLEManager/discoveredPeripherals`` replay their latest value to every new subscriber; ``ReliaBLEManager/peripheralDiscoveries`` does **not** replay, so subscribe before you start scanning to avoid missing early advertisements. The discoveries feed is also bounded, so a subscriber that consumes slower than advertisements arrive drops the oldest pending events rather than growing memory without bound.
 
