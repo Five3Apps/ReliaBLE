@@ -1876,9 +1876,13 @@ struct ReliaBLEManagerTests {
         #expect(await pollUntil(timeout: 3.0) { handle.connectionState == .connected })
 
         // Subscribe before invalidating — `connectionStateChanges` has no replay, so a stream created afterwards
-        // would miss the very event under test. The actor hop guarantees registration completed.
+        // would miss the very event under test. Creating the stream only *enqueues* registration as an unstructured
+        // `Task`, and awaiting an unrelated actor method does not order the two, so wait until the subscriber is
+        // actually visible to the broadcast. Without this the test races invalidation and fails under CI load.
         let changes = manager.connectionStateChanges
-        await manager.bluetooth.updateState()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.bluetooth.testConnectionStateSubscriberCount() >= 1
+        })
 
         let id = handle.id
         let collector = Task { () -> ConnectionStateChange? in
