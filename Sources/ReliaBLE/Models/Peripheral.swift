@@ -143,6 +143,11 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
     /// example after Bluetooth is powered off and live references are invalidated), rather than reporting a state
     /// that is known to be false. As with the other cached properties there is no change notification — re-read it
     /// inside a ``ReliaBLEManager/connectionStateChanges`` loop.
+    ///
+    /// That loop is a complete tick: a clear emits ``ConnectionState/disconnected(reason:)`` carrying
+    /// ``PeripheralError/bluetoothUnavailable``, so re-reading on every event is sufficient and this property never
+    /// strands a stale `.connected`. Note the deliberate asymmetry — the event describes the transition that
+    /// happened, while the handle reports `nil` for "the library is no longer tracking this peripheral."
     public var connectionState: ConnectionState? { state.withLock { $0.connectionState } }
 
     // MARK: - Connection

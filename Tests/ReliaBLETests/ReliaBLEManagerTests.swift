@@ -1852,6 +1852,58 @@ struct ReliaBLEManagerTests {
         #expect(handle.rssi == priorRSSI)
     }
 
+    @Test func invalidatePeripheralsEmitsTerminalConnectionStateChange() async throws {
+        // Clearing tracked connection state is the one transition a subscriber cannot infer on its own: a cleared
+        // peripheral produces no further events, so without an explicit emit a UI driven only by
+        // `connectionStateChanges` renders `.connected` forever after a radio reset. The handle reverting to `nil`
+        // is not enough — nothing tells the app to go re-read it.
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        #expect(await pollUntil(timeout: 3.0) { handle.connectionState == .connected })
+
+        // Subscribe before invalidating — `connectionStateChanges` has no replay, so a stream created afterwards
+        // would miss the very event under test. The actor hop guarantees registration completed.
+        let changes = manager.connectionStateChanges
+        await manager.bluetooth.updateState()
+
+        let id = handle.id
+        let collector = Task { () -> ConnectionStateChange? in
+            for await change in changes
+            where change.peripheralId == id && change.state == .disconnected(reason: .bluetoothUnavailable) {
+                return change
+            }
+            return nil
+        }
+
+        await manager.bluetooth.testInvalidatePeripherals()
+
+        // Bound the wait: a regression that drops the emit must fail this test, not hang the suite.
+        let watchdog = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            collector.cancel()
+        }
+        let terminal = await collector.value
+        watchdog.cancel()
+
+        #expect(terminal?.state == .disconnected(reason: .bluetoothUnavailable))
+        // The event describes the transition; the handle reports "no longer tracked".
+        #expect(handle.connectionState == nil)
+    }
+
     @Test func willRestoreDefersScanUntilPoweredOn() async throws {
         // Direct-handler unit test: CoreBluetoothMock sets `isScanning = true` synchronously
         // inside central init when scan services are restored, so a faithful cold-relaunch cannot

@@ -1139,15 +1139,28 @@ actor BluetoothActor {
         broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
     }
 
-    /// Drops all tracked connection state, mirroring the clear onto every affected handle.
+    /// Drops all tracked connection state, mirroring the clear onto every affected handle and broadcasting a
+    /// terminal transition for each.
     ///
     /// A bare `connectionStates.removeAll()` would leave handles reporting a state the library no longer believes —
     /// a handle stuck on `.connected` after the radio was invalidated is worse than one reporting nothing, because
-    /// unlike the metadata properties it is not merely stale, it is known to be false. No change is broadcast:
-    /// clearing is not a per-peripheral transition, and neither caller broadcast one before.
+    /// unlike the metadata properties it is not merely stale, it is known to be false.
+    ///
+    /// Clearing is silent on the handle (``Peripheral/connectionState`` reverts to `nil`, meaning "not tracked")
+    /// but **not** on the stream: a subscriber that only ever learns about transitions from
+    /// `connectionStateChanges` would otherwise keep rendering `.connected` forever, since a cleared peripheral
+    /// produces no further events. `.disconnected(reason: .bluetoothUnavailable)` is emitted instead — true at the
+    /// moment it is sent, and the reason a consumer needs to react to.
+    ///
+    /// `shutdown()` also routes through here, but it finishes and drops every continuation first, so the broadcast
+    /// is a no-op there — a torn-down stack ends its streams rather than emitting a final state into them.
     private func clearConnectionStates() {
         for id in connectionStates.keys {
             registry.applyConnectionState(id: id, state: nil)
+            broadcast(
+                ConnectionStateChange(peripheralId: id, state: .disconnected(reason: .bluetoothUnavailable)),
+                to: connectionStateChangesContinuations
+            )
         }
         connectionStates.removeAll()
     }
