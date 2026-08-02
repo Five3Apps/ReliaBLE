@@ -554,8 +554,9 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
+        let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
         var changes = manager.connectionStateChanges.makeAsyncIterator()
-        await manager.bluetooth.updateState()
+        #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
@@ -696,9 +697,9 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
+        let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
         var changes = manager.connectionStateChanges.makeAsyncIterator()
-        // Force an actor hop so registration completes before we connect.
-        await manager.bluetooth.updateState()
+        #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         // Discover the connectable test peripheral.
         await manager.startScanning()
@@ -727,8 +728,9 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
+        let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
         var changes = manager.connectionStateChanges.makeAsyncIterator()
-        await manager.bluetooth.updateState()
+        #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         await manager.startScanning()
         let discovered = await Mock.waitForDiscovered(
@@ -765,8 +767,9 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
+        let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
         var changes = manager.connectionStateChanges.makeAsyncIterator()
-        await manager.bluetooth.updateState()
+        #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
@@ -851,8 +854,9 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager)
         await manager.bluetooth.setReconnectPolicy(Self.testReconnectPolicy)
 
+        let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
         var changes = manager.connectionStateChanges.makeAsyncIterator()
-        await manager.bluetooth.updateState()
+        #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
@@ -1876,13 +1880,10 @@ struct ReliaBLEManagerTests {
         #expect(await pollUntil(timeout: 3.0) { handle.connectionState == .connected })
 
         // Subscribe before invalidating — `connectionStateChanges` has no replay, so a stream created afterwards
-        // would miss the very event under test. Creating the stream only *enqueues* registration as an unstructured
-        // `Task`, and awaiting an unrelated actor method does not order the two, so wait until the subscriber is
-        // actually visible to the broadcast. Without this the test races invalidation and fails under CI load.
+        // would miss the very event under test, and creating one only *enqueues* registration.
+        let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
         let changes = manager.connectionStateChanges
-        #expect(await pollUntil(timeout: 3.0) {
-            await manager.bluetooth.testConnectionStateSubscriberCount() >= 1
-        })
+        #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         let id = handle.id
         let collector = Task { () -> ConnectionStateChange? in
@@ -2498,6 +2499,23 @@ enum Mock {
     static func waitForState(_ description: String, on manager: ReliaBLEManager, timeout: Double = 3.0) async -> Bool {
         await pollUntil(timeout: timeout) {
             await manager.currentState.description == description
+        }
+    }
+
+    /// Waits until a `connectionStateChanges` subscription created after `baseline` is visible to the actor.
+    ///
+    /// The stream factory is `nonisolated` and dispatches `register(...)` as an unstructured `Task`, so awaiting
+    /// any *other* actor method does not order the two jobs — it only proves that unrelated method ran. Because
+    /// this feed never replays, a test that triggers its transition before the subscription lands misses the event
+    /// outright. The failure mode is a silent timeout that only appears under load, so prefer this over any
+    /// incidental "force an actor hop" call.
+    static func waitForConnectionSubscription(
+        on manager: ReliaBLEManager,
+        above baseline: Int,
+        timeout: Double = 3.0
+    ) async -> Bool {
+        await pollUntil(timeout: timeout) {
+            await manager.bluetooth.testConnectionStateSubscriberCount() > baseline
         }
     }
 
