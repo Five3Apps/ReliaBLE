@@ -1,6 +1,6 @@
 # ReliaBLE
 
-[![CI](https://github.com/Five3Apps/ReliaBLE/actions/workflows/ci.yml/badge.svg)](https://github.com/Five3Apps/ReliaBLE/actions/workflows/ci.yml)
+[![CI](https://github.com/Five3Apps/ReliaBLE/actions/workflows/ci.yml/badge.svg)](https://github.com/Five3Apps/ReliaBLE/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/Five3Apps/ReliaBLE/branch/master/graph/badge.svg)](https://codecov.io/gh/Five3Apps/ReliaBLE)
 
 A reliable, modern, and easy-to-use Swift package for apps that talk to Bluetooth Low Energy (BLE) peripherals.
 

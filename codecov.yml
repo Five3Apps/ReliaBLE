@@ -1,0 +1,25 @@
+# Codecov configuration for ReliaBLE.
+#
+# Coverage is measured for the library sources only. The CI workflow already
+# filters test files, the Demo app, and dependencies out of the uploaded lcov
+# report via llvm-cov's -ignore-filename-regex; the ignore list below is a
+# second line of defence so those paths never count toward coverage even if the
+# export filter changes.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: auto
+
+ignore:
+  - "Tests"
+  - "Demo"
+  - "**/.build/**"
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true

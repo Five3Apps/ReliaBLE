@@ -37,7 +37,31 @@ jobs:
         run: swift build
 
       - name: Test
-        run: swift test
+        run: swift test --enable-code-coverage
+
+      # Export coverage as lcov, restricted to library sources. The
+      # -ignore-filename-regex drops test files, the Demo app, and all
+      # dependency/build-artifact code so the badge reflects library coverage
+      # only. Paths are absolute in llvm-cov output, so these fragments match
+      # anywhere in the checkout.
+      - name: Export code coverage
+        run: |
+          BIN_PATH="$(swift build --show-bin-path)"
+          XCTEST="$(find "${BIN_PATH}" -maxdepth 1 -name '*.xctest' | head -1)"
+          COV_BIN="${XCTEST}/Contents/MacOS/$(basename "${XCTEST}" .xctest)"
+          xcrun llvm-cov export \
+            -format=lcov \
+            -instr-profile "${BIN_PATH}/codecov/default.profdata" \
+            "${COV_BIN}" \
+            -ignore-filename-regex='(\.build|Tests|Demo)/' \
+            > coverage.lcov
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   docc:
     name: DocC catalog
