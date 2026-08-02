@@ -71,7 +71,8 @@ protocol PeripheralRegistryBridge: Sendable {
     /// Interns the handle for `id` if needed, then mirrors a connection-state transition onto it.
     ///
     /// A `nil` state means the library no longer tracks a connection state for `id` — pass it when the actor's
-    /// tracking is cleared, so a handle cannot keep reporting a state that is known to be false.
+    /// tracking is cleared, so a handle cannot keep reporting a state that is known to be false. Clearing is the
+    /// one case that does **not** intern: it corrects an existing handle if there is one, and is otherwise a no-op.
     func applyConnectionState(id: String, state: ConnectionState?)
 
     /// Drops every interned handle. Called from terminal teardown only.
@@ -87,6 +88,19 @@ protocol PeripheralRegistryBridge: Sendable {
 ///
 /// There is deliberately **no** process-global registry. Each manager is an independent BLE stack, so two managers
 /// mean two registries and two distinct handles for the same physical device.
+///
+/// ## Growth
+///
+/// Handles are held **strongly** and keyed by resolved id, and every discovery interns one — including for devices
+/// the app never asks about. Nothing evicts them: `BluetoothActor.shutdown()` empties the table, but that is
+/// test/harness teardown, so in a shipping app **the registry retains one handle per distinct id observed for the
+/// lifetime of the manager**. A long-running background scan in a dense RF environment is therefore the case to
+/// watch; each entry is small (an id plus last-known metadata) and bounded by the number of distinct devices seen,
+/// not by advertisement volume.
+///
+/// Weak-value storage (`[String: WeakBox<Peripheral>]` with prune-on-insert) is the known stronger answer —
+/// interning identity would then last exactly as long as the app holds a reference — and is deferred rather than
+/// rejected. Revisit it if the observed-device count per session becomes unbounded in practice.
 ///
 /// ## Retain graph
 ///
@@ -170,8 +184,17 @@ final class PeripheralHandleRegistry: PeripheralRegistryBridge, Sendable {
     }
 
     func applyConnectionState(id: String, state: ConnectionState?) {
-        let handle = peripheral(id: id)
+        // A clear is the one case that must not intern. Minting a handle purely to write `nil` onto it would grow
+        // the table with entries nobody requested and nobody can observe — a handle created later reads `nil`
+        // anyway. A real state, by contrast, must intern: a handle obtained after the transition has to report it
+        // rather than diverge from the actor's tracking.
+        guard let handle = state == nil ? existingHandle(id: id) : peripheral(id: id) else { return }
         handle.applyConnectionState(state)
+    }
+
+    /// Returns the handle for `id` only if one has already been interned, without creating one.
+    private func existingHandle(id: String) -> Peripheral? {
+        storage.withLock { $0.handles[id] }
     }
 
     /// Drops every interned handle. Called from `BluetoothActor.shutdown()`.
