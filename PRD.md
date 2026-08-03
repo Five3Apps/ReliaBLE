@@ -31,7 +31,7 @@ The library is **unshipped** and under active development. This PRD is the **v1 
 | Type | Role |
 |---|---|
 | **`ReliaBLEManager`** | Façade: authorization, Bluetooth state, scanning, peripheral registry, configuration. |
-| **`Peripheral`** | Long-lived **control handle**, interned by id per manager. Primary type for wearables/IoT: sticky discovery filter, connection/readiness, command queue, Advanced connect/disconnect, last-seen / last-advertisement metadata. |
+| **`Peripheral`** | Long-lived **control handle**, interned by id per manager. Primary type for wearables/IoT: sticky discovery filter, connection/readiness, command queue, Manual connect/disconnect, last-seen / last-advertisement metadata. |
 | **`DiscoveredPeripheral`** | Sendable **scan snapshot** (advertisement, rssi, lastSeen, id, …). Manager-stamped. Exposes **`peripheral`** syntactic sugar resolving to the interned `Peripheral` handle. |
 
 - Live `CBPeripheral` / GATT objects remain inside the library’s Bluetooth isolation domain only.
@@ -44,12 +44,12 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
 
 ### Connection model (work-driven primary)
 
-- **Primary path:** work drives the link. A non-empty per-`Peripheral` command queue causes auto-connect (and discovery to *ready* when required). When the queue is empty and there is no Advanced app hold, start **idle disconnect** (global config, **default 5 seconds**).
-- **Advanced app hold:** `Peripheral.connect(autoReconnect:)` / `disconnect()` suppress idle teardown while held. Documented as Advanced; expected to be rare. Same ensure-linked path as work-driven connect—not a second connection stack or either-or mode enum.
+- **Primary path:** work drives the link. A non-empty per-`Peripheral` command queue causes auto-connect (and discovery to *ready* when required). When the queue is empty and there is no manual-connect hold, start **idle disconnect** (global config, **default 5 seconds**).
+- **Manual connect:** `Peripheral.connect(autoReconnect:)` / `disconnect()` set a manual-connect hold that suppresses idle teardown while held. Documented as Advanced; expected to be rare. Same ensure-linked path as work-driven connect—not a second connection stack or either-or mode enum.
 - **Reconnect (Approach B):**
   - **Tier-0** (OS `CBConnectPeripheralOptionEnableAutoReconnect`): enabled on work-driven connects while the link is up; **ended** when idle teardown or intentional disconnect cancels the connection.
-  - **Tier-1** (library exponential-backoff ladder): armed on unexpected disconnect **only while** the command queue is non-empty (or Advanced hold with reconnect desired). Disarmed when the queue is empty and there is no such hold.
-  - Accepted gap: during the idle grace window, Tier-0 may reconnect once with an empty queue; if still quiet and no hold, cancel again.
+  - **Tier-1** (library exponential-backoff ladder): armed on unexpected disconnect **only while** the command queue is non-empty (or a manual-connect hold with reconnect desired). Disarmed when the queue is empty and there is no such hold.
+  - Accepted gap: during the idle grace window, Tier-0 may reconnect once with an empty queue; if still quiet and no manual-connect hold, cancel again.
 - **PoweredOn:** work submission (scan, connect, command/`run`) **awaits** a usable radio (`PoweredOn`) rather than silently no-op’ing. Terminal states (unauthorized, unsupported, powered off per policy) **fail** promptly with typed errors. Bluetooth state remains observable for UI gating.
 - Manager-level `connect(to:)` as the primary app API is a **refactor target**: connect/disconnect/run/discovery belong on **`Peripheral`**.
 
@@ -71,24 +71,24 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
 1. Reliability of Communication:
 
 - FR-1.1: Implement error detection and correction mechanisms for each BLE transaction (command/watchdog layer; builds on FR-4/FR-5 after FR-10).
-- FR-1.2: Ensure automatic reconnection per the connection model (Approach B: Tier-0 while linked on work-driven connects; Tier-1 ladder with exponential backoff while work is pending or Advanced hold requests reconnect). On reconnection, services and characteristics must be re-discovered rather than reused, as part of returning to a discovery-*ready* state (FR-10.6, FR-10.3); a re-established link alone is not sufficient to resume characteristic I/O. Command-layer reconnect-and-rerun (FR-4/FR-5) depends on this ready transition rather than treating "connected again" as enough. (Tier-1 backoff substrate exists; queue/hold gating, idle cancel of Tier-0, and discovery re-run remain open.)
+- FR-1.2: Ensure automatic reconnection per the connection model (Approach B: Tier-0 while linked on work-driven connects; Tier-1 ladder with exponential backoff while work is pending or a manual-connect hold requests reconnect). On reconnection, services and characteristics must be re-discovered rather than reused, as part of returning to a discovery-*ready* state (FR-10.6, FR-10.3); a re-established link alone is not sufficient to resume characteristic I/O. Command-layer reconnect-and-rerun (FR-4/FR-5) depends on this ready transition rather than treating "connected again" as enough. (Tier-1 backoff substrate exists; queue/hold gating, idle cancel of Tier-0, and discovery re-run remain open.)
 - FR-1.3: Provide status updates on connection stability and data transmission integrity.
     - ✅ FR-1.3.1: Provide status updates on connection stability (e.g. connected, disconnected, reconnecting), exposed in a device-centric way on `Peripheral` (and/or equivalent streams) as the type model lands.
     - FR-1.3.2: Provide status updates on data transmission integrity (command/transaction layer).
 - FR-1.4: **PoweredOn gating for work:** Scan, connect, and command submission must await `PoweredOn` (or equivalent usable state) instead of silently no-op’ing when the radio is not ready. Terminal unusable states fail with typed errors. Observability of Bluetooth state for UI remains required.
-- FR-1.5: **Idle disconnect:** When a `Peripheral` has no pending/queued commands and no Advanced app hold, disconnect after a configurable idle interval. Default interval is **5 seconds**. Configuration is **global** (not per-peripheral) unless a future requirement explicitly adds per-device overrides.
+- FR-1.5: **Idle disconnect:** When a `Peripheral` has no pending/queued commands and no manual-connect hold, disconnect after a configurable idle interval. Default interval is **5 seconds**. Configuration is **global** (not per-peripheral) unless a future requirement explicitly adds per-device overrides.
 
 
 2. Public Interface for Easy Integration:
 
 - FR-2.1: Design a clear, documented API for developers to interact with BLE functionality without UI components, centered on **`Peripheral`** for device work and **`ReliaBLEManager`** for process-wide concerns (auth, scan, registry).
-- FR-2.2: Include example usage showing: known-id `Peripheral`, scan → `DiscoveredPeripheral.peripheral`, work-driven `run` (when commands exist), Advanced connect, and discovery readiness—without requiring CoreBluetooth expertise.
+- FR-2.2: Include example usage showing: known-id `Peripheral`, scan → `DiscoveredPeripheral.peripheral`, work-driven `run` (when commands exist), Manual connect, and discovery readiness—without requiring CoreBluetooth expertise.
 - FR-2.3: Provide streams (or equivalent) for asynchronous events:
     - ✅ FR-2.3.1: Connection-state changes (connection, disconnection, connection failure / reconnecting). Migrate primary consumption to `Peripheral` as the handle model lands.
     - FR-2.3.2: Data received from peripherals (command/notify path after FR-4/FR-10).
     - FR-2.3.3: Discovery/readiness changes distinct from connection state (FR-10.3.2).
 - FR-2.4: **Public type model:**
-    - FR-2.4.1: **`Peripheral`** is a long-lived handle interned by id per manager. It is the unit of connection policy, GATT discovery filter, readiness, subscriptions, command queue, and Advanced connect/disconnect.
+    - FR-2.4.1: **`Peripheral`** is a long-lived handle interned by id per manager. It is the unit of connection policy, GATT discovery filter, readiness, subscriptions, command queue, and Manual connect/disconnect.
     - ✅ FR-2.4.2: **`DiscoveredPeripheral`** is a Sendable scan snapshot (advertisement metadata). It must not be the only way to obtain a `Peripheral`.
     - ✅ FR-2.4.3: **`DiscoveredPeripheral.peripheral`** (or equivalent sugar) resolves to the interned handle through the vending manager's registry. Repeated advertisements for the same device must resolve to the same handle, and a snapshot vended by one manager must never resolve against another manager's registry. The mechanism that carries the manager association is an implementation choice.
     - ✅ FR-2.4.4: **`manager.peripheral(id:)`** (or equivalent) creates or returns a handle for a known id before any advertisement is seen; later discovery binds the live radio to that handle.
@@ -120,7 +120,7 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - FR-4.2.3: Read-write (both read from and write to peripherals).
     - FR-4.2.4: Write-only (send data to peripherals).
 - FR-4.3: Implement parsing of responses from peripherals into a usable Swift data structure (app-supplied decode as appropriate).
-- FR-4.4: **Work-driven link:** Enqueueing/running a command on a disconnected `Peripheral` must auto-connect (and run discovery to ready as needed) without requiring a prior Advanced `connect`, unless product policy for never-seen ids chooses fail-fast (implementation planning).
+- FR-4.4: **Work-driven link:** Enqueueing/running a command on a disconnected `Peripheral` must auto-connect (and run discovery to ready as needed) without requiring a prior Manual `connect`, unless product policy for never-seen ids chooses fail-fast (implementation planning).
 - FR-4.5: **Reconnect-and-rerun:** On unexpected disconnect with commands still queued or in flight, after link recovery and return to discovery-*ready*, retry/resume command execution so transient drops do not require the app to re-drive the queue (idempotent command design preferred).
 - FR-4.6: **Exactly-once completion:** Each command finishes with a single terminal success or failure (no double completion).
 - FR-4.7: **Watchdogs:** Enforce per-step (or per-command) timeouts; streaming/multi-frame commands may reset the watchdog per frame as specified in implementation.
@@ -194,7 +194,7 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - Command successes or failures
     - ✅ Scanning start/stop
     - Service/characteristic discovery events (discovery start/completion/failure, readiness transitions, GATT table changes, subscription state changes)
-    - Idle connect/disconnect and Advanced hold connect/disconnect
+    - Idle connect/disconnect and Manual connect/disconnect
     - Security events (e.g., encryption initiation or failure)
     - Data chunking operations
 
@@ -258,10 +258,10 @@ only where the gate must be honored.
 
 11. Connection Lifecycle on `Peripheral`:
 
-- FR-11.1: **Work-driven connect:** When work requires a link (non-empty command queue, or other library-defined work that needs a connection), the library connects the `Peripheral` without a prior Advanced `connect` call.
-- FR-11.2: **Advanced app hold:** `Peripheral.connect(autoReconnect: Bool)` sets an app hold (suppresses idle teardown). `Peripheral.disconnect()` clears the hold and intentionally cancels the connection. The `autoReconnect` flag controls whether Tier-0/Tier-1 apply for that hold, consistent with Approach B. Primary docs emphasize work-driven usage; hold APIs are Advanced.
-- FR-11.3: **Idle teardown:** Per FR-1.5—only when queue empty and no app hold; cancel connection (drops Tier-0).
-- FR-11.4: **Single state machine:** Work-driven connect and Advanced connect share one ensure-linked implementation (PoweredOn await, connect, discover to ready). No parallel connection stacks.
+- FR-11.1: **Work-driven connect:** When work requires a link (non-empty command queue, or other library-defined work that needs a connection), the library connects the `Peripheral` without a prior Manual `connect` call.
+- FR-11.2: **Manual connect:** `Peripheral.connect(autoReconnect: Bool)` sets a manual-connect hold (suppresses idle teardown). `Peripheral.disconnect()` clears the hold and intentionally cancels the connection. The `autoReconnect` flag controls whether Tier-0/Tier-1 apply for that hold, consistent with Approach B. Primary docs emphasize work-driven usage; the manual-connect APIs are documented as Advanced.
+- FR-11.3: **Idle teardown:** Per FR-1.5—only when queue empty and no manual-connect hold; cancel connection (drops Tier-0).
+- FR-11.4: **Single state machine:** Work-driven connect and Manual connect share one ensure-linked implementation (PoweredOn await, connect, discover to ready). No parallel connection stacks.
 - FR-11.5: Connection-state observation remains available (FR-1.3.1) and must distinguish intentional disconnect, unexpected drop, and reconnecting where applicable.
 
 
@@ -295,7 +295,7 @@ only where the gate must be honored.
 5. Documentation:
 
 - NFR-5.1: Provide comprehensive documentation for all public APIs, including usage examples, parameters, return values, error handling, command types, discovery readiness, and chunking.
-- NFR-5.2: Getting Started emphasizes work-driven `Peripheral` usage for wearables/IoT; Advanced section covers app-hold connect/disconnect and raw scanner flows.
+- NFR-5.2: Getting Started emphasizes work-driven `Peripheral` usage for wearables/IoT; Advanced section covers Manual connect/disconnect and raw scanner flows.
 - NFR-5.3: Document OS GATT cache / Service Changed limitations (FR-10.5.3) for integrating apps and firmware partners.
 
 

@@ -41,7 +41,7 @@ That was a good milestone for **scan lists + Swift 6 safety**. It is an awkward 
 - readiness / subscription intent,
 - a per-device command queue,
 - work-driven auto-connect and idle teardown,
-- Advanced explicit `connect`/`disconnect` (“app hold”).
+- Manual explicit `connect`/`disconnect` (the manual-connect hold).
 
 ### Two jobs that fight each other
 
@@ -129,7 +129,7 @@ DiscoveredPeripheral  (Sendable value)
 Peripheral  (long-lived handle, interned by id)
   ├── discoveryFilter (sticky; FR-10)
   ├── run(command) / ready / connection streams
-  ├── Advanced connect(autoReconnect:) / disconnect()
+  ├── Manual connect(autoReconnect:) / disconnect()
   └── lastSeen / rssi / lastAdvertisement?        // option A metadata for “my devices” UI
 ```
 
@@ -185,7 +185,7 @@ Whether `run` on a never-seen handle **implicitly scans until match** vs **fails
 
 For full connection/reconnect/FR-10 discussion see the investigation doc. Short version:
 
-- **Work-driven default:** non-empty command queue → auto-connect; idle teardown (global default 5s) when quiet; Advanced `connect` is rare **app hold**.
+- **Work-driven default:** non-empty command queue → auto-connect; idle teardown (global default 5s) when quiet; Manual `connect` is the rare **manual-connect hold**.
 - **FR-10:** GATT discovery/readiness on **`Peripheral`**; sticky UUID filter on the handle; **connected ≠ ready**.
 - **Commands (after FR-10):** `peripheral.run(...)`; serial per-device queue; reconnect-and-rerun after ready.
 

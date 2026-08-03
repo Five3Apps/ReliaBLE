@@ -87,7 +87,7 @@ Handle instances are interned in a **manager-owned** `PeripheralHandleRegistry`,
 
 ### What blocks the PRD shape today
 
-- An immutable snapshot struct cannot own a sticky discovery filter, a command queue, an Advanced connection hold, or stable reference identity for a "my devices" list.
+- An immutable snapshot struct cannot own a sticky discovery filter, a command queue, a manual-connect hold, or stable reference identity for a "my devices" list.
 - Manager-primary `connect(to:)` teaches the wrong API (FR-2.5 calls it a temporary milestone).
 - There is no registry, so known-id-before-scan (`Peripheral(id:)` today) produces an orphan value that can only fail.
 - `DiscoveredPeripheral` and the `.peripheral` sugar don't exist.

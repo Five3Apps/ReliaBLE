@@ -7,7 +7,7 @@
 
 ReliaBLE is the modern, improved equivalent of the ObjC **Core** layer (`CCBTCentralManager` / `CCBTPeripheral` / `CCBTCommand`). The reference protocol facade and app layers are **usage context**, not something ReliaBLE should re-implement. The PRD is the v1 target; the library is unshipped and not intended for use before PRD completion.
 
-**Shipped code today** is a strong **link manager** (scan, multi-device connect, two-tier reconnect, lifecycle streams, background restore). The ObjC reliability moat was **PoweredOn gate → demand-driven connect → discovery readiness → serial command queue → pause/reconnect/rerun**. PR #47 specifies the discovery gate (FR-10). Commands (FR-4/5) follow FR-10. Product direction re-centers **work-driven connection as the only primary model**: non-empty command queue drives auto-connect; idle teardown when the queue is empty. Reconnect is **Approach B**: Tier-0 (OS) enabled while the work-driven link is up, cancelled on idle teardown; Tier-1 armed only while work is pending. Explicit `connect()`/`disconnect()` is an **Advanced app-hold** path (rarely used), not an either-or policy mode. Public device model is **two types**: long-lived **`Peripheral`** (control handle; primary for wearables/IoT) and value **`DiscoveredPeripheral`** (scan snapshot; manager-stamped `.peripheral` sugar). Not `manager.connect(id:)` as the primary API. See also `docs/designs/discovered-peripheral-vs-peripheral-2026-07-15.md`.
+**Shipped code today** is a strong **link manager** (scan, multi-device connect, two-tier reconnect, lifecycle streams, background restore). The ObjC reliability moat was **PoweredOn gate → demand-driven connect → discovery readiness → serial command queue → pause/reconnect/rerun**. PR #47 specifies the discovery gate (FR-10). Commands (FR-4/5) follow FR-10. Product direction re-centers **work-driven connection as the only primary model**: non-empty command queue drives auto-connect; idle teardown when the queue is empty. Reconnect is **Approach B**: Tier-0 (OS) enabled while the work-driven link is up, cancelled on idle teardown; Tier-1 armed only while work is pending. Explicit `connect()`/`disconnect()` is a **Manual connect** path (rarely used), not an either-or policy mode. Public device model is **two types**: long-lived **`Peripheral`** (control handle; primary for wearables/IoT) and value **`DiscoveredPeripheral`** (scan snapshot; manager-stamped `.peripheral` sugar). Not `manager.connect(id:)` as the primary API. See also `docs/designs/discovered-peripheral-vs-peripheral-2026-07-15.md`.
 
 **Full PRD + agreed product direction clears (and in places exceeds) the ObjC Core bar**, provided FR-10, work-driven default, and command reconnect-and-rerun actually ship. Framing/CRC stay app-owned by design (OSS multi-device).
 
@@ -18,9 +18,9 @@ ReliaBLE is the modern, improved equivalent of the ObjC **Core** layer (`CCBTCen
 | Topic | Decision |
 |---|---|
 | **Layering** | ReliaBLE = modern Core only. Protocol/app layers in ObjC are context for how Core is consumed. |
-| **Connection model** | **Work-driven only as the primary path:** auto-connect when the command queue is non-empty; idle teardown when empty. **Reconnect Approach B:** work-driven connects pass Tier-0 (OS auto-reconnect) while linked; idle teardown / intentional cancel drops OS reconnect; Tier-1 armed only while queue non-empty (exact “no work ⇒ no library ladder”). Explicit `connect(autoReconnect:)` / `disconnect()` is **Advanced app-hold** (docs only; rarely used): same ensure-linked path, suppresses idle while held; `autoReconnect` Bool remains on explicit `connect`. **No either-or `ConnectionPolicy.mode`.** |
+| **Connection model** | **Work-driven only as the primary path:** auto-connect when the command queue is non-empty; idle teardown when empty. **Reconnect Approach B:** work-driven connects pass Tier-0 (OS auto-reconnect) while linked; idle teardown / intentional cancel drops OS reconnect; Tier-1 armed only while queue non-empty (exact “no work ⇒ no library ladder”). Explicit `connect(autoReconnect:)` / `disconnect()` is **Manual connect** (docs only; rarely used): same ensure-linked path, suppresses idle while held; `autoReconnect` Bool remains on explicit `connect`. **No either-or `ConnectionPolicy.mode`.** |
 | **Connect API placement** | Hang connect / discovery / commands off **`Peripheral`** (long-lived handle), matching ObjC `CCBTPeripheral` / `runCommand:` ergonomics — not only `ReliaBLEManager.connect(to:)`. |
-| **Public device types** | **`Peripheral`** = control handle (stable id, sticky discovery filter, ready, queue, Advanced connect, last-seen metadata). **`DiscoveredPeripheral`** = scan snapshot (ads/rssi); manager-stamped; **`discovered.peripheral`** sugar → interned handle. Leave **`Device`** free for multi-transport app layers. |
+| **Public device types** | **`Peripheral`** = control handle (stable id, sticky discovery filter, ready, queue, Manual connect, last-seen metadata). **`DiscoveredPeripheral`** = scan snapshot (ads/rssi); manager-stamped; **`discovered.peripheral`** sugar → interned handle. Leave **`Device`** free for multi-transport app layers. |
 | **Known id / “my devices”** | App obtains `manager.peripheral(id:)` up front; discovery later binds live CB to the same handle. Primary UI for IoT = tracked **`Peripheral`s** (option A: last discovery metadata on the handle). Raw discovery stream = scanner/provisioning. No fake placeholder discoveries. Optional later: thin `PeripheralUpdate` event (option B). |
 | **Discovery API (GATT FR-10)** | On **`Peripheral`**, not a global id-keyed manager API. |
 | **UUID declaration** | Sticky on **`Peripheral`** (e.g. `discoveryFilter`); required before auto-discovery / first work (fail-closed if empty). |
@@ -47,7 +47,7 @@ ReliaBLE is the modern, improved equivalent of the ObjC **Core** layer (`CCBTCen
 - ObjC docs: `Bluetooth/docs/BLE-Architecture.md`, `Swift6-Translation.md`
 - ObjC Core: `CCBTCentralManager`, `CCBTPeripheral`, `CCBTCommand`
 - ReliaBLE: `PRD.md` (incl. FR-10 from PR #47), `Sources/ReliaBLE/*`, DocC
-- Product feedback: layering, PoweredOn, work-driven + Advanced hold (Approach B reconnect), Peripheral-scoped APIs, PRD bar, actor layout
+- Product feedback: layering, PoweredOn, work-driven + Manual connect (Approach B reconnect), Peripheral-scoped APIs, PRD bar, actor layout
 
 ---
 
@@ -60,7 +60,7 @@ ReliaBLE **is** the modern Core. Mapping:
 | ObjC Core | ReliaBLE (target) |
 |---|---|
 | `CCBTCentralManager` | Central concerns on `ReliaBLEManager` + internal `BluetoothActor` (scan, radio state, multi-device registry) |
-| `CCBTPeripheral` | **`Peripheral`** handle (work-driven link, discovery/ready, command queue, idle teardown, optional app-hold, last-seen metadata) |
+| `CCBTPeripheral` | **`Peripheral`** handle (work-driven link, discovery/ready, command queue, idle teardown, optional manual-connect hold, last-seen metadata) |
 | *(scan row / ads)* | **`DiscoveredPeripheral`** value snapshot + `.peripheral` sugar |
 | `CCBTCommand` | App-supplied command protocol executed by **`Peripheral`** (FR-4/5, after FR-10) |
 
@@ -153,43 +153,43 @@ For a **work-driven default** targeting wearables/IoT:
 
 **Swift 6 shape** (from `Swift6-Translation.md:76-100`): parked work is a suspended `await`, not an `NSOperationQueue.suspended` flag — same product behavior, better structured cancellation/timeouts.
 
-### 2.4 Work-driven link + Advanced app-hold (no either-or policy)
+### 2.4 Work-driven link + Manual connect (no either-or policy)
 
-**Product decision (KISS):** one connection state machine. The primary model is ObjC-style work-driven. Explicit connect is not a second “mode” — it is an optional **app hold** on the same machine.
+**Product decision (KISS):** one connection state machine. The primary model is ObjC-style work-driven. Explicit connect is not a second “mode” — it is an optional **manual-connect hold** on the same machine.
 
-**Target devices** (wearables, IoT sensors, smart-home): sessions are “do a job,” not always-connected notify. Always-connected notify is out of primary scope; app-hold is documented under **Advanced** and expected to be rare.
+**Target devices** (wearables, IoT sensors, smart-home): sessions are “do a job,” not always-connected notify. Always-connected notify is out of primary scope; Manual connect is documented under **Advanced** and expected to be rare.
 
 #### Rules
 
 | Signal | Meaning |
 |---|---|
 | **Command queue non-empty** | Reason to be linked: auto-connect if down; Tier-0 enabled at that connect; Tier-1 armed on unexpected drop |
-| **Command queue empty** | Disarm Tier-1; start idle teardown timer (if no app hold) — cancel connection ends Tier-0 |
-| **App hold** (Advanced) | Set by `connect(autoReconnect:)`; cleared by `disconnect()`. Suppresses idle teardown while held. Same ensure-linked path as work-driven connect |
-| **Idle teardown** | Runs only when **queue empty and no app hold**; cancel connection drops OS Tier-0 |
+| **Command queue empty** | Disarm Tier-1; start idle teardown timer (if no manual-connect hold) — cancel connection ends Tier-0 |
+| **Manual-connect hold** | Set by `connect(autoReconnect:)`; cleared by `disconnect()`. Suppresses idle teardown while held. Same ensure-linked path as work-driven connect |
+| **Idle teardown** | Runs only when **queue empty and no manual-connect hold**; cancel connection drops OS Tier-0 |
 
 ```text
-ensureLinked()  ← called from run(command) and from Advanced connect()
+ensureLinked()  ← called from run(command) and from Manual connect()
   await PoweredOn
   connect if needed  // work-driven: pass Tier-0 EnableAutoReconnect (Approach B)
   discover to ready (FR-10)
 
 on unexpected disconnect:
-  if queue non-empty OR (app hold && autoReconnect):
+  if queue non-empty OR (manual-connect hold && autoReconnect):
     arm Tier-1 ladder   // exact “work pending ⇒ library reconnect”
   else:
     stay down           // no Tier-1 when quiet
 
-on queue drained && !appHold:
+on queue drained && !manualHold:
   disarm Tier-1
   start idle timer → cancel connection  // cancels Tier-0 as well
 
-on Advanced connect(autoReconnect:):
-  set appHold; ensureLinked()
-  Tier-0 / Tier-1 follow the autoReconnect Bool while hold remains
+on Manual connect(autoReconnect:):
+  set manualHold; ensureLinked()
+  Tier-0 / Tier-1 follow the autoReconnect Bool while a manual-connect hold remains
 
-on Advanced disconnect():
-  clear appHold; intentional cancel; disarm reconnect
+on Manual disconnect():
+  clear manualHold; intentional cancel; disarm reconnect
 ```
 
 #### Reconnect: Approach B
@@ -197,18 +197,18 @@ on Advanced disconnect():
 | Path | Tier-0 (OS `EnableAutoReconnect`) | Tier-1 (library ladder) |
 |---|---|---|
 | **Work-driven** (default) | **On while linked** — passed at auto-connect for work; **dropped when idle teardown (or intentional cancel) cancels the connection** | **On only while queue non-empty** (mid-job drop with work remaining) |
-| **Advanced `connect(autoReconnect: true)`** | On for that hold | Armed while app hold remains |
-| **Advanced `connect(autoReconnect: false)`** | Off | Off for that hold |
-| **Queue empty, no hold** | Ended by cancel on idle teardown | **Disarmed** |
+| **Manual `connect(autoReconnect: true)`** | On for that hold | Armed while manual-connect hold remains |
+| **Manual `connect(autoReconnect: false)`** | Off | Off for that hold |
+| **Queue empty, no manual-connect hold** | Ended by cancel on idle teardown | **Disarmed** |
 
-Rationale: Tier-0 is fixed at connect time and cannot track “queue just emptied” without cancelling. Approach B keeps OS help **during an active job** (link is up for work) and relies on **idle teardown cancel** to end Tier-0 when the queue is quiet. Exact “no work ⇒ no library reconnect” stays on **Tier-1** (arm/disarm from queue). Accepted gap: during the idle grace window (e.g. 5s after last command) Tier-0 might still bring the link back once with an empty queue — then idle logic should cancel again if still quiet and no hold. KISS: do not re-`connect` to flip options when the queue toggles.
+Rationale: Tier-0 is fixed at connect time and cannot track “queue just emptied” without cancelling. Approach B keeps OS help **during an active job** (link is up for work) and relies on **idle teardown cancel** to end Tier-0 when the queue is quiet. Exact “no work ⇒ no library reconnect” stays on **Tier-1** (arm/disarm from queue). Accepted gap: during the idle grace window (e.g. 5s after last command) Tier-0 might still bring the link back once with an empty queue — then idle logic should cancel again if still quiet and no manual-connect hold. KISS: do not re-`connect` to flip options when the queue toggles.
 
 #### Docs shape
 
 - **Primary docs / Getting Started:** only `run(command)` (after FR-10/4); connection is an implementation detail.
-- **Advanced:** `connect(autoReconnect:)` / `disconnect()` as app hold — keep link up without pending work; `autoReconnect` semantics as today.
+- **Manual connect:** `connect(autoReconnect:)` / `disconnect()` as a manual-connect hold — keep link up without pending work; `autoReconnect` semantics as today.
 
-**Complexity:** one ensure-linked path + `appHold` + `queuedWork` flags + idle cancel. No `ConnectionPolicy.mode` enum.
+**Complexity:** one ensure-linked path + `manualHold` + `queuedWork` flags + idle cancel. No `ConnectionPolicy.mode` enum.
 
 ### 2.5 Public types: `Peripheral` (handle) + `DiscoveredPeripheral` (snapshot)
 
@@ -216,7 +216,7 @@ Rationale: Tier-0 is fixed at connect time and cannot track “queue just emptie
 
 | Type | Kind | Role |
 |---|---|---|
-| **`Peripheral`** | Long-lived handle (interned by id in the manager) | Primary app type for wearables/IoT: sticky `discoveryFilter`, work-driven `run`, ready/connection streams, Advanced `connect`/`disconnect`, last-seen / last-advertisement metadata (option A) |
+| **`Peripheral`** | Long-lived handle (interned by id in the manager) | Primary app type for wearables/IoT: sticky `discoveryFilter`, work-driven `run`, ready/connection streams, Manual `connect`/`disconnect`, last-seen / last-advertisement metadata (option A) |
 | **`DiscoveredPeripheral`** | Sendable value snapshot | Scan row: ads, rssi, lastSeen; **manager-stamped**; **`discovered.peripheral`** → same interned handle |
 | **`ReliaBLEManager`** | Façade | Auth, scan, registry, `peripheral(id:)`, tracked-peripherals feed |
 
@@ -260,7 +260,7 @@ for await d in manager.peripheralDiscoveries {
     // ...
 }
 
-// Advanced hold
+// Manual connect hold
 try await p.connect(autoReconnect: true)
 ```
 
@@ -307,7 +307,7 @@ API: `device.run(command)` (or equivalent), not manager-global.
 | PoweredOn gating | Not explicit as park/await; state stream exists | **Partial** — should specify await/park for work submission (product §2.3) |
 | Discovery readiness gate | **FR-10.3** (stronger: streams, timeout, fail-closed, distinct from connection) | **Yes — exceeds** |
 | Re-discover on reconnect / modify | **FR-10.5 / 10.6**, FR-1.2 amended | **Yes — exceeds** (restore + subscription intent) |
-| Work-driven + idle; Approach B reconnect (Tier-0 while linked, cancel on idle; Tier-1 while queue non-empty) | Not yet first-class in PRD | **Gap** — product model; document work-driven + Advanced hold; Approach B |
+| Work-driven + idle; Approach B reconnect (Tier-0 while linked, cancel on idle; Tier-1 while queue non-empty) | Not yet first-class in PRD | **Gap** — product model; document work-driven + Manual connect; Approach B |
 | Serial command queue | FR-5.2.1 FIFO | **Yes** |
 | Reconnect-and-rerun commands | FR-1.2 + FR-4/5 depend on ready | **Yes if implemented** as retry-after-ready |
 | Exactly-once + watchdogs | FR-1.1 / implied | **Yes if specified tightly in command design** |
@@ -320,7 +320,7 @@ API: `device.run(command)` (or equivalent), not manager-global.
 
 **Yes — the full PRD target clears the ObjC Core reliability bar**, and exceeds it on discovery observability, restore, multi-device, and connection recovery — **if** implementation follows FR-10 → commands with retry-after-ready, and product adds:
 
-1. Work-driven link + idle teardown; Approach B reconnect (Tier-0 while linked, cancel on idle; Tier-1 only while queue non-empty); Advanced app-hold `connect`/`disconnect` only.
+1. Work-driven link + idle teardown; Approach B reconnect (Tier-0 while linked, cancel on idle; Tier-1 only while queue non-empty); Manual `connect`/`disconnect` only.
 2. Await/park (not silent no-op) for PoweredOn on work paths.
 3. Device-handle API so the Core is usable without re-learning CB.
 
@@ -396,9 +396,9 @@ Command FIFO: explicit gate per device id inside the actor (semaphore/queue), no
 | Central scan + PoweredOn gate | Await/park on work paths (recommend PRD note) | Scan no-op; partial |
 | `Peripheral` handle + `DiscoveredPeripheral` snapshot | **Product: yes** (option A metadata on handle) | Today single snapshot type + manager.connect |
 | Work-driven connect + idle teardown | **Product: primary** | Absent |
-| Advanced app-hold `connect`/`disconnect` | **Product: Advanced docs; rare** | Only path today (to be demoted) |
+| Manual `connect`/`disconnect` | **Product: Advanced docs; rare** | Only path today (to be demoted) |
 | Work-driven: Tier-0 while linked + cancel on idle; Tier-1 while queue non-empty | **Product: Approach B** | Today two-tier on manager connect; not yet queue/idle-gated |
-| Two-tier reconnect + streams (Advanced hold / general substrate) | Exceeds ObjC | **Done** (wire to queue/hold rules) |
+Two-tier reconnect + streams (Manual connect / general substrate) | Exceeds ObjC | **Done** (wire to queue/hold rules) |
 | Discovery readiness gate | FR-10 | Absent |
 | Ready stream on device | FR-10.3.2 + product | Absent |
 | Subscription intent re-arm | FR-10.4.5 | Absent |
@@ -418,7 +418,7 @@ Command FIFO: explicit gate per device id inside the actor (semaphore/queue), no
 2. Leaving scan as silent no-op while marketing work-driven Core → mysterious “sync did nothing.”
 3. Implementing full FR-5.2 priority before serial + ready + rerun.
 4. Per-peripheral actors holding CB objects → Sendable / ownership bugs.
-5. Treating Advanced `connect` as a second connection stack instead of app-hold on one machine.
+5. Treating Manual `connect` as a second connection stack instead of a manual-connect hold on one machine.
 6. PRD/docs not updated for work-driven primary → implementers treat manager.connect as the “real” API.
 7. Enabling Tier-0 on work-driven connects **without** idle/intentional cancel → OS reconnects indefinitely with empty queue (violates Approach B). Idle grace may allow one OS reconnect; must re-cancel if still quiet.
 
@@ -429,16 +429,16 @@ Command FIFO: explicit gate per device id inside the actor (semaphore/queue), no
 ### PRD / design updates
 
 1. Document **work-driven primary path**: auto-connect on non-empty command queue; idle teardown when empty; **Approach B reconnect** — Tier-0 while linked (cancel on idle), Tier-1 only while work pending. Idle duration as a simple config default (e.g. 5s), not a mode enum.
-2. Document **Advanced app-hold**: `connect(autoReconnect:)` / `disconnect()` suppress idle while held; existing `autoReconnect` Bool controls Tier-0/Tier-1 for that hold. Rare; Advanced docs only.
+2. Document **Manual connect**: `connect(autoReconnect:)` / `disconnect()` suppress idle while held; existing `autoReconnect` Bool controls Tier-0/Tier-1 for that hold. Rare; Advanced docs only.
 3. Specify **PoweredOn**: work submission awaits ready radio; terminal states fail; no silent scan no-op.
-4. Specify **`Peripheral` / `DiscoveredPeripheral` split**: handle-centric API (`run` / discovery filter / Advanced connect); `discovered.peripheral` sugar; `peripheral(id:)` for known devices; tracked feed with last-discovery metadata (option A); manager keeps auth, scan, registry.
+4. Specify **`Peripheral` / `DiscoveredPeripheral` split**: handle-centric API (`run` / discovery filter / Manual connect); `discovered.peripheral` sugar; `peripheral(id:)` for known devices; tracked feed with last-discovery metadata (option A); manager keeps auth, scan, registry.
 5. Keep FR-10 before FR-4/5 (unchanged).
 6. Document reliability unit: **command completion after ready** (not connection alone).
 
 ### Build sequence
 
 1. **`Peripheral` handle + `DiscoveredPeripheral` snapshot** rename/split; registry intern by id; `discovered.peripheral` sugar; `peripheral(id:)`; move link APIs onto `Peripheral`.
-2. **Work-driven link rules**: ensure-linked from `run` with Tier-0 on; idle when queue empty && !appHold (cancel drops Tier-0); Tier-1 arm/disarm from queue (Approach B); Advanced hold via `connect`/`disconnect`.
+2. **Work-driven link rules**: ensure-linked from `run` with Tier-0 on; idle when queue empty && !manualHold (cancel drops Tier-0); Tier-1 arm/disarm from queue (Approach B); Manual connect via `connect`/`disconnect`.
 3. **PoweredOn await** on scan/connect/work paths (replace scan no-op).
 4. **FR-10** on handle (SM, ready stream, filtered discovery, subscriptions, didModifyServices, restore rediscover).
 5. **Serial command queue** + run-after-ready + reconnect-and-rerun + watchdogs.
@@ -462,14 +462,14 @@ Command FIFO: explicit gate per device id inside the actor (semaphore/queue), no
 5. **Work-driven + never-seen known id** — on `run`, implicit filtered scan-until-match vs fail-fast “not discovered”? (Product choice; both fit the type model.)
 6. **`Peripheral` reference semantics** — class vs struct-holding-id façade (both forward to actor); pick at implementation for identity/`===`/UI binding ergonomics.
 
-**Settled (connections + types):** Work-driven primary; no either-or `ConnectionPolicy`; Approach B reconnect; Advanced app-hold only; idle **global 5s**; ready = catalog-ready; subscriptions = intent + re-arm; **`Peripheral` / `DiscoveredPeripheral`** split with option A metadata.
+**Settled (connections + types):** Work-driven primary; no either-or `ConnectionPolicy`; Approach B reconnect; Manual connect only; idle **global 5s**; ready = catalog-ready; subscriptions = intent + re-arm; **`Peripheral` / `DiscoveredPeripheral`** split with option A metadata.
 
 ---
 
 ## Conclusion
 
 - **Layering:** ReliaBLE = improved ObjC Core; band protocol is consumer context only.
-- **Connections:** Prefer **await/park PoweredOn** for work paths (not only boot; not silent no-op). **Work-driven primary** (queue drives auto-connect; idle when empty); **Approach B** reconnect (Tier-0 while linked, cancel on idle; Tier-1 while work pending); **Advanced app-hold** `connect`/`disconnect` only — no either-or policy. Demote manager-only connect.
+- **Connections:** Prefer **await/park PoweredOn** for work paths (not only boot; not silent no-op). **Work-driven primary** (queue drives auto-connect; idle when empty); **Approach B** reconnect (Tier-0 while linked, cancel on idle; Tier-1 while work pending); **Manual connect** `connect`/`disconnect` only — no either-or policy. Demote manager-only connect.
 - **Types:** **`Peripheral`** (handle, IoT primary) + **`DiscoveredPeripheral`** (scan snapshot + `.peripheral` sugar); tracked “my devices” via handles + option A metadata; leave `Device` for apps.
 - **Discovery:** FR-10 on **`Peripheral`**; sticky UUID filter on the handle.
 - **Commands:** After FR-10 only.
