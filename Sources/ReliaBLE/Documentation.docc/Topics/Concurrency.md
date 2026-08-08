@@ -61,13 +61,18 @@ All mutating actions are `async` and hop onto the Bluetooth actor for you:
 - ``Peripheral/connect(autoReconnect:)``
 - ``Peripheral/disconnect()``
 
+> Note: ``ReliaBLEManager/startScanning(services:)`` now **throws**. A usable radio is awaited
+> before scanning begins: a transient state (`.resetting` / `.unknown`) is awaited, while a
+> terminal state (powered off or unsupported) fails fast with a typed ``PeripheralError``.
+> Cancelling the calling task while the scan is parked on a transient state unblocks the pending
+> radio wait with a `CancellationError`.
+
 The current Bluetooth state is exposed as an `async` getter,
 ``ReliaBLEManager/currentState``:
 
 ```swift
 let state = await manager.currentState
 ```
-
 ### Observing events
 
 ReliaBLE exposes three event surfaces, each of which returns a **fresh,

@@ -68,8 +68,8 @@ struct ReliaBLEManagerTests {
             // `peripheral(id:)` is synchronous and nonisolated — callable from any isolation domain.
             _ = manager.peripheral(id: "unused")
 
-            await manager.startScanning()
-            await manager.startScanning(services: [])
+            try? await manager.startScanning()
+            try? await manager.startScanning(services: [])
             await manager.stopScanning()
 
             // `authorizeBluetooth()` suspends until the authorization decision resolves; under the mock's
@@ -294,25 +294,159 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning(services: nil)
+        try await manager.startScanning(services: nil)
         #expect(await Mock.waitForState("Scanning", on: manager))
 
         await manager.stopScanning()
         #expect(await Mock.waitForState("Ready", on: manager))
     }
 
-    @Test func startScanningIsNoOpWhenNotPoweredOn() async throws {
+    @Test func startScanningFailsWhenPoweredOff() async throws {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
         CBMCentralManagerMock.simulatePowerOff()
         #expect(await Mock.waitForState("Powered Off", on: manager))
 
-        await manager.startScanning()
-        // The guard on `centralManager.state == .poweredOn` means the scan never starts.
-        #expect(await manager.currentState.description == "Powered Off")
+        await #expect(throws: PeripheralError.bluetoothPoweredOff) {
+            try await manager.startScanning()
+        }
+
+        // No scan started despite the call.
+        #expect(await manager.bluetooth.testIsScanning() == false)
 
         // Restore power so later tests start from a known-good state.
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+    }
+
+    @Test func startScanningFailsWhenUnsupported() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unsupported)
+        #expect(await Mock.waitForState("Unsupported", on: manager))
+
+        await #expect(throws: PeripheralError.bluetoothUnsupported) {
+            try await manager.startScanning()
+        }
+
+        #expect(await manager.bluetooth.testIsScanning() == false)
+
+        // Restore power so later tests start from a known-good state.
+        CBMCentralManagerMock.simulateInitialState(.poweredOn)
+        #expect(await Mock.waitForState("Ready", on: manager))
+    }
+
+    @Test func startScanningAwaitsTransientState() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let scanTask = Task { try await manager.startScanning() }
+
+        // Wait until the scan waiter is parked on the transient state.
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = try await scanTask.value
+
+        // The radio reaching `.poweredOn` resolved the waiter and started the scan.
+        #expect(await Mock.waitForState("Scanning", on: manager))
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
+    }
+
+    @Test func transientStateResolvingToPoweredOffFailsWaiter() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let scanTask = Task { try await manager.startScanning() }
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        CBMCentralManagerMock.simulatePowerOff()
+        await #expect(throws: PeripheralError.bluetoothPoweredOff) {
+            try await scanTask.value
+        }
+
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
+        #expect(await manager.bluetooth.testIsScanning() == false)
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+    }
+
+    @Test func stopScanningCompletesParkedScanWaiterSuccessfully() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let scanTask = Task { try await manager.startScanning() }
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        // stopScanning() while parked resolves the waiter successfully; no scan starts.
+        await manager.stopScanning()
+        _ = try await scanTask.value
+
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
+        #expect(await manager.bluetooth.testIsScanning() == false)
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+    }
+
+    @Test func supersededScanWaiterCompletesWithoutScanning() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let first = Task { try await manager.startScanning(services: [CBUUID(string: "180D")]) }
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        // A second startScanning supersedes the first.
+        let second = Task { try await manager.startScanning(services: nil) }
+
+        // The earlier waiter completes successfully without scanning.
+        _ = try await first.value
+
+        // The newer request now owns the single-slot scan waiter.
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = try await second.value
+
+        #expect(await Mock.waitForState("Scanning", on: manager))
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
+    }
+
+    @Test func startScanningCancellationUnblocksWaiter() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let scanTask = Task { try await manager.startScanning() }
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        // Cancelling the awaiting task unblocks the parked waiter with a `CancellationError`
+        // and leaves no continuation behind.
+        scanTask.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await scanTask.value
+        }
+
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
+        #expect(await manager.bluetooth.testIsScanning() == false)
+
         CBMCentralManagerMock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
@@ -326,7 +460,7 @@ struct ReliaBLEManagerTests {
         // `peripheralDiscoveries` does not replay, so subscribe before scanning starts.
         let discoveries = manager.peripheralDiscoveries
 
-        await manager.startScanning()
+        try await manager.startScanning()
 
         let discovered = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
@@ -378,7 +512,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         _ = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -409,7 +543,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         _ = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -430,7 +564,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -456,7 +590,7 @@ struct ReliaBLEManagerTests {
         #expect(handle.lastSeen == nil)
         #expect(handle.advertisement == nil)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         _ = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -475,7 +609,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         _ = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -496,7 +630,7 @@ struct ReliaBLEManagerTests {
         let handle = manager.peripheral(id: Mock.testPeripheralID)
         let stream = manager.discoveredPeripherals
 
-        await manager.startScanning()
+        try await manager.startScanning()
 
         // On the first element containing the test id, immediately assert the handle
         // carries metadata — no polling, just a direct assertion after the element arrives.
@@ -519,7 +653,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let discovered = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -532,6 +666,94 @@ struct ReliaBLEManagerTests {
         let handle = try #require(discovered).peripheral
         // The live `CBPeripheral` is registered under this snapshot's id, so connect must not throw.
         try await handle.connect()
+    }
+
+    @Test func connectFailsWhenPoweredOff() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let discovered = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        await manager.stopScanning()
+        let handle = try #require(discovered).peripheral
+
+        CBMCentralManagerMock.simulatePowerOff()
+        _ = await Mock.waitForState("Powered Off", on: manager)
+
+        await #expect(throws: PeripheralError.bluetoothPoweredOff) {
+            try await handle.connect()
+        }
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+    }
+
+    @Test func connectAwaitsTransientState() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let discovered = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        await manager.stopScanning()
+        let handle = try #require(discovered).peripheral
+
+        // Transition to a transient state. `.unknown` deliberately avoids `.resetting`, which would
+        // trigger peripheral invalidation (a later step); here the live reference must survive so
+        // connect can proceed once the radio returns.
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let connectTask = Task { try await handle.connect() }
+        _ = await pollUntil(timeout: 2.0) {
+            await manager.bluetooth.testPendingPoweredOnWaiterCount() == 1
+        }
+
+        CBMCentralManagerMock.simulatePowerOn()
+        try await connectTask.value
+
+        // The parked radio wait was resolved; no continuation is left behind.
+        #expect(await manager.bluetooth.testPendingPoweredOnWaiterCount() == 0)
+    }
+
+    @Test func connectTransientResolvingToPoweredOffThrows() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let discovered = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        await manager.stopScanning()
+        let handle = try #require(discovered).peripheral
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let connectTask = Task { try await handle.connect() }
+        _ = await pollUntil(timeout: 2.0) {
+            await manager.bluetooth.testPendingPoweredOnWaiterCount() == 1
+        }
+
+        // The transient resolves to a terminal `.poweredOff`, failing the waiter with a typed error.
+        CBMCentralManagerMock.simulatePowerOff()
+        await #expect(throws: PeripheralError.bluetoothPoweredOff) {
+            try await connectTask.value
+        }
+
+        #expect(await manager.bluetooth.testPendingPoweredOnWaiterCount() == 0)
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
     }
 
     @Test func connectToUnknownPeripheralThrows() async throws {
@@ -558,7 +780,7 @@ struct ReliaBLEManagerTests {
         var changes = manager.connectionStateChanges.makeAsyncIterator()
         #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -598,7 +820,7 @@ struct ReliaBLEManagerTests {
 
         // Drive a scan cycle so the enabled logger evaluates its message autoclosures.
         await Mock.ensureReady(manager)
-        await manager.startScanning()
+        try await manager.startScanning()
         _ = await Mock.waitForState("Scanning", on: manager)
         await manager.stopScanning()
     }
@@ -702,7 +924,7 @@ struct ReliaBLEManagerTests {
         #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         // Discover the connectable test peripheral.
-        await manager.startScanning()
+        try await manager.startScanning()
         let discovered = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -732,7 +954,7 @@ struct ReliaBLEManagerTests {
         var changes = manager.connectionStateChanges.makeAsyncIterator()
         #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let discovered = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -771,7 +993,7 @@ struct ReliaBLEManagerTests {
         var changes = manager.connectionStateChanges.makeAsyncIterator()
         #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -813,7 +1035,7 @@ struct ReliaBLEManagerTests {
         // before we issue the connect (connectionStateChanges has no replay).
         _ = await manager.currentConnectionStates
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -858,7 +1080,7 @@ struct ReliaBLEManagerTests {
         var changes = manager.connectionStateChanges.makeAsyncIterator()
         #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -920,7 +1142,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -998,7 +1220,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1051,7 +1273,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1108,7 +1330,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1160,7 +1382,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1224,7 +1446,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1283,7 +1505,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1333,7 +1555,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1371,7 +1593,7 @@ struct ReliaBLEManagerTests {
 
         let changes = manager.connectionStateChanges
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1449,7 +1671,7 @@ struct ReliaBLEManagerTests {
         // Force an actor hop so registration completes before we connect.
         _ = await manager.currentConnectionStates
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1575,7 +1797,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager1)
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        await manager1.startScanning()
+        try await manager1.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
@@ -1670,7 +1892,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager1)
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        await manager1.startScanning()
+        try await manager1.startScanning()
         let connectionPeripheral = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
@@ -1716,7 +1938,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager1)
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        await manager1.startScanning()
+        try await manager1.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
@@ -1775,7 +1997,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager1)
         await manager1.bluetooth.testClearPersistedReconnectIntent()
 
-        await manager1.startScanning()
+        try await manager1.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager1,
@@ -1833,7 +2055,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1867,7 +2089,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: manager,
@@ -1949,7 +2171,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -1978,7 +2200,7 @@ struct ReliaBLEManagerTests {
         #expect(handle.cbIdentifier == nil)
 
         // First discover so live refs and prior metadata exist.
-        await manager.startScanning()
+        try await manager.startScanning()
         let snap = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: manager,
@@ -2029,7 +2251,7 @@ struct ReliaBLEManagerTests {
         #expect(await managerB.bluetooth.testRestoreIdentifier() == restoreB)
 
         // A discovers while B is idle — B's discovered list must stay empty.
-        await managerA.startScanning()
+        try await managerA.startScanning()
         let discoveredOnA = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: managerA,
@@ -2042,7 +2264,7 @@ struct ReliaBLEManagerTests {
         await managerA.stopScanning()
 
         // B discovers independently into its own maps.
-        await managerB.startScanning()
+        try await managerB.startScanning()
         let discoveredOnB = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: managerB,
@@ -2053,7 +2275,7 @@ struct ReliaBLEManagerTests {
         await managerB.stopScanning()
 
         // Connect only on A; B must not observe connection state for that peripheral.
-        await managerA.startScanning()
+        try await managerA.startScanning()
         let connectableA = await Mock.waitForDiscovered(
             id: Mock.connectionTestPeripheralID,
             on: managerA,
@@ -2132,7 +2354,7 @@ struct ReliaBLEManagerTests {
         #expect(set.count == 1, "id-only equality means same-id handles from different managers count as one in a Set")
 
         // Discover only on A.
-        await managerA.startScanning()
+        try await managerA.startScanning()
         _ = await Mock.waitForDiscovered(
             id: Mock.testPeripheralID,
             on: managerA,

@@ -176,14 +176,23 @@ public final class ReliaBLEManager: Sendable {
 
     /// Starts scanning for peripheral devices, optionally filtering by specific services.
     ///
+    /// Rather than silently no-op'ing when the radio is not yet usable, this waits for a transient
+    /// (`.resetting` / `.unknown`) state to resolve and fails fast with a typed
+    /// ``PeripheralError`` for terminal states (``PeripheralError/bluetoothPoweredOff``,
+    /// ``PeripheralError/bluetoothUnsupported``, ``PeripheralError/bluetoothUnavailable``).
+    /// Cancelling the calling task while the call is parked on a transient radio state unblocks the
+    /// wait with a `CancellationError`.
+    ///
     /// - Parameter services: An optional array of `CBUUID` objects representing the services to scan for. If provided,
     /// only peripherals advertising these services will be discovered. If `nil`, scans for all peripheral devices.
-    ///
-    /// - Note: If Bluetooth is not authorized or powered on, this method will not start scanning. It is the caller's
-    /// responsibility to ensure that Bluetooth is authorized and powered on before calling this method.
-    public func startScanning(services: sending [CBUUID]? = nil) async {
+    public func startScanning(services: sending [CBUUID]? = nil) async throws {
         await bluetooth.ensureCentralManager()
-        await bluetooth.startScanning(services: services)
+
+        try await withTaskCancellationHandler {
+            try await bluetooth.startScanning(services: services)
+        } onCancel: {
+            Task { await bluetooth.cancelScanWaiter() }
+        }
     }
 
     /// Stops scanning for peripheral devices.

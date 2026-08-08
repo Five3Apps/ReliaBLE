@@ -177,6 +177,21 @@ actor BluetoothActor {
     /// the next central state update.
     private var poweredOnContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
 
+    /// Continuation for a parked ``startScanning()`` call awaiting a usable radio. There is at most one
+    /// pending scan at a time, so a single slot suffices.
+    private var scanWaiterContinuation: CheckedContinuation<Void, Error>?
+
+    /// Service filter requested by the currently parked scan waiter, or `nil` if none is parked.
+    private var scanWaiterServices: [CBUUID]?
+
+    /// The restored-scan deferral (``pendingRestoredScanServices``) and this scan waiter are two
+    /// distinct mechanisms kept deliberately separate rather than collapsed into one (plan D-2 open
+    /// item): the restored-scan stash is driven by ``handleCentralManagerStateUpdate()``'s `.poweredOn`
+    /// handling, whereas an app ``startScanning(services:)`` waiter is driven by
+    /// ``resolvePoweredOnWaiters()``. They never both fire because every app scan clears
+    /// ``pendingRestoredScanServices`` — the app-requested filter wins D-2 precedence. Collapsing
+    /// them would couple the restore deferral to the app-visible await state for no benefit.
+
     /// The current Bluetooth state.
     var currentBluetoothState: BluetoothState = .unknown
 
@@ -285,6 +300,12 @@ actor BluetoothActor {
         let pendingPoweredOn = poweredOnContinuations
         poweredOnContinuations.removeAll()
         for continuation in pendingPoweredOn.values {
+            continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
+        }
+
+        if let continuation = scanWaiterContinuation {
+            scanWaiterContinuation = nil
+            scanWaiterServices = nil
             continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
         }
 
@@ -642,7 +663,11 @@ actor BluetoothActor {
     /// - `.unauthorized` → ``PeripheralError/bluetoothUnavailable``
     /// - `.resetting` / `.unknown` → parks a continuation until the next state update
     /// - Task cancellation → ``CancellationError``
-    func waitUntilPoweredOn() async throws {
+    ///
+    /// - Parameter waiterID: A per-call UUID so the caller (via ``cancelPoweredOnContinuation(_:)``) may
+    ///   cancel just this specific wait. The caller is responsible for minting the UUID — typically the
+    ///   nonisolated façade's `withTaskCancellationHandler` onCancel.
+    func waitUntilPoweredOn(waiterID: UUID) async throws {
         guard !isShutdown else { throw PeripheralError.bluetoothUnavailable }
         guard let centralManager else { throw PeripheralError.bluetoothUnavailable }
         switch centralManager.state {
@@ -655,50 +680,76 @@ actor BluetoothActor {
         case .unauthorized:
             throw PeripheralError.bluetoothUnavailable
         case .resetting, .unknown:
-            try await suspendForPoweredOn()
+            try await suspendForPoweredOn(waiterID: waiterID)
         @unknown default:
             throw PeripheralError.bluetoothUnavailable
         }
     }
 
-    /// Parks a continuation for ``waitUntilPoweredOn()`` until the radio becomes usable.
-    private func suspendForPoweredOn() async throws {
+    /// Parks a continuation for ``waitUntilPoweredOn(waiterID:)`` until the radio becomes usable.
+    private func suspendForPoweredOn(waiterID: UUID) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             guard !Task.isCancelled else {
                 continuation.resume(throwing: CancellationError())
                 return
             }
-            let id = UUID()
-            poweredOnContinuations[id] = continuation
+            poweredOnContinuations[waiterID] = continuation
         }
     }
 
-    /// Resolves all pending ``waitUntilPoweredOn()`` calls based on the current radio state.
+    /// Resolves any pending ``waitUntilPoweredOn()`` calls based on the current radio state.
     ///
     /// Called from ``handleCentralManagerStateUpdate()`` on every state update. Terminal states
     /// fail all waiters; `.poweredOn` resumes them successfully; transient states leave them parked.
     private func resolvePoweredOnWaiters() {
-        guard !poweredOnContinuations.isEmpty else { return }
+        let hasScanWaiter = scanWaiterContinuation != nil
+        guard !poweredOnContinuations.isEmpty || hasScanWaiter else { return }
         guard let centralManager else { return }
-        let result: Result<Void, Error>
+
         switch centralManager.state {
         case .poweredOn:
-            result = .success(())
+            // A parked scan waiter gets its scan issued and completes successfully on power-on.
+            if let continuation = scanWaiterContinuation {
+                scanWaiterContinuation = nil
+                let services = scanWaiterServices
+                scanWaiterServices = nil
+                beginScan(services: services)
+                continuation.resume(returning: ())
+            }
+            if !poweredOnContinuations.isEmpty {
+                let pending = poweredOnContinuations
+                poweredOnContinuations.removeAll()
+                for continuation in pending.values {
+                    continuation.resume(returning: ())
+                }
+            }
         case .poweredOff:
-            result = .failure(PeripheralError.bluetoothPoweredOff)
+            failPoweredOnAndScanWaiters(with: PeripheralError.bluetoothPoweredOff)
         case .unsupported:
-            result = .failure(PeripheralError.bluetoothUnsupported)
+            failPoweredOnAndScanWaiters(with: PeripheralError.bluetoothUnsupported)
         case .unauthorized:
-            result = .failure(PeripheralError.bluetoothUnavailable)
+            failPoweredOnAndScanWaiters(with: PeripheralError.bluetoothUnavailable)
         case .resetting, .unknown:
             return
         @unknown default:
-            result = .failure(PeripheralError.bluetoothUnavailable)
+            failPoweredOnAndScanWaiters(with: PeripheralError.bluetoothUnavailable)
         }
-        let pending = poweredOnContinuations
-        poweredOnContinuations.removeAll()
-        for continuation in pending.values {
-            continuation.resume(with: result)
+    }
+
+    /// Fails every parked ``waitUntilPoweredOn()`` continuation and any parked scan waiter with a
+    /// terminal radio-state error.
+    private func failPoweredOnAndScanWaiters(with error: PeripheralError) {
+        if let continuation = scanWaiterContinuation {
+            scanWaiterContinuation = nil
+            scanWaiterServices = nil
+            continuation.resume(throwing: error)
+        }
+        if !poweredOnContinuations.isEmpty {
+            let pending = poweredOnContinuations
+            poweredOnContinuations.removeAll()
+            for continuation in pending.values {
+                continuation.resume(throwing: error)
+            }
         }
     }
 
@@ -710,21 +761,120 @@ actor BluetoothActor {
 
     // MARK: - Scanning
 
-    func startScanning(services: sending [CBUUID]? = nil) {
+    /// Starts scanning for peripherals, optionally filtering by specific services.
+    ///
+    /// Rather than silently no-op'ing when the radio is not yet usable, this waits for a
+    /// transient (`.resetting` / `.unknown`) state to resolve and fails fast with a typed
+    /// ``PeripheralError`` for terminal states (`.poweredOff`, `.unsupported`, `.unauthorized`).
+    ///
+    /// A parked scan waiter (on a transient state) has four distinct outcomes, only one of which
+    /// throws `CancellationError` (D-2): radio reaches `.poweredOn` (scan starts), `stopScanning()`
+    /// is called (waiter completes successfully, no scan), the waiter is superseded by a later
+    /// ``startScanning(services:)`` (completes successfully without scanning), or the radio
+    /// resolves to a terminal state (throws the matching typed error).
+    func startScanning(services: sending [CBUUID]? = nil) async throws {
         guard !isShutdown else {
             log?.warn(tags: [.category(.scanning)], "Attempted to start scan after shutdown")
-            return
+            throw PeripheralError.bluetoothUnavailable
         }
         guard let centralManager else {
             log?.warn(tags: [.category(.scanning)], "Attempted to start scan without a central manager")
-            return
+            throw PeripheralError.bluetoothUnavailable
         }
 
-        guard centralManager.state == .poweredOn else {
-            log?.warn(tags: [.category(.scanning)], "Attempted to start scan while central manager is not ready (poweredOn)")
-            return
+        switch centralManager.state {
+        case .poweredOn:
+            // An app-requested scan supersedes any deferred restored scan (D-2 filter precedence):
+            // clear the stashed filter so a later power-on does not also resume it — CoreBluetooth
+            // has a single scan, last writer wins.
+            pendingRestoredScanServices = nil
+            pendingRestoredScanOptions = nil
+            beginScan(services: services)
+        case .poweredOff:
+            throw PeripheralError.bluetoothPoweredOff
+        case .unsupported:
+            throw PeripheralError.bluetoothUnsupported
+        case .unauthorized:
+            throw PeripheralError.bluetoothUnavailable
+        case .resetting, .unknown:
+            try await parkScanWaiter(services: services)
+        @unknown default:
+            throw PeripheralError.bluetoothUnavailable
+        }
+    }
+
+    /// Parks a ``startScanning(services:)`` invocation until the radio resolves, it is superseded
+    /// by a newer scan request, ``stopScanning()`` is called, or the calling task is cancelled.
+    ///
+    /// Supersede semantics: a later ``startScanning(services:)`` completes an earlier parked waiter
+    /// successfully without scanning (the newer request owns the single-slot scan; coalescing is not
+    /// attempted because the service filters may differ). Clears the deferred restored scan so an
+    /// app scan wins filter precedence.
+    ///
+    /// The waiter is re-driven after resume, re-reading ``centralManager`` and its state, because a
+    /// resumed continuation runs on a later actor turn and the radio may have flipped again.
+    private func parkScanWaiter(services: sending [CBUUID]?) async throws {
+        // A later startScanning supersedes a parked one: resolve the previous waiter successfully.
+        if let previous = scanWaiterContinuation {
+            scanWaiterContinuation = nil
+            scanWaiterServices = nil
+            previous.resume(returning: ())
         }
 
+        // An app-requested scan supersedes any deferred restored scan (D-2 filter precedence).
+        pendingRestoredScanServices = nil
+        pendingRestoredScanOptions = nil
+
+        scanWaiterServices = services
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            guard !Task.isCancelled else {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            scanWaiterContinuation = continuation
+        }
+
+        // Resumed. Re-read the radio because it may have flipped since the waiter was resolved.
+        guard let centralManager else { throw PeripheralError.bluetoothUnavailable }
+        switch centralManager.state {
+        case .poweredOn:
+            // If ``resolvePoweredOnWaiters()`` already issued the scan, nothing left to do. If this
+            // waiter was resolved by ``stopScanning()``, ``scanWaiterServices`` is nil and we must
+            // not start a scan. Otherwise issue it now (e.g. after a transient re-park above).
+            if scanWaiterServices != nil, centralManager.isScanning == false {
+                let services = scanWaiterServices
+                scanWaiterServices = nil
+                beginScan(services: services)
+            }
+        case .resetting, .unknown:
+            // The radio regressed to a transient state while we held the continuation; re-park
+            // only while a scan is still requested. If ``stopScanning()`` resolved this waiter, it
+            // cleared ``scanWaiterServices`` — return successfully, no scan, rather than re-parking.
+            if scanWaiterServices != nil {
+                try await parkScanWaiter(services: scanWaiterServices)
+            }
+        case .poweredOff:
+            throw PeripheralError.bluetoothPoweredOff
+        case .unsupported:
+            throw PeripheralError.bluetoothUnsupported
+        case .unauthorized:
+            throw PeripheralError.bluetoothUnavailable
+        @unknown default:
+            throw PeripheralError.bluetoothUnavailable
+        }
+    }
+
+    /// Cancels a parked ``startScanning(services:)`` waiter, invoked from a
+    /// `withTaskCancellationHandler` onCancel. No-op when no waiter is parked.
+    func cancelScanWaiter() {
+        guard let continuation = scanWaiterContinuation else { return }
+        scanWaiterContinuation = nil
+        scanWaiterServices = nil
+        continuation.resume(throwing: CancellationError())
+    }
+
+    /// Issues `scanForPeripherals` for the given filter and broadcasts the resulting state.
+    private func beginScan(services: sending [CBUUID]?) {
         if services == nil || services?.isEmpty == true {
             log?.warn(
                 tags: [.category(.scanning)],
@@ -732,6 +882,7 @@ actor BluetoothActor {
             )
         }
 
+        guard let centralManager else { return }
         centralManager.scanForPeripherals(withServices: services, options: nil)
 
         if centralManager.isScanning {
@@ -742,7 +893,20 @@ actor BluetoothActor {
         }
     }
 
+    /// Stops scanning and completes any parked scan waiter. Cancelling is always allowed, so this
+    /// performs no radio wait.
+    ///
+    /// A ``startScanning(services:)`` suspended on a transient state is resolved **successfully**
+    /// (void, no scan starts) — the start-then-stop sequence completed as the app requested and is
+    /// not an error (D-2).
     func stopScanning() {
+        // Complete any parked scan waiter successfully before tearing down the scan.
+        if let continuation = scanWaiterContinuation {
+            scanWaiterContinuation = nil
+            scanWaiterServices = nil
+            continuation.resume(returning: ())
+        }
+
         guard !isShutdown else {
             log?.warn(tags: [.category(.scanning)], "Attempted to stop scan after shutdown")
             return
@@ -1444,6 +1608,11 @@ actor BluetoothActor {
     /// Test-only hook: number of continuations currently parked by ``waitUntilPoweredOn()``.
     func testPendingPoweredOnWaiterCount() -> Int {
         poweredOnContinuations.count
+    }
+
+    /// Test-only hook: whether a ``startScanning(services:)`` waiter is currently parked.
+    func testPendingScanWaiterCount() -> Int {
+        scanWaiterContinuation == nil ? 0 : 1
     }
 
     /// Test-only hook: injects a disconnect event with the specified `isReconnecting` flag,

@@ -154,6 +154,12 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
 
     /// Initiates a connection to this peripheral.
     ///
+    /// Rather than silently no-op'ing or throwing when the radio is not yet usable, this waits for
+    /// a transient (`.resetting` / `.unknown`) radio state to resolve before issuing the connect,
+    /// and fails fast with a typed error for terminal states (``PeripheralError/bluetoothPoweredOff``,
+    /// ``PeripheralError/bluetoothUnsupported``, ``PeripheralError/bluetoothUnavailable``). Cancelling
+    /// the calling task while parked on a transient state unblocks the wait with a `CancellationError`.
+    ///
     /// - Parameter autoReconnect: When `true` (the default), the library passes
     ///   `CBConnectPeripheralOptionEnableAutoReconnect` to the system and arms the app-side exponential-backoff
     ///   ladder for cases the OS option doesn't cover. Set to `false` for one-shot connections where reconnection
@@ -166,6 +172,15 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
         guard let manager = state.withLock({ $0.manager }) else { throw PeripheralError.bluetoothUnavailable }
 
         await manager.bluetooth.ensureCentralManager()
+
+        // Await a usable radio (cancellable), then forward to the actor connect path.
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await manager.bluetooth.waitUntilPoweredOn(waiterID: waiterID)
+        } onCancel: {
+            Task { await manager.bluetooth.cancelPoweredOnContinuation(waiterID) }
+        }
+
         try await manager.bluetooth.connect(id: id, autoReconnect: autoReconnect)
     }
 
