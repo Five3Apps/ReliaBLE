@@ -1920,7 +1920,10 @@ struct ReliaBLEManagerTests {
         #expect(await pollUntil(timeout: 3.0) {
             await manager2.currentConnectionStates[Mock.connectionTestPeripheralID] == .connected
         })
-        #expect(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID))
+        // reconnectEnabled is now synced from demand (wantsReconnect). A restored link with no
+        // rehydrated manual-connect hold (hold rehydration is step 6) has no demand, so the id is
+        // not re-armed — the restore-time seed is corrected by handleDidConnect's syncReconnectIntent.
+        #expect(!(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID)))
 
         await manager2.bluetooth.testClearPersistedReconnectIntent()
         await Mock.tearDown(manager2)
@@ -2439,6 +2442,174 @@ struct ReliaBLEManagerTests {
         } catch let error as PeripheralError {
             #expect(error == .bluetoothUnavailable)
         }
+    }
+
+    // MARK: - Work-Driven Demand Substrate
+
+    @Test func workLeaseAutoConnectsWithoutPriorConnect() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        // No manual connect() — the lease alone must create demand and drive an auto-connect.
+        let token = try await handle.acquireWorkLease()
+
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 1)
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        await handle.releaseWorkLease(token)
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 0)
+    }
+
+    @Test func leaseOnNeverSeenIdThrowsNotFound() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        let handle = manager.peripheral(id: "never-seen-lease")
+
+        await #expect(throws: PeripheralError.notFound) {
+            _ = try await handle.acquireWorkLease()
+        }
+    }
+
+    @Test func doubleReleaseIsNoOp() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        // Two leases held. A broken `Int` refcount would drop to zero on the double-release and tear
+        // down a link that still has work — the Set<UUID> bookkeeping must keep it at 1.
+        let tokenA = try await handle.acquireWorkLease()
+        let tokenB = try await handle.acquireWorkLease()
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 2)
+
+        await handle.releaseWorkLease(tokenA)
+        await handle.releaseWorkLease(tokenA)
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 1)
+
+        await handle.releaseWorkLease(tokenB)
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 0)
+    }
+
+    @Test func connectPoweredOffSetsHoldAndRelinksOnPowerOn() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.testPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        CBMCentralManagerMock.simulatePowerOff()
+        _ = await Mock.waitForState("Powered Off", on: manager)
+
+        await #expect(throws: PeripheralError.bluetoothPoweredOff) {
+            try await handle.connect()
+        }
+
+        // The hold is registered BEFORE the radio wait, so a thrown connect still leaves durable demand.
+        #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+        // step 6: the radio-return sweep (D-1 event 12) relinks the held id; not implemented until then.
+    }
+
+    @Test func manualDisconnectDuringRadioOutageSucceeds() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
+
+        // A radio reset invalidates live references (clears cbPeripherals) but preserves the hold.
+        CBMCentralManagerMock.simulateInitialState(.resetting)
+        _ = await Mock.waitForState("Resetting", on: manager)
+        #expect(!(await manager.bluetooth.testContainsCBPeripheral(handle.id)))
+        #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
+
+        // Dropping the hold during a radio outage must succeed, not throw .notFound.
+        try await handle.disconnect()
+        #expect(!(await manager.bluetooth.testHasManualConnectHold(for: handle.id)))
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+    }
+
+    @Test func manualDisconnectClearsHoldAndTearsDown() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let changes = manager.connectionStateChanges
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connecting
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connected
+        #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
+
+        try await handle.disconnect()
+        #expect(!(await manager.bluetooth.testHasManualConnectHold(for: handle.id)))
+
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 3_000_000_000)
+        let states = events.map { $0.state }
+        #expect(states.contains(.disconnecting))
+        #expect(states.contains(.disconnected(reason: nil)))
+        let hasReconnecting = states.contains {
+            if case .reconnecting = $0 { return true }
+            return false
+        }
+        #expect(!hasReconnecting)
     }
 }
 

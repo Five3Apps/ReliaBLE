@@ -130,6 +130,35 @@ fileprivate final class TaskRegistry: @unchecked Sendable {
     }
 }
 
+// MARK: - Demand Bookkeeping Types
+
+/// A manual-connect hold for one peripheral. `reconnectDesired` mirrors the `autoReconnect` argument
+/// passed to ``Peripheral/connect(autoReconnect:)``.
+struct ManualConnectHold: Sendable {
+    var reconnectDesired: Bool
+}
+
+/// An opaque, actor-issued handle for one outstanding work lease.
+///
+/// Storing a `Set<UUID>` per peripheral (rather than a bare refcount) makes an already-released token
+/// *detectable*: a refcount cannot tell a double-release of token A from a legitimate release of token B.
+struct WorkLeaseToken: Sendable, Hashable {
+    let id: String
+    let leaseID: UUID
+}
+
+/// Why ``BluetoothActor/reevaluateLink(id:reason:)`` is being asked to (re)establish a link.
+///
+/// Disambiguates the issue gate: bare `demand` governs idle suppression only, while the connect-issuing
+/// arm requires `wantsReconnect(id)` **or** an explicit caller intent (D-1).
+enum LinkReason: Sendable {
+    case explicitConnect
+    case workAcquired
+    case radioReturned
+    case relinkAfterIntentional
+    case discoveredWhileDemanded
+}
+
 // MARK: - BluetoothActor
 
 /// Actor that serializes all CoreBluetooth interactions for a single ``ReliaBLEManager`` stack.
@@ -236,6 +265,11 @@ actor BluetoothActor {
     private var intentionalDisconnects: Set<String> = []
     private var reconnectAttempts: [String: Int] = [:]
 
+    /// Live work-lease UUIDs per peripheral. `workCount(id)` is `activeLeases[id]?.count ?? 0`.
+    /// A `Set<UUID>` rather than a bare `Int` so an already-released token is *detectable*.
+    private var activeLeases: [String: Set<UUID>] = [:]
+    private var manualConnectHold: [String: ManualConnectHold] = [:]
+
     // MARK: - Initialization
 
     /// Bridge to the owning manager's handle registry.
@@ -321,6 +355,8 @@ actor BluetoothActor {
         reconnectEnabled.removeAll()
         intentionalDisconnects.removeAll()
         reconnectAttempts.removeAll()
+        activeLeases.removeAll()
+        manualConnectHold.removeAll()
         pendingRestoredScanServices = nil
         pendingRestoredScanOptions = nil
     }
@@ -1315,80 +1351,187 @@ actor BluetoothActor {
         log?.debug("Refreshed \(retrieved.count) peripherals from CBCentralManager")
     }
 
-    // MARK: - Connection
-    
-    /// Initiates a connection to the live peripheral backing the given snapshot `id`.
+    // MARK: - Demand Substrate
+
+    /// Number of live work leases for `id`.
+    private func workCount(for id: String) -> Int {
+        activeLeases[id]?.count ?? 0
+    }
+
+    /// Derived, never stored: demand exists when any work lease is held or a manual-connect hold is set.
+    private func demand(id: String) -> Bool {
+        workCount(for: id) > 0 || manualConnectHold[id] != nil
+    }
+
+    /// Derived, never stored: whether demand wants a link back (work leases, or a hold with
+    /// `reconnectDesired`). Governs the connect-issuing arm and Tier-1 gating.
+    private func wantsReconnect(id: String) -> Bool {
+        workCount(for: id) > 0 || manualConnectHold[id]?.reconnectDesired == true
+    }
+
+    /// The only place in the codebase that may call `centralManager.connect(_:options:)`.
     ///
-    /// Optimistically broadcasts `.connecting` before the CoreBluetooth call, then issues the
-    /// connection request. The actual `.connected` or `.failed` callback arrives later via the
-    /// delegate pipeline.
-    ///
-    /// - Parameter id: The ``Peripheral/id`` of a previously discovered peripheral.
-    /// - Parameter autoReconnect: When `true`, the OS auto-reconnect option is passed and the
-    ///   library ladder may arm on failure. When `false`, reconnection is suppressed entirely.
-    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id` (a stale snapshot).
-    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
-    func connect(id: String, autoReconnect: Bool = true) throws {
-        guard !isShutdown else {
-            log?.warn(tags: [.peripheral(id)], "Attempted to connect after shutdown")
-            throw PeripheralError.bluetoothUnavailable
-        }
-        guard let centralManager else {
-            log?.warn(tags: [.peripheral(id)], "Attempted to connect without a central manager")
-            throw PeripheralError.bluetoothUnavailable
-        }
-        
+    /// Side-effect free apart from its two intended effects: an optimistic `.connecting` via
+    /// ``setConnectionState(_:for:)`` and the CoreBluetooth connect call. It does **not** mutate
+    /// ``reconnectEnabled``, does not persist, and does not clear ``intentionalDisconnects`` — those
+    /// are the caller's job (``syncReconnectIntent`` for the signal, per-event logic for the rest).
+    private func issueConnect(id: String, enableAutoReconnect: Bool) throws {
         guard let cbPeripheral = cbPeripherals[id] else {
             throw PeripheralError.notFound
         }
-        
-        if autoReconnect {
+        guard let centralManager else {
+            throw PeripheralError.bluetoothUnavailable
+        }
+
+        setConnectionState(.connecting, for: id)
+
+        var options: [String: Any]?
+        if #available(macOS 14.0, iOS 17.0, *) {
+            options = enableAutoReconnect ? [CBConnectPeripheralOptionEnableAutoReconnect: true] : nil
+        }
+        centralManager.connect(cbPeripheral, options: options)
+    }
+
+    /// Keeps ``reconnectEnabled`` in step with the derived demand signal, and is the place hold-driven
+    /// persistence is written from.
+    ///
+    /// Inserts ``id`` when ``wantsReconnect(id)`` is true, removes it otherwise.
+    // TODO(step 6): reshape this into the persisted hold map (id → reconnectDesired) and make this the
+    // sole persistence writer. This step keeps the existing set-shaped persistence shape/format.
+    private func syncReconnectIntent(id: String) {
+        if wantsReconnect(id: id) {
             reconnectEnabled.insert(id)
         } else {
             reconnectEnabled.remove(id)
         }
         persistReconnectIntent()
-        intentionalDisconnects.remove(id)
-        setConnectionState(.connecting, for: id)
-        
-        var options: [String: Any]?
-        if #available(macOS 14.0, iOS 17.0, *) {
-            options = autoReconnect ? [CBConnectPeripheralOptionEnableAutoReconnect: true] : nil
-        }
-        centralManager.connect(cbPeripheral, options: options)
     }
-    
-    /// Initiates a disconnection from the live peripheral backing the given snapshot `id`.
+
+    /// The single ensure-linked entry point (D-1 event 5).
     ///
-    /// Optimistically broadcasts `.disconnecting` before cancelling the connection. The actual
-    /// `.disconnected` callback arrives later via the delegate pipeline.
-    ///
-    /// - Parameter id: The ``Peripheral/id`` of a previously connected peripheral.
-    /// - Throws: ``PeripheralError/notFound`` if no live `CBPeripheral` is registered for `id`.
-    /// - Throws: ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
-    func disconnect(id: String) throws {
-        guard !isShutdown else {
-            log?.warn(tags: [.peripheral(id)], "Attempted to disconnect after shutdown")
+    /// Returns early (no-op) when there is no demand. Otherwise verifies the radio per D-radio, the
+    /// live peripheral, and the current link state before deciding whether to issue a connect.
+    /// `.notFound` is terminal for the automatic path — no scan, no retry loop — and demand is retained.
+    func reevaluateLink(id: String, reason: LinkReason) throws {
+        guard demand(id: id) else { return }
+
+        // Re-check the radio per D-radio: a waiter resumed at .poweredOn runs on a later actor turn, by
+        // which time the radio may have flipped again. Fail on terminal regression; transient states are
+        // re-driven later (radio-return sweep / next evaluation), never issued against a dead radio.
+        guard !isShutdown, let centralManager else {
             throw PeripheralError.bluetoothUnavailable
         }
-        guard let centralManager else {
-            log?.warn(tags: [.peripheral(id)], "Attempted to disconnect without a central manager")
+        switch centralManager.state {
+        case .poweredOn:
+            break
+        case .poweredOff:
+            throw PeripheralError.bluetoothPoweredOff
+        case .unsupported:
+            throw PeripheralError.bluetoothUnsupported
+        case .unauthorized:
+            throw PeripheralError.bluetoothUnavailable
+        case .resetting, .unknown:
+            return
+        @unknown default:
             throw PeripheralError.bluetoothUnavailable
         }
-        
+
         guard let cbPeripheral = cbPeripherals[id] else {
             throw PeripheralError.notFound
         }
-        
-        // Reset auto-reconnect since this was an explicit disconnect
-        intentionalDisconnects.insert(id)
-        reconnectEnabled.remove(id)
-        persistReconnectIntent()
+
+        // Already connected — verify against the live CBPeripheral state, not the cached
+        // connectionStates value. Tier-0 cannot be flipped on a live link (CoreBluetooth has no API to
+        // change connect options mid-connection), so if demand now wants it, the option applies on the
+        // next connect issue. Just keep intent in step.
+        if cbPeripheral.state == .connected {
+            syncReconnectIntent(id: id)
+            return
+        }
+
+        // Already connecting, or system reconnect (Tier-0) in progress — let it run.
+        switch connectionStates[id] {
+        case .connecting, .reconnecting(source: .system, attempt: _, nextRetryAt: _):
+            syncReconnectIntent(id: id)
+            return
+        default:
+            break
+        }
+
+        if wantsReconnect(id: id) || reason == .explicitConnect {
+            try issueConnect(id: id, enableAutoReconnect: wantsReconnect(id: id))
+        }
+    }
+
+    /// Registers a manual-connect hold (D-1 event 3). Hold registration **only** — does not wait for
+    /// the radio and does not issue a connect; that is split out so a `connect` that throws
+    /// `bluetoothPoweredOff` still leaves durable demand behind.
+    func applyManualConnectHold(id: String, reconnectDesired: Bool) {
+        manualConnectHold[id] = ManualConnectHold(reconnectDesired: reconnectDesired)
+        intentionalDisconnects.remove(id)
+        // TODO(step 5): cancel any idle timer for id here.
+        syncReconnectIntent(id: id)
+    }
+
+    /// Clears a manual-connect hold and tears down the link per the settling rule (D-1 event 4).
+    ///
+    /// Returns success (does not throw) when there is no live `CBPeripheral` or nothing to cancel —
+    /// dropping a hold during a radio outage must not throw `.notFound`.
+    func applyManualDisconnect(id: String) {
+        manualConnectHold.removeValue(forKey: id)
+        syncReconnectIntent(id: id)
+
+        // Cancel the Tier-1 ladder.
         taskRegistry.cancel(id)
         reconnectAttempts[id] = nil
-        
-        setConnectionState(.disconnecting, for: id)
-        centralManager.cancelPeripheralConnection(cbPeripheral)
+
+        guard let cbPeripheral = cbPeripherals[id] else { return }
+
+        if cbPeripheral.state == .connected {
+            intentionalDisconnects.insert(id)
+            setConnectionState(.disconnecting, for: id)
+            centralManager?.cancelPeripheralConnection(cbPeripheral)
+        } else {
+            // Settling rule: never publish an optimistic `.disconnecting` unless the peripheral is
+            // currently `.connected`. Settle synchronously and do NOT mark intentional — a late
+            // `didDisconnect` is then classified as unexpected, and `armReconnect` is gated off by
+            // `wantsReconnect`, so the late callback is a no-op.
+            setConnectionState(.disconnected(reason: nil), for: id)
+        }
+    }
+
+    /// Acquires a work lease on a discovered peripheral, creating demand that drives an auto-connect.
+    ///
+    /// Fails `.notFound` when there is no live `CBPeripheral`. The radio wait (D-radio) is done by the
+    /// caller-facing wrapper (``Peripheral/acquireWorkLease()``) before calling here.
+    func acquireWorkLease(id: String) async throws -> WorkLeaseToken {
+        guard cbPeripherals[id] != nil else { throw PeripheralError.notFound }
+
+        let leaseID = UUID()
+        activeLeases[id, default: []].insert(leaseID)
+        syncReconnectIntent(id: id)
+        try reevaluateLink(id: id, reason: .workAcquired)
+        return WorkLeaseToken(id: id, leaseID: leaseID)
+    }
+
+    /// Releases a work lease. Releasing an unknown or already-released token is a no-op.
+    func releaseWorkLease(_ token: WorkLeaseToken) async {
+        guard activeLeases[token.id]?.remove(token.leaseID) != nil else {
+            log?.debug(tags: [.peripheral(token.id)], "releaseWorkLease: unknown or already-released token — no-op")
+            return
+        }
+        syncReconnectIntent(id: token.id)
+        // TODO(step 5): begin idle grace if demand(id) is now false.
+    }
+
+    /// Test-only hook: number of live work leases for `id`.
+    func testWorkCount(for id: String) -> Int {
+        workCount(for: id)
+    }
+
+    /// Test-only hook: whether a manual-connect hold exists for `id`.
+    func testHasManualConnectHold(for id: String) -> Bool {
+        manualConnectHold[id] != nil
     }
 
     /// The single write path for per-peripheral connection state.
@@ -1445,6 +1588,7 @@ actor BluetoothActor {
         }
         
         clearReconnectState(for: id)
+        syncReconnectIntent(id: id)
         
         log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral connected")
         setConnectionState(.connected, for: id)
@@ -1575,7 +1719,7 @@ actor BluetoothActor {
         }
         
         do {
-            try connect(id: id, autoReconnect: true)
+            try issueConnect(id: id, enableAutoReconnect: wantsReconnect(id: id))
         } catch {
             let reason = (error as? PeripheralError) ?? .unknown
             clearReconnectState(for: id)
