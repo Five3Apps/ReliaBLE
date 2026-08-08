@@ -278,15 +278,11 @@ private struct DeviceDetailView: View {
             }
 
             Button(action: {
+                let handle = reliaBLE.peripheral(id: device.id)
                 if isActive {
-                    Task { try? await reliaBLE.disconnect(from: Peripheral(id: device.id)) }
+                    Task { try? await handle.disconnect() }
                 } else {
-                    Task {
-                        try? await reliaBLE.connect(
-                            to: Peripheral(id: device.id),
-                            autoReconnect: autoReconnect
-                        )
-                    }
+                    Task { try? await handle.connect(autoReconnect: autoReconnect) }
                 }
             }) {
                 Text(isActive ? "Disconnect" : "Connect")

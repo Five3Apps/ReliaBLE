@@ -40,7 +40,7 @@ rather than juggling a central manager for day-to-day tasks.
 - **Scanning with rich advertisement data.** Scan for all peripherals or filter by
   service UUID, and consume results as strongly-typed ``AdvertisementData`` snapshots
   through `AsyncStream`s — either per-advertisement (``PeripheralDiscoveryEvent``) or as a
-  de-duplicated list of ``Peripheral`` values. Background scanning and state restoration
+  de-duplicated list of ``DiscoveredPeripheral`` snapshots. Background scanning and state restoration
   are supported.
 - **Multiple simultaneous peripherals.** Maintain connections to many devices at once,
   each with its own connection state and (in the v1 target) its own command queue.
@@ -67,6 +67,7 @@ and open your first connection.
 ### Peripherals
 
 - ``Peripheral``
+- ``DiscoveredPeripheral``
 - ``AdvertisementData``
 - ``PeripheralDiscoveryEvent``
 - ``PeripheralError``

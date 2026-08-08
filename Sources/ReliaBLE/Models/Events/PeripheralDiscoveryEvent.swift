@@ -29,9 +29,14 @@ import CoreBluetooth
 
 /// A lightweight, `Sendable` event emitted for each advertisement received while scanning.
 public struct PeripheralDiscoveryEvent: Identifiable, Hashable, Sendable {
-    /// Unique identifier for the peripheral as set by CoreBluetooth
+    /// CoreBluetooth `UUID` identifier assigned by the system.
+    ///
+    /// This is **not** the app-facing peripheral identifier (which is a `String` carried by
+    /// ``Peripheral/id`` and ``DiscoveredPeripheral/id``). Until FR-8.5 provides direct
+    /// advertisement-to-id correlation, map via ``DiscoveredPeripheral`` or its
+    /// ``DiscoveredPeripheral/peripheral`` handle.
     public let id: UUID
-    
+
     /// The name advertised by the peripheral, if available
     public let name: String?
     
@@ -42,6 +47,11 @@ public struct PeripheralDiscoveryEvent: Identifiable, Hashable, Sendable {
     public let advertisement: AdvertisementData
     
     /// Create a discovered peripheral event from CoreBluetooth information.
+    ///
+    /// - Parameters:
+    ///   - cbPeripheral: The CoreBluetooth peripheral.
+    ///   - advertisement: Parsed advertisement data.
+    ///   - rssi: Signal strength of the advertisement.
     init(cbPeripheral: CBPeripheral, advertisement: AdvertisementData, rssi: Int) {
         self.id = cbPeripheral.identifier
         self.name = cbPeripheral.name ?? advertisement.localName

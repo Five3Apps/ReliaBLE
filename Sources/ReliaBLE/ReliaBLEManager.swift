@@ -45,6 +45,11 @@ public final class ReliaBLEManager: Sendable {
     /// capture `[weak self]`. Live stream subscribers retain the actor until terminated.
     let bluetooth: BluetoothActor
 
+    /// Per-manager store of ``Peripheral`` handles, which is what makes ``peripheral(id:)`` synchronous and what
+    /// guarantees one handle instance per id per manager. Owned here rather than by the actor because handles must
+    /// be obtainable from a SwiftUI body and before any `CBCentralManager` exists.
+    let handleRegistry: PeripheralHandleRegistry
+
     /// Initializes the ReliaBLEManager with the provided configuration, or a default configuration if none is provided.
     ///
     /// Initializing a ReliaBLEManager does not start the `CBCentralManager` unless the user has already authorized
@@ -57,11 +62,19 @@ public final class ReliaBLEManager: Sendable {
         loggingService = LoggingService(levels: config.logLevels, writers: config.logWriters, queue: config.logQueue)
         loggingService.enabled = config.loggingEnabled
 
+        // Two-phase construction, and it has to be this way: `self` is unusable until every stored property is
+        // initialized, so the registry cannot be handed its manager up front — and `bluetooth` needs the registry.
+        // Create the registry unattached, inject it, then bind the manager once initialization is complete.
+        handleRegistry = PeripheralHandleRegistry()
+
         bluetooth = BluetoothActor(
             log: loggingService,
             reconnectPolicy: config.reconnectPolicy,
-            restoreIdentifier: config.restoreIdentifier
+            restoreIdentifier: config.restoreIdentifier,
+            registry: handleRegistry
         )
+
+        handleRegistry.attach(manager: self)
 
         // `init` stays synchronous and kicks off central creation via a fire-and-forget `Task`
         // rather than awaiting it, so the initializer never blocks. To prevent an operation invoked
@@ -156,7 +169,7 @@ public final class ReliaBLEManager: Sendable {
     /// A multi-subscriber `AsyncStream` that emits the current de-duplicated list of discovered
     /// peripherals each time it changes. Each property access returns a fresh, independent stream;
     /// the current list is replayed as the first element on subscription.
-    public var discoveredPeripherals: AsyncStream<[Peripheral]> {
+    public var discoveredPeripherals: AsyncStream<[DiscoveredPeripheral]> {
         bluetooth.discoveredPeripheralsStream()
     }
 
@@ -178,37 +191,33 @@ public final class ReliaBLEManager: Sendable {
         await bluetooth.stopScanning()
     }
 
-    // MARK: - Connection
+    // MARK: - Peripherals
 
-    /// Initiates a connection to a previously discovered peripheral.
+    /// Returns the control handle for a peripheral identifier, creating it on first request.
     ///
-    /// The ``Peripheral`` is a value snapshot captured at discovery time. This method forwards its ``Peripheral/id``
-    /// to the live CoreBluetooth peripheral held internally and requests a connection.
+    /// This is the entry point for acting on a peripheral. Connecting, disconnecting, and reading last-known
+    /// metadata all live on the returned ``Peripheral``:
     ///
-    /// - Parameter peripheral: A peripheral previously delivered via ``discoveredPeripherals``.
-    /// - Parameter autoReconnect: When `true` (the default), the library passes
-    ///   `CBConnectPeripheralOptionEnableAutoReconnect` to the system and arms the app-side
-    ///   exponential-backoff ladder for cases the OS option doesn't cover. Set to `false` for
-    ///   one-shot connections where reconnection is not desired.
-    /// - Throws: ``PeripheralError/notFound`` if the peripheral's live reference has been invalidated (a stale
-    ///   snapshot), or ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up (for example, not
-    ///   yet authorized).
-    public func connect(to peripheral: Peripheral, autoReconnect: Bool = true) async throws {
-        await bluetooth.ensureCentralManager()
-        try await bluetooth.connect(id: peripheral.id, autoReconnect: autoReconnect)
-    }
-
-    /// Initiates a disconnection from a previously connected peripheral.
+    /// ```swift
+    /// let band = manager.peripheral(id: "user-band")
+    /// try await band.connect()
+    /// ```
     ///
-    /// The ``Peripheral`` is a value snapshot. This forwards its ``Peripheral/id`` to the live
-    /// CoreBluetooth peripheral and cancels the connection.
+    /// Handles are **interned per manager**: calling this repeatedly with the same `id` returns the identical
+    /// (`===`) object, and it is the same object ``DiscoveredPeripheral/peripheral`` resolves to. That makes a
+    /// handle safe to store in a view model and rely on as a stable identity.
     ///
-    /// - Parameter peripheral: A peripheral previously delivered via ``discoveredPeripherals``.
-    /// - Throws: ``PeripheralError/notFound`` if the peripheral's live reference has been
-    ///   invalidated, or ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up.
-    public func disconnect(from peripheral: Peripheral) async throws {
-        await bluetooth.ensureCentralManager()
-        try await bluetooth.disconnect(id: peripheral.id)
+    /// The call is synchronous and requires no Bluetooth setup, so a peripheral the app already knows about — a
+    /// wearable bound to the user's account, say — can be represented before it has ever been seen. Such a handle
+    /// carries no metadata and throws ``PeripheralError/notFound`` from ``Peripheral/connect(autoReconnect:)`` until
+    /// discovery or state restoration matches it to a real device. Matching is by identifier: a handle created as
+    /// `"MyBand"` binds to a device that advertises the name `MyBand`.
+    ///
+    /// Two managers are two independent stacks, so each vends its own distinct handle for the same `id`.
+    ///
+    /// - Parameter id: The app-facing peripheral identifier.
+    public func peripheral(id: String) -> Peripheral {
+        handleRegistry.peripheral(id: id)
     }
 }
 

@@ -65,7 +65,7 @@ actor DeviceStoreActor: ModelActor {
         try? modelContext.save()
     }
 
-    func syncDevices(_ peripherals: [Peripheral]) {
+    func syncDevices(_ peripherals: [DiscoveredPeripheral]) {
         assertWritesOffMainThread()
 
         do {

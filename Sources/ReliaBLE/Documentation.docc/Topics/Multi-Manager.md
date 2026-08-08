@@ -16,7 +16,15 @@ Each ``ReliaBLEManager`` is a **fully isolated stack**: its own actor,
 streams. Constructing a second manager gives you a second, independent stack —
 their discovered peripherals, connection state, and streams never cross over.
 Two managers scanning the same physical device each hold their own
-``Peripheral`` snapshot; there is no shared, cross-manager discovered list.
+``DiscoveredPeripheral`` snapshots and distinct ``Peripheral`` handle instances;
+there is no shared, cross-manager discovered list.
+
+Handles are per-manager (the handle registry lives on the manager, not in a
+process-global singleton). Two handles for the same physical device id vended by
+different managers compare `==` (equality keys on ``Peripheral/id``), but they
+are **not** `===` — they are different objects on different registries, and each
+can only talk to its own manager. Multi-manager apps must not pass handles
+between stacks. When identity matters, use `===`.
 
 Configuration — including `ReconnectPolicy` and logging — is applied **per
 manager**. The config you pass to `init(config:)` governs only that instance.

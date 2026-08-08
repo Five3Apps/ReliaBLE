@@ -176,12 +176,12 @@ actor BluetoothActor {
 
     var log: LoggingService?
 
-    /// Value snapshots of all discovered peripherals, keyed implicitly by ``Peripheral/id``.
-    var discoveredPeripherals: [Peripheral] = []
+    /// Value snapshots of all discovered peripherals, keyed implicitly by ``DiscoveredPeripheral/id``.
+    var discoveredPeripherals: [DiscoveredPeripheral] = []
 
-    /// Live `CBPeripheral` references keyed by ``Peripheral/id``.
+    /// Live `CBPeripheral` references keyed by ``DiscoveredPeripheral/id``.
     ///
-    /// This mutable, non-`Sendable` reference map never escapes the actor. ``Peripheral`` snapshots carry only an
+    /// This mutable, non-`Sendable` reference map never escapes the actor. Snapshots and handles carry only an
     /// `id`; operations that need the live peripheral look it up here.
     private var cbPeripherals: [String: CBPeripheral] = [:]
 
@@ -195,7 +195,7 @@ actor BluetoothActor {
 
     private var stateContinuations: [UUID: AsyncStream<BluetoothState>.Continuation] = [:]
     private var discoveryContinuations: [UUID: AsyncStream<PeripheralDiscoveryEvent>.Continuation] = [:]
-    private var peripheralsContinuations: [UUID: AsyncStream<[Peripheral]>.Continuation] = [:]
+    private var peripheralsContinuations: [UUID: AsyncStream<[DiscoveredPeripheral]>.Continuation] = [:]
 
     /// Per-peripheral connection states, keyed by ``Peripheral/id``.
     var connectionStates: [String: ConnectionState] = [:]
@@ -214,11 +214,26 @@ actor BluetoothActor {
 
     // MARK: - Initialization
 
+    /// Bridge to the owning manager's handle registry.
+    ///
+    /// The actor resolves identity and owns live references; the registry owns ``Peripheral`` instances. Every
+    /// call into this bridge happens on the actor's executor, before the corresponding broadcast — see the
+    /// apply-before-broadcast invariant on ``resolveAndUpsertDiscovered(cbPeripheral:name:rssi:lastSeen:advertisement:)``.
+    ///
+    /// This reference must never lead back to the manager strongly; see ``PeripheralRegistryBridge``.
+    private let registry: PeripheralRegistryBridge
+
     /// Creates an actor with configuration only — no `CBCentralManager` is created here.
-    init(log: LoggingService, reconnectPolicy: ReconnectPolicy, restoreIdentifier: String?) {
+    init(
+        log: LoggingService,
+        reconnectPolicy: ReconnectPolicy,
+        restoreIdentifier: String?,
+        registry: PeripheralRegistryBridge
+    ) {
         self.log = log
         self.reconnectPolicy = reconnectPolicy
         self.restoreIdentifier = restoreIdentifier
+        self.registry = registry
     }
 
     deinit {
@@ -256,7 +271,11 @@ actor BluetoothActor {
         delegateShim = nil
         cbPeripherals.removeAll()
         discoveredPeripherals.removeAll()
-        connectionStates.removeAll()
+        clearConnectionStates()
+        // Drop interned handles along with the stack they belong to. Handles the app still holds keep working,
+        // orphaned, throwing `.bluetoothUnavailable`. A radio reset (`invalidatePeripherals`) deliberately does not
+        // do this — a handle must survive one with its metadata intact.
+        registry.removeAllHandles()
         reconnectEnabled.removeAll()
         intentionalDisconnects.removeAll()
         reconnectAttempts.removeAll()
@@ -306,7 +325,7 @@ actor BluetoothActor {
     ///
     /// The current list is replayed as the first element (`.bufferingNewest(1)`, latest-wins), so
     /// a new subscriber immediately observes the peripherals already discovered.
-    nonisolated func discoveredPeripheralsStream() -> AsyncStream<[Peripheral]> {
+    nonisolated func discoveredPeripheralsStream() -> AsyncStream<[DiscoveredPeripheral]> {
         AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             Task { await self.register(peripheralsContinuation: continuation) }
         }
@@ -349,7 +368,7 @@ actor BluetoothActor {
         }
     }
 
-    private func register(peripheralsContinuation continuation: AsyncStream<[Peripheral]>.Continuation) {
+    private func register(peripheralsContinuation continuation: AsyncStream<[DiscoveredPeripheral]>.Continuation) {
         guard !isShutdown else { continuation.finish(); return }
         let id = UUID()
         continuation.yield(discoveredPeripherals)
@@ -716,8 +735,6 @@ actor BluetoothActor {
             "Restoring BLE state: \(restoredPeripherals.count) peripheral(s), scanServices=\(restoredScanServices ?? [])"
         )
 
-        // Empty advertisement placeholder — restoration carries no advertisement payload.
-        let emptyAdvertisement = AdvertisementData(rawAdvertisementData: [:])
         let now = Date()
         var didMutatePeripherals = false
 
@@ -725,47 +742,20 @@ actor BluetoothActor {
         let persistedIntent = persistedReconnectIntent()
 
         for cbPeripheral in restoredPeripherals {
-            // Restored peripherals arrive with no delegate; re-associate into actor-owned maps
-            // using the same identity rules as discovery. Peripheral-level GATT callbacks are not
-            // yet used by the library, so no `CBPeripheralDelegate` is attached here.
-            let identifier = cbPeripheral.name ?? cbPeripheral.identifier.uuidString
-            let cbIdentifier = cbPeripheral.identifier
-            let name = cbPeripheral.name
-
-            let resolvedId: String
-            if let idx = discoveredPeripherals.firstIndex(where: { $0.id == identifier }) {
-                resolvedId = identifier
-                discoveredPeripherals[idx] = Peripheral(
-                    id: resolvedId,
-                    cbIdentifier: cbIdentifier,
-                    name: name,
-                    rssi: discoveredPeripherals[idx].rssi,
-                    lastSeen: now,
-                    advertisement: discoveredPeripherals[idx].advertisement ?? emptyAdvertisement
-                )
-            } else if let idx = discoveredPeripherals.firstIndex(where: { $0.cbIdentifier == cbIdentifier }) {
-                resolvedId = discoveredPeripherals[idx].id
-                discoveredPeripherals[idx] = Peripheral(
-                    id: resolvedId,
-                    cbIdentifier: cbIdentifier,
-                    name: name ?? discoveredPeripherals[idx].name,
-                    rssi: discoveredPeripherals[idx].rssi,
-                    lastSeen: now,
-                    advertisement: discoveredPeripherals[idx].advertisement ?? emptyAdvertisement
-                )
-            } else {
-                resolvedId = identifier
-                discoveredPeripherals.append(
-                    Peripheral(
-                        id: resolvedId,
-                        cbIdentifier: cbIdentifier,
-                        name: name,
-                        rssi: nil,
-                        lastSeen: now,
-                        advertisement: emptyAdvertisement
-                    )
-                )
-            }
+            // Restored peripherals arrive with no delegate; re-associate into actor-owned maps using the same
+            // identity rules as discovery — literally the same helper, so the two paths cannot drift and a
+            // restored device interns the same handle it had before termination. Peripheral-level GATT callbacks
+            // are not yet used by the library, so no `CBPeripheralDelegate` is attached here.
+            //
+            // `rssi` and `advertisement` are passed as `nil` to invoke the helper's keep-existing merge rule:
+            // restoration carries neither, and a device discovered before termination must not have them wiped.
+            let resolvedId = resolveAndUpsertDiscovered(
+                cbPeripheral: cbPeripheral,
+                name: cbPeripheral.name,
+                rssi: nil,
+                lastSeen: now,
+                advertisement: nil
+            )
 
             cbPeripherals[resolvedId] = cbPeripheral
             didMutatePeripherals = true
@@ -793,11 +783,7 @@ actor BluetoothActor {
             }
 
             if let connectionState {
-                connectionStates[resolvedId] = connectionState
-                broadcast(
-                    ConnectionStateChange(peripheralId: resolvedId, state: connectionState),
-                    to: connectionStateChangesContinuations
-                )
+                setConnectionState(connectionState, for: resolvedId)
             }
         }
 
@@ -880,7 +866,7 @@ actor BluetoothActor {
     ) {
         // Extract the untyped advertisement dictionary into a typed, Sendable snapshot exactly once. The raw
         // `[String: Any]` does not leave this actor; the same `AdvertisementData` feeds both the discovery event
-        // and the stored `Peripheral` snapshot.
+        // and the stored `DiscoveredPeripheral` snapshot.
         let advertisement = AdvertisementData(rawAdvertisementData: advertisementData)
 
         // Emit lightweight discovery feed.
@@ -890,73 +876,124 @@ actor BluetoothActor {
             to: discoveryContinuations
         )
 
-        // Derive the app-facing `id` from the advertised name, falling back to the local name and
-        // finally the CoreBluetooth identifier string.
-        //
-        // TODO: FR-8.5 — Unique Identifier from Manufacturing Data.
-        // KNOWN LIMITATION: advertised names are not unique. Two distinct physical devices that
-        // advertise the same name resolve to the same `identifier` here, so they collapse into a
-        // single `discoveredPeripherals` entry and a single `cbPeripherals` slot — the later
-        // discovery overwrites the earlier device's live `CBPeripheral`, so `connect(id:)` may target
-        // whichever was seen last. FR-8.5 will replace this with a stable identity derived from
-        // manufacturing data; until then the dedup key is best-effort. The `cbIdentifier` fallback
-        // below only rescues a *single* device whose advertised name changes, not the same-name
-        // collision between *different* devices.
-        let identifier = cbPeripheral.name
-            ?? advertisement.localName
-            ?? cbPeripheral.identifier.uuidString
-
-        let cbIdentifier = cbPeripheral.identifier
-        let name = cbPeripheral.name ?? advertisement.localName
-        let now = Date()
-
-        // Resolve the id to store under. Prefer an existing entry matching the app-facing `identifier`; otherwise
-        // fall back to an existing entry for the same `CBPeripheral` (whose resolved `id` may differ if the name has
-        // since changed), preserving that entry's original `id`. Otherwise this is a brand-new peripheral.
-        let resolvedId: String
-        if let idx = discoveredPeripherals.firstIndex(where: { $0.id == identifier }) {
-            resolvedId = identifier
-            discoveredPeripherals[idx] = Peripheral(
-                id: resolvedId,
-                cbIdentifier: cbIdentifier,
-                name: name,
-                rssi: rssi,
-                lastSeen: now,
-                advertisement: advertisement
-            )
-        } else if let idx = discoveredPeripherals.firstIndex(where: { $0.cbIdentifier == cbIdentifier }) {
-            resolvedId = discoveredPeripherals[idx].id
-            discoveredPeripherals[idx] = Peripheral(
-                id: resolvedId,
-                cbIdentifier: cbIdentifier,
-                name: name,
-                rssi: rssi,
-                lastSeen: now,
-                advertisement: advertisement
-            )
-        } else {
-            resolvedId = identifier
-            let new = Peripheral(
-                id: resolvedId,
-                cbIdentifier: cbIdentifier,
-                name: name,
-                rssi: rssi,
-                lastSeen: now,
-                advertisement: advertisement
-            )
-            log?.debug(tags: [.category(.scanning), .peripheral(new.id)], "Adding newly discovered peripheral")
-            discoveredPeripherals.append(new)
-        }
+        // Identity resolution and the snapshot upsert live in the shared helper, so discovery and state
+        // restoration cannot drift apart.
+        let resolvedId = resolveAndUpsertDiscovered(
+            cbPeripheral: cbPeripheral,
+            name: cbPeripheral.name ?? advertisement.localName,
+            rssi: rssi,
+            lastSeen: Date(),
+            advertisement: advertisement
+        )
 
         // Stash the live reference under the resolved id. Never escapes the actor.
         cbPeripherals[resolvedId] = cbPeripheral
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
     }
 
+    /// Resolves the app-facing id for a peripheral, upserts its snapshot into ``discoveredPeripherals``, and
+    /// mirrors the merged result onto the interned handle. Returns the resolved id.
+    ///
+    /// This is the library's **single identity-resolution site**, shared by discovery and state restoration. Those
+    /// two paths previously carried near-duplicate copies of these rules, which had already drifted apart; keeping
+    /// them together is what guarantees both return the same handle for the same device.
+    ///
+    /// Resolution is: derive `cbPeripheral.name ?? advertisement.localName ?? cbPeripheral.identifier.uuidString`,
+    /// then match an existing entry by `id`, else by `cbIdentifier` (preserving that entry's original `id`, so a
+    /// device that renames itself keeps its identity), else append.
+    ///
+    /// **Merge rule: `nil` means keep.** A `nil` `name`, `rssi`, or `advertisement` preserves the existing value
+    /// rather than clearing it, falling back to `nil` (or an empty advertisement) when there is no existing entry.
+    /// Discovery always passes real values, so the rule is a no-op there. Restoration depends on it: a restored
+    /// peripheral carries no advertisement payload and no RSSI, and wiping those would silently downgrade a device
+    /// the app had already discovered — visibly, now that the handle republishes them.
+    ///
+    /// `lastSeen` is always stamped by the caller. For restoration that means "when the live reference was last
+    /// bound" rather than "last heard from", which is why the public property is documented as *last bound or seen*.
+    ///
+    /// This helper deliberately does **not** broadcast and does **not** emit a ``PeripheralDiscoveryEvent``.
+    /// Discovery broadcasts once per advertisement and emits its event before resolution even begins; restoration
+    /// broadcasts once after its whole loop and never emits on the advertisement feed. Leaving both to the callers
+    /// preserves each of those contracts for free.
+    ///
+    /// - Important: The handle is updated *before* the caller broadcasts, so a consumer that receives snapshot *N*
+    ///   can never read handle metadata older than *N*. Any future change that broadcasts earlier to shave latency
+    ///   would break that guarantee.
+    private func resolveAndUpsertDiscovered(
+        cbPeripheral: CBPeripheral,
+        name: String?,
+        rssi: Int?,
+        lastSeen: Date,
+        advertisement: AdvertisementData?
+    ) -> String {
+        // TODO: FR-8.5 — Unique Identifier from Manufacturing Data.
+        // KNOWN LIMITATION: advertised names are not unique. Two distinct physical devices that advertise the same
+        // name resolve to the same `identifier` here, so they collapse into a single `discoveredPeripherals` entry
+        // and a single `cbPeripherals` slot — the later discovery overwrites the earlier device's live
+        // `CBPeripheral`, so `connect(id:)` may target whichever was seen last. FR-8.5 will replace this with a
+        // stable identity derived from manufacturing data; until then the dedup key is best-effort. The
+        // `cbIdentifier` fallback below only rescues a *single* device whose advertised name changes, not the
+        // same-name collision between *different* devices.
+        let identifier = cbPeripheral.name
+            ?? advertisement?.localName
+            ?? cbPeripheral.identifier.uuidString
+        let cbIdentifier = cbPeripheral.identifier
+
+        let existingIndex: Int?
+        let resolvedId: String
+        if let idx = discoveredPeripherals.firstIndex(where: { $0.id == identifier }) {
+            existingIndex = idx
+            resolvedId = identifier
+        } else if let idx = discoveredPeripherals.firstIndex(where: { $0.cbIdentifier == cbIdentifier }) {
+            existingIndex = idx
+            resolvedId = discoveredPeripherals[idx].id
+        } else {
+            existingIndex = nil
+            resolvedId = identifier
+        }
+
+        let existing = existingIndex.map { discoveredPeripherals[$0] }
+        let mergedName = name ?? existing?.name
+        let mergedRSSI = rssi ?? existing?.rssi
+        // `??` is lazily evaluated, so the empty placeholder is only built on the restore-a-never-seen-device path.
+        let mergedAdvertisement = advertisement
+            ?? existing?.advertisement
+            ?? AdvertisementData(rawAdvertisementData: [:])
+
+        let snapshot = DiscoveredPeripheral(
+            id: resolvedId,
+            cbIdentifier: cbIdentifier,
+            name: mergedName,
+            rssi: mergedRSSI,
+            lastSeen: lastSeen,
+            advertisement: mergedAdvertisement,
+            registry: registry
+        )
+
+        if let existingIndex {
+            discoveredPeripherals[existingIndex] = snapshot
+        } else {
+            log?.debug(tags: [.category(.scanning), .peripheral(resolvedId)], "Adding newly discovered peripheral")
+            discoveredPeripherals.append(snapshot)
+        }
+
+        // Apply before the caller broadcasts — see the Important note above.
+        registry.applyDiscovery(
+            id: resolvedId,
+            cbIdentifier: cbIdentifier,
+            name: mergedName,
+            rssi: mergedRSSI,
+            lastSeen: lastSeen,
+            advertisement: mergedAdvertisement
+        )
+
+        return resolvedId
+    }
+
     private func invalidatePeripherals() {
         // The value snapshots hold no CoreBluetooth reference to clear; drop the live registry instead.
         cbPeripherals.removeAll()
-        connectionStates.removeAll()
+        clearConnectionStates()
         taskRegistry.cancelAll()
         reconnectAttempts.removeAll()
         reconnectEnabled.removeAll()
@@ -1049,8 +1086,7 @@ actor BluetoothActor {
         }
         persistReconnectIntent()
         intentionalDisconnects.remove(id)
-        connectionStates[id] = .connecting
-        broadcast(ConnectionStateChange(peripheralId: id, state: .connecting), to: connectionStateChangesContinuations)
+        setConnectionState(.connecting, for: id)
         
         var options: [String: Any]?
         if #available(macOS 14.0, iOS 17.0, *) {
@@ -1088,9 +1124,45 @@ actor BluetoothActor {
         taskRegistry.cancel(id)
         reconnectAttempts[id] = nil
         
-        connectionStates[id] = .disconnecting
-        broadcast(ConnectionStateChange(peripheralId: id, state: .disconnecting), to: connectionStateChangesContinuations)
+        setConnectionState(.disconnecting, for: id)
         centralManager.cancelPeripheralConnection(cbPeripheral)
+    }
+
+    /// The single write path for per-peripheral connection state.
+    ///
+    /// Records the state, mirrors it onto the interned handle so ``Peripheral/connectionState`` stays in step, and
+    /// broadcasts the change. Every transition must go through here — a bare `connectionStates[id] = …` would
+    /// leave the handle's cached value silently stale.
+    private func setConnectionState(_ state: ConnectionState, for id: String) {
+        connectionStates[id] = state
+        registry.applyConnectionState(id: id, state: state)
+        broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+    }
+
+    /// Drops all tracked connection state, mirroring the clear onto every affected handle and broadcasting a
+    /// terminal transition for each.
+    ///
+    /// A bare `connectionStates.removeAll()` would leave handles reporting a state the library no longer believes —
+    /// a handle stuck on `.connected` after the radio was invalidated is worse than one reporting nothing, because
+    /// unlike the metadata properties it is not merely stale, it is known to be false.
+    ///
+    /// Clearing is silent on the handle (``Peripheral/connectionState`` reverts to `nil`, meaning "not tracked")
+    /// but **not** on the stream: a subscriber that only ever learns about transitions from
+    /// `connectionStateChanges` would otherwise keep rendering `.connected` forever, since a cleared peripheral
+    /// produces no further events. `.disconnected(reason: .bluetoothUnavailable)` is emitted instead — true at the
+    /// moment it is sent, and the reason a consumer needs to react to.
+    ///
+    /// `shutdown()` also routes through here, but it finishes and drops every continuation first, so the broadcast
+    /// is a no-op there — a torn-down stack ends its streams rather than emitting a final state into them.
+    private func clearConnectionStates() {
+        for id in connectionStates.keys {
+            registry.applyConnectionState(id: id, state: nil)
+            broadcast(
+                ConnectionStateChange(peripheralId: id, state: .disconnected(reason: .bluetoothUnavailable)),
+                to: connectionStateChangesContinuations
+            )
+        }
+        connectionStates.removeAll()
     }
 
     /// Resolves a ``Peripheral/id`` from the live `CBPeripheral` reference using reverse object-identity lookup.
@@ -1111,9 +1183,8 @@ actor BluetoothActor {
         
         clearReconnectState(for: id)
         
-        connectionStates[id] = .connected
         log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral connected")
-        broadcast(ConnectionStateChange(peripheralId: id, state: .connected), to: connectionStateChangesContinuations)
+        setConnectionState(.connected, for: id)
     }
 
     private func handleDidDisconnect(_ payload: ConnectionPayload) {
@@ -1128,11 +1199,8 @@ actor BluetoothActor {
             // explicit `cancelPeripheralConnection`, so we intentionally ignore `payload.error` here
             // and always report a clean disconnect — otherwise the app/Demo would misclassify an
             // intentional disconnect as an error drop.
-            let state: ConnectionState = .disconnected(reason: nil)
-            connectionStates[id] = state
             log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected (explicit)")
-            
-            broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+            setConnectionState(.disconnected(reason: nil), for: id)
             
             return
         }
@@ -1142,25 +1210,20 @@ actor BluetoothActor {
             // (library) cannot overlap under odd callback ordering.
             taskRegistry.cancel(id)
 
-            connectionStates[id] = .reconnecting(source: .system, attempt: nil, nextRetryAt: nil)
             log?.info(tags: [.peripheral(id), .category(.connection)], "System auto-reconnect in progress")
-            
-            broadcast(ConnectionStateChange(peripheralId: id, state: .reconnecting(source: .system, attempt: nil, nextRetryAt: nil)), to: connectionStateChangesContinuations)
+            setConnectionState(.reconnecting(source: .system, attempt: nil, nextRetryAt: nil), for: id)
             
             return
         }
         
         let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
-        let state: ConnectionState = .disconnected(reason: mappedError)
-        connectionStates[id] = state
-        
         if let error = mappedError {
             log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected with error: \(error)")
         } else {
             log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected")
         }
         
-        broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+        setConnectionState(.disconnected(reason: mappedError), for: id)
         armReconnect(id: id)
     }
 
@@ -1171,12 +1234,9 @@ actor BluetoothActor {
         }
         
         let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
-        let state: ConnectionState = .failed(reason: mappedError)
-        connectionStates[id] = state
-        
         log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral connection failed with error: \(mappedError ?? .unknown)")
         
-        broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+        setConnectionState(.failed(reason: mappedError), for: id)
         armReconnect(id: id)
     }
 
@@ -1223,8 +1283,7 @@ actor BluetoothActor {
         let sleepNanos: UInt64 = nanosDouble >= Double(UInt64.max) ? .max : UInt64(nanosDouble)
 
         let nextRetryAt = Date().addingTimeInterval(delaySeconds)
-        connectionStates[id] = .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)
-        broadcast(ConnectionStateChange(peripheralId: id, state: .reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt)), to: connectionStateChangesContinuations)
+        setConnectionState(.reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt), for: id)
 
         let task = Task { [weak self] in
             do {
@@ -1257,10 +1316,8 @@ actor BluetoothActor {
         } catch {
             let reason = (error as? PeripheralError) ?? .unknown
             clearReconnectState(for: id)
-            let state: ConnectionState = .failed(reason: reason)
-            connectionStates[id] = state
             log?.warn(tags: [.peripheral(id), .category(.connection)], "Reconnect attempt failed: \(reason)")
-            broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+            setConnectionState(.failed(reason: reason), for: id)
         }
     }
     

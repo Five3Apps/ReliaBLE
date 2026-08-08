@@ -57,3 +57,4 @@ The library is built with Swift 6 and **complete concurrency checking**. The `Re
 - Public API on `ReliaBLEManager` is the supported surface for external consumers. Adding/removing methods there is a breaking change.
 - `forceMock: true` is currently passed to `CBCentralManagerFactory.instance(...)` in `BluetoothActor`. The production factory ignores this parameter; the mock factory honors it. Don't "clean it up" — it's load-bearing for the test target.
 - DocC catalog lives at `Sources/ReliaBLE/Documentation.docc/`. The `swift-docc-plugin` is a package dep so `swift package generate-documentation` works. This documentation **must** be kept up to date with the public API on `ReliaBLEManager` and the overall architecture and usage patterns.
+- **Generated DocC output goes to `./user-docs` (gitignored), never `./docs`.** `./docs` is AI agent managed plans, designs, investigations, and reviews.

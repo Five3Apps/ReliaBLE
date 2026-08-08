@@ -25,92 +25,209 @@
 //  SOFTWARE.
 
 import Foundation
+import Synchronization
 
-/// An immutable, `Sendable` value snapshot of a Bluetooth peripheral and its metadata.
+/// A long-lived control handle for a Bluetooth peripheral.
 ///
-/// A `Peripheral` carries no reference to the underlying CoreBluetooth `CBPeripheral`. The live `CBPeripheral` is
-/// owned exclusively by the library in an `id`-keyed registry that never escapes its internal concurrency domain.
-/// Operations that need the live peripheral (such as ``ReliaBLEManager/connect(to:autoReconnect:)``) forward the snapshot's ``id``;
-/// the actor looks up the live reference and throws ``PeripheralError/notFound`` if the snapshot has since gone stale.
+/// A `Peripheral` is the object an app holds onto and acts through: it owns ``connect(autoReconnect:)`` and
+/// ``disconnect()``, and it exposes the last-known metadata for the device it represents. Unlike a
+/// ``DiscoveredPeripheral`` — a per-scan value snapshot — a handle is *stable*: there is exactly **one handle
+/// instance per ``id`` per ``ReliaBLEManager``, so it is safe to store one in a view model and rely on reference
+/// identity (`===`).
 ///
-/// The integrating app can also construct a `Peripheral` from a known identifier *before* it has been discovered —
-/// for example, a wearable bound to the user's account — using ``init(id:)``. Such a snapshot has no
-/// ``advertisement`` (and no live reference) until ReliaBLE matches it against a discovered `CBPeripheral`.
+/// ## Obtaining a handle
 ///
-/// Because it is a pure value type, a `Peripheral` is freely sendable across isolation domains and safe to hand to
-/// the integrating app for UI display.
-public struct Peripheral: Sendable, Identifiable, Hashable {
-    /// Unique identifier for the peripheral.
+/// Handles are never constructed directly. Obtain one either from a known identifier, before the device has ever
+/// been seen:
+///
+/// ```swift
+/// let band = manager.peripheral(id: "user-band")
+/// ```
+///
+/// …or from a discovery snapshot:
+///
+/// ```swift
+/// for await discovered in manager.discoveredPeripherals {
+///     for snapshot in discovered {
+///         let handle = snapshot.peripheral   // the same instance `peripheral(id:)` returns
+///     }
+/// }
+/// ```
+///
+/// ## Metadata is last-known, not live
+///
+/// ``name``, ``rssi``, ``lastSeen``, ``advertisement``, and ``connectionState`` are synchronous, cached reads of
+/// the most recent value the library resolved for this ``id``. They are deliberately *not* `async`, so SwiftUI row
+/// bodies can read them inline. Two consequences follow:
+///
+/// - **Reads are per-property, not one atomic snapshot.** Reading ``name`` then ``rssi`` can straddle two
+///   discovery updates. This is benign for display but is a real part of the contract.
+/// - **There is no change notification.** `Peripheral` is a plain `Sendable` class — it is not `@Observable` and
+///   publishes nothing. Use ``ReliaBLEManager/discoveredPeripherals`` as the "something changed" tick and re-read
+///   handle metadata inside that loop; likewise re-read ``connectionState`` inside a
+///   ``ReliaBLEManager/connectionStateChanges`` loop.
+///
+/// Metadata survives a radio reset: after the library invalidates its live CoreBluetooth references, the last-known
+/// values remain readable while ``connect(autoReconnect:)`` throws ``PeripheralError/notFound`` until the device is
+/// rediscovered.
+///
+/// ## Concurrency
+///
+/// `Peripheral` is a checked `Sendable` class. All mutable state lives inside a single `Mutex`; every other stored
+/// property is immutable. The handle holds **no** `CBPeripheral` — live CoreBluetooth objects never leave the
+/// library's internal isolation domain, and operations forward by ``id``.
+///
+/// The handle's reference to its manager is **weak**: a handle can legitimately outlive the manager that vended it.
+/// An orphaned handle keeps its metadata but throws ``PeripheralError/bluetoothUnavailable`` from
+/// ``connect(autoReconnect:)`` and ``disconnect()``.
+public final class Peripheral: Sendable, Identifiable, Hashable {
+    /// Everything mutable about a handle, guarded by a single lock.
     ///
-    /// When provided by the integrating app via ``init(id:)`` this is the app's own identifier. When resolved at
-    /// discovery time it is the peripheral's advertised name, its local name, or — as a fallback — the CoreBluetooth
-    /// identifier string.
+    /// The `weak` manager reference is sound here specifically *because* it is boxed: every read and write happens
+    /// under the mutex, and the runtime's weak load/zeroing is atomic with respect to deallocation. A bare
+    /// `weak var` on an `@unchecked Sendable` class would not be.
+    private struct State {
+        weak var manager: ReliaBLEManager?
+        var cbIdentifier: UUID?
+        var name: String?
+        var rssi: Int?
+        var lastSeen: Date?
+        var advertisement: AdvertisementData?
+        var connectionState: ConnectionState?
+    }
+
+    /// Unique, app-facing identifier for the peripheral.
+    ///
+    /// When the app creates the handle via ``ReliaBLEManager/peripheral(id:)`` this is the app's own identifier.
+    /// When the library resolves it at discovery time it is the peripheral's advertised name, its local name, or —
+    /// as a fallback — the CoreBluetooth identifier string.
     public let id: String
 
-    /// The CoreBluetooth identifier for the peripheral, used to retrieve it after invalidation.
+    private let state: Mutex<State>
+
+    /// Creates a handle. **Only ``PeripheralHandleRegistry`` may call this** — the registry is what guarantees the
+    /// one-instance-per-id invariant, and a second construction site would silently break it. This is enforced by
+    /// review convention rather than by access control, since the registry lives in its own file.
+    init(id: String, manager: ReliaBLEManager?) {
+        self.id = id
+        self.state = Mutex(State(manager: manager))
+    }
+
+    // MARK: - Last-known metadata
+
+    /// The CoreBluetooth identifier for the peripheral, used to re-resolve the live peripheral after invalidation.
     ///
-    /// `nil` for an app-constructed peripheral that has not yet been discovered.
-    public let cbIdentifier: UUID?
+    /// `nil` until the peripheral has been discovered or restored.
+    public var cbIdentifier: UUID? { state.withLock { $0.cbIdentifier } }
 
-    /// The name advertised by the peripheral, if available.
-    public let name: String?
+    /// The name most recently advertised by the peripheral, if any.
+    public var name: String? { state.withLock { $0.name } }
 
-    /// Signal strength indicator (RSSI) of the most recent advertisement.
-    public let rssi: Int?
+    /// Signal strength indicator (RSSI) from the most recent advertisement.
+    public var rssi: Int? { state.withLock { $0.rssi } }
 
-    /// The timestamp when the peripheral was last seen.
-    public let lastSeen: Date?
+    /// When the peripheral was last seen — or, for a peripheral recovered through state restoration, when its live
+    /// reference was last bound.
+    public var lastSeen: Date? { state.withLock { $0.lastSeen } }
 
     /// The typed advertisement data from the most recent discovery.
     ///
-    /// `nil` until the peripheral has been discovered. Advertisement data is transient, per-discovery information; it
-    /// is not the peripheral's connected GATT service catalog.
-    public let advertisement: AdvertisementData?
+    /// `nil` until the peripheral has been discovered. Advertisement data is transient, per-discovery information;
+    /// it is not the peripheral's connected GATT service catalog.
+    public var advertisement: AdvertisementData? { state.withLock { $0.advertisement } }
 
-    /// Registers a known peripheral before it has been discovered.
+    /// The last-known connection state for this peripheral, or `nil` if the library is not tracking one.
     ///
-    /// Use this when the integrating app already has a stable identifier for a peripheral — such as a device bound to
-    /// the user's account — and wants ReliaBLE to match it against the corresponding `CBPeripheral` once discovered.
-    /// The resulting snapshot has no ``cbIdentifier``, ``name``, ``rssi``, ``lastSeen``, or ``advertisement`` until
-    /// discovery populates them.
+    /// Mirrored from the library's internal connection tracking, including when that tracking is *cleared*: unlike
+    /// the metadata properties above, this reverts to `nil` when the library drops its connection state (for
+    /// example after Bluetooth is powered off and live references are invalidated), rather than reporting a state
+    /// that is known to be false. As with the other cached properties there is no change notification — re-read it
+    /// inside a ``ReliaBLEManager/connectionStateChanges`` loop.
     ///
-    /// - Parameter id: The integrating app's unique identifier for the peripheral.
-    public init(id: String) {
-        self.init(id: id, cbIdentifier: nil, name: nil, rssi: nil, lastSeen: nil, advertisement: nil)
+    /// That loop is a complete tick: a clear emits ``ConnectionState/disconnected(reason:)`` carrying
+    /// ``PeripheralError/bluetoothUnavailable``, so re-reading on every event is sufficient and this property never
+    /// strands a stale `.connected`. Note the deliberate asymmetry — the event describes the transition that
+    /// happened, while the handle reports `nil` for "the library is no longer tracking this peripheral."
+    public var connectionState: ConnectionState? { state.withLock { $0.connectionState } }
+
+    // MARK: - Connection
+
+    /// Initiates a connection to this peripheral.
+    ///
+    /// - Parameter autoReconnect: When `true` (the default), the library passes
+    ///   `CBConnectPeripheralOptionEnableAutoReconnect` to the system and arms the app-side exponential-backoff
+    ///   ladder for cases the OS option doesn't cover. Set to `false` for one-shot connections where reconnection
+    ///   is not desired.
+    /// - Throws: ``PeripheralError/notFound`` if the library holds no live reference for this ``id`` — either it
+    ///   has never been discovered, or its reference was invalidated. ``PeripheralError/bluetoothUnavailable`` if
+    ///   Bluetooth has not been set up (for example, not yet authorized), or if the manager that vended this handle
+    ///   has been deallocated or shut down.
+    public func connect(autoReconnect: Bool = true) async throws {
+        guard let manager = state.withLock({ $0.manager }) else { throw PeripheralError.bluetoothUnavailable }
+
+        await manager.bluetooth.ensureCentralManager()
+        try await manager.bluetooth.connect(id: id, autoReconnect: autoReconnect)
     }
 
-    /// Creates a fully-specified peripheral snapshot. Used internally at discovery time.
+    /// Initiates a disconnection from this peripheral.
     ///
-    /// - Parameters:
-    ///   - id: Unique identifier for the peripheral.
-    ///   - cbIdentifier: The CoreBluetooth identifier, used to re-resolve the live peripheral after invalidation.
-    ///   - name: The name advertised by the peripheral, if available.
-    ///   - rssi: Signal strength indicator (RSSI) of the most recent advertisement.
-    ///   - lastSeen: The timestamp when the peripheral was last seen.
-    ///   - advertisement: The typed advertisement data from the most recent discovery.
-    init(
-        id: String,
-        cbIdentifier: UUID? = nil,
-        name: String? = nil,
-        rssi: Int? = nil,
-        lastSeen: Date? = nil,
-        advertisement: AdvertisementData? = nil
+    /// - Throws: ``PeripheralError/notFound`` if the library holds no live reference for this ``id``, or
+    ///   ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up or the vending manager is gone.
+    public func disconnect() async throws {
+        guard let manager = state.withLock({ $0.manager }) else { throw PeripheralError.bluetoothUnavailable }
+
+        await manager.bluetooth.ensureCentralManager()
+        try await manager.bluetooth.disconnect(id: id)
+    }
+
+    // MARK: - Internal mutation
+    //
+    // Both entry points are called from `PeripheralHandleRegistry` on behalf of `BluetoothActor`, so writes are
+    // already serialized by the actor's executor. The lock exists to make *reads* from arbitrary isolation domains
+    // safe, not to order writes.
+    //
+    // FR-10 (#52) will attach the sticky discovery filter, command queue, and GATT readiness state to this type.
+    // Nothing for it is stored here yet.
+
+    /// Mirrors the resolved discovery/restore snapshot onto the handle.
+    ///
+    /// Values are applied exactly as given: the caller has already merged them (see
+    /// `BluetoothActor.resolveAndUpsertDiscovered`), so the handle and the snapshot list never disagree.
+    func applyMetadata(
+        cbIdentifier: UUID?,
+        name: String?,
+        rssi: Int?,
+        lastSeen: Date?,
+        advertisement: AdvertisementData?
     ) {
-        self.id = id
-        self.cbIdentifier = cbIdentifier
-        self.name = name
-        self.rssi = rssi
-        self.lastSeen = lastSeen
-        self.advertisement = advertisement
+        state.withLock {
+            $0.cbIdentifier = cbIdentifier
+            $0.name = name
+            $0.rssi = rssi
+            $0.lastSeen = lastSeen
+            $0.advertisement = advertisement
+        }
     }
+
+    /// Mirrors a connection-state transition onto the handle. `nil` clears it, for when the library stops tracking
+    /// a connection state for this peripheral entirely.
+    func applyConnectionState(_ connectionState: ConnectionState?) {
+        state.withLock { $0.connectionState = connectionState }
+    }
+
+    // MARK: - Hashable
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
 
+    /// Equality keys on ``id`` only, matching the id-keyed connection-state tracking used throughout the library.
+    ///
+    /// Within a single manager this is equivalent to identity, because handles are interned. Across *two* managers
+    /// it is not: two handles for the same ``id`` vended by different managers compare `==` but are distinct
+    /// objects on distinct registries, and each can only talk to its own manager. Multi-manager apps must not mix
+    /// them; use `===` when identity is what you mean.
     public static func == (lhs: Peripheral, rhs: Peripheral) -> Bool {
-        // Equality keys on `id` only: the identifier is unique and the matching between `Peripheral` snapshots and
-        // their live `CBPeripheral` is handled internally by the library.
         return lhs.id == rhs.id
     }
 }

@@ -63,6 +63,35 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # Compile-only gate for the four non-macOS platforms declared in Package.swift. Tests stay macOS-only
+  # because they need the CoreBluetoothMock harness, not a real radio — but without this leg a change
+  # could silently break a declared platform.
+  platform-build:
+    name: Build (${{ matrix.platform }})
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [iOS, tvOS, watchOS, visionOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          if [ ! -d /Applications/Xcode_16.4.app ]; then
+            echo "Xcode 16.4 not found. Installed Xcode versions:"
+            ls /Applications | grep Xcode || true
+            exit 1
+          fi
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Build
+        run: |
+          xcodebuild build \
+            -scheme ReliaBLE \
+            -destination 'generic/platform=${{ matrix.platform }}'
+
   docc:
     name: DocC catalog
     runs-on: macos-15
@@ -85,14 +114,18 @@ jobs:
       # Builds the static-hosting site AND acts as the DocC validation gate on
       # every PR via --warnings-as-errors. The extra static-hosting flags don't
       # affect validation; they just shape the output for GitHub Pages.
+      #
+      # Output goes to ./user-docs, NOT ./docs. Publishing is by Pages artifact (below), so the
+      # directory name is arbitrary — and ./docs holds hand-written plans, designs, and reviews that
+      # generate-documentation would wipe out when this command is run locally.
       - name: Build DocC catalog
         run: |
-          swift package --allow-writing-to-directory ./docs \
+          swift package --allow-writing-to-directory ./user-docs \
             generate-documentation --target ReliaBLE \
             --disable-indexing \
             --transform-for-static-hosting \
             --hosting-base-path ReliaBLE \
-            --output-path ./docs \
+            --output-path ./user-docs \
             --warnings-as-errors
 
       # Only publish from master; PRs validate but do not deploy.
@@ -100,7 +133,7 @@ jobs:
         if: github.ref == 'refs/heads/master'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./docs
+          path: ./user-docs
 
   deploy-docs:
     name: Deploy documentation
