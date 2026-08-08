@@ -47,6 +47,26 @@ public enum PeripheralError: Error, Sendable, Equatable {
     /// retrying; if the manager is gone, create a new one and obtain a fresh handle.
     case bluetoothUnavailable
 
+    /// Bluetooth is powered off, so the operation could not be performed.
+    ///
+    /// Thrown when an operation requires a usable radio but `CBCentralManager.state` is
+    /// `.poweredOff`. This is a **terminal fail-fast** condition: user-disabled Bluetooth is
+    /// a decision the app must surface, not a condition to hang the wait on, so the wait
+    /// does not continue when this state is reached.
+    case bluetoothPoweredOff
+
+    /// Bluetooth is unsupported on this device, so the operation could not be performed.
+    ///
+    /// Thrown when an operation requires a usable radio but `CBCentralManager.state` is
+    /// `.unsupported`. Like ``bluetoothPoweredOff``, this is a **terminal fail-fast**
+    /// condition — the radio will never become usable, so the operation fails rather than
+    /// awaiting.
+    ///
+    /// Unlike the transient states (`.resetting` and `.unknown`), which are awaited until
+    /// they resolve, ``bluetoothPoweredOff`` and ``bluetoothUnsupported`` fail promptly.
+    /// ``bluetoothUnavailable`` covers the `.unauthorized`, no-central, and shut-down cases.
+    case bluetoothUnsupported
+
     /// The connection to the peripheral failed.
     case connectionFailed
 
