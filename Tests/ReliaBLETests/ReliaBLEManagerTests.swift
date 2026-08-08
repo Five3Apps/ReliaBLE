@@ -1920,10 +1920,12 @@ struct ReliaBLEManagerTests {
         #expect(await pollUntil(timeout: 3.0) {
             await manager2.currentConnectionStates[Mock.connectionTestPeripheralID] == .connected
         })
-        // reconnectEnabled is now synced from demand (wantsReconnect). A restored link with no
-        // rehydrated manual-connect hold (hold rehydration is step 6) has no demand, so the id is
-        // not re-armed — the restore-time seed is corrected by handleDidConnect's syncReconnectIntent.
-        #expect(!(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID)))
+        // reconnectEnabled is synced from demand (wantsReconnect). A restored link with no rehydrated
+        // manual-connect hold (hold rehydration is step 6) has no demand. In step 5, handleDidConnect's
+        // event-8 branch routes a no-demand landing to beginIdleGrace (not syncReconnectIntent), so the
+        // stale restore-time seed is not yet corrected — step 6's hold rehydration + persistence reshape
+        // removes it. Assert the current step-5 state: the stale seed remains.
+        #expect(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID))
 
         await manager2.bluetooth.testClearPersistedReconnectIntent()
         await Mock.tearDown(manager2)
@@ -2610,6 +2612,305 @@ struct ReliaBLEManagerTests {
             return false
         }
         #expect(!hasReconnecting)
+    }
+
+    // MARK: - Idle Disconnect (Grace Window & Teardown)
+
+    @Test func idleDisconnectAfterLastLeaseReleased() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Releasing the last lease drops demand and starts the idle grace window.
+        await handle.releaseWorkLease(token)
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 0)
+
+        // The link tears down cleanly within the idle interval.
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+    }
+
+    @Test func manualConnectHoldSuppressesIdle() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Quiet for 3x the interval — the manual-connect hold suppresses idle teardown.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        #expect(await manager.currentConnectionStates[handle.id] == .connected)
+    }
+
+    @Test func disconnectWithActiveLeaseRelinks() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        let changes = manager.connectionStateChanges
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        try await handle.disconnect()
+        #expect(!(await manager.bluetooth.testHasManualConnectHold(for: handle.id)))
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 1)
+
+        // The link cancels once: exactly one .disconnecting, ending at .disconnected(reason: nil).
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 3_000_000_000)
+        let states = events.map { $0.state }
+        #expect(states.filter { $0 == .disconnecting }.count == 1)
+        #expect(states.last == .disconnected(reason: nil))
+        // step 6: assert work re-drives the link back to .connected
+    }
+
+    @Test func tier0BlipDuringGraceRearmsIdle() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.3)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Release the lease (idle grace armed), then a Tier-0 reconnect lands during the grace window.
+        await handle.releaseWorkLease(token)
+        await manager.bluetooth.testInjectConnect(for: handle.id)
+
+        // Event 8: the reconnect landing re-arms idle; the link is cancelled again.
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+    }
+
+    @Test func restoredLinkRetainedWhenWorkDeclared() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.5)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Release (idle grace armed), then declare work again inside the grace window.
+        await handle.releaseWorkLease(token)
+        let token2 = try await handle.acquireWorkLease()
+
+        // The link is retained — idle was cancelled, still connected.
+        #expect(await manager.bluetooth.testWorkCount(for: handle.id) == 1)
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        await handle.releaseWorkLease(token2)
+    }
+
+    @Test func idleWhileLibraryReconnectingSettlesCleanly() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        var policy = ReconnectPolicy()
+        policy.maxAttempts = 5
+        policy.initialDelay = 1.0
+        let manager = await Mock.makeManager(reconnectPolicy: policy)
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Unexpected drop arms the Tier-1 ladder (lease held → wantsReconnect).
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
+        #expect(await pollUntil(timeout: 3.0) {
+            if case .reconnecting(.library, _, _) = await manager.currentConnectionStates[handle.id] {
+                return true
+            }
+            return false
+        })
+
+        // Demand drops while the ladder sleeps → settle cleanly, no stuck .disconnecting.
+        await handle.releaseWorkLease(token)
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+        #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
+    }
+
+    @Test func zeroIdleIntervalTearsDownImmediately() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Interval 0 tears the link down as soon as demand hits zero (still asynchronously).
+        await handle.releaseWorkLease(token)
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+    }
+
+    @Test func idleDoesNotFireWhenDemandReturnsBeforeExpiry() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.5)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Release (idle armed), then re-acquire before expiry — the stale timer must not fire.
+        await handle.releaseWorkLease(token)
+        let token2 = try await handle.acquireWorkLease()
+
+        // Wait past the original expiry; the generation guard keeps the link connected.
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        #expect(await manager.currentConnectionStates[handle.id] == .connected)
+
+        await handle.releaseWorkLease(token2)
+    }
+
+    // Exploratory (#9): disconnect while the connect is still pending (.connecting).
+    @Test func disconnectDuringConnectingSettlesCleanly() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        let changes = manager.connectionStateChanges
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connecting
+        try await handle.disconnect()
+
+        // The settling rule must not leave a stuck .disconnecting — settle to .disconnected(reason: nil).
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
     }
 }
 

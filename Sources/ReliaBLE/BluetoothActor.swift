@@ -176,6 +176,10 @@ actor BluetoothActor {
     private nonisolated let eventPipeline = EventPipeline()
     /// Nonisolated box so `deinit` may cancel reconnect tasks without touching actor-isolated state.
     private nonisolated let taskRegistry = TaskRegistry()
+    /// A *separate* registry for idle-grace timers, distinct from ``taskRegistry`` so a peripheral can
+    /// legitimately have both a reconnect-ladder task and an idle task pending without key collision
+    /// silently cancelling the wrong one (D-1).
+    private nonisolated let idleTaskRegistry = TaskRegistry()
 
     // MARK: - Actor-Isolated State
 
@@ -270,6 +274,11 @@ actor BluetoothActor {
     private var activeLeases: [String: Set<UUID>] = [:]
     private var manualConnectHold: [String: ManualConnectHold] = [:]
 
+    /// Generation counter per peripheral for the idle-grace timer, guarding against the same
+    /// cancel-during-sleep race the reconnect ladder defends against: bump on arm, capture, re-check
+    /// on wake. A stale generation means the timer was superseded and must not fire (D-1 event 6/7).
+    private var idleGeneration: [String: UInt64] = [:]
+
     // MARK: - Initialization
 
     /// Bridge to the owning manager's handle registry.
@@ -303,6 +312,7 @@ actor BluetoothActor {
     deinit {
         eventPipeline.finish()
         taskRegistry.cancelAll()
+        idleTaskRegistry.cancelAll()
     }
 
     /// Terminal teardown for tests/harness. Clears volatile state only — does **not** touch
@@ -313,6 +323,7 @@ actor BluetoothActor {
 
         eventPipeline.finish()
         taskRegistry.cancelAll()
+        idleTaskRegistry.cancelAll()
         delegateEventTask?.cancel()
         delegateEventTask = nil
 
@@ -357,6 +368,7 @@ actor BluetoothActor {
         reconnectAttempts.removeAll()
         activeLeases.removeAll()
         manualConnectHold.removeAll()
+        idleGeneration.removeAll()
         pendingRestoredScanServices = nil
         pendingRestoredScanOptions = nil
     }
@@ -1469,7 +1481,10 @@ actor BluetoothActor {
     func applyManualConnectHold(id: String, reconnectDesired: Bool) {
         manualConnectHold[id] = ManualConnectHold(reconnectDesired: reconnectDesired)
         intentionalDisconnects.remove(id)
-        // TODO(step 5): cancel any idle timer for id here.
+        // A hold suppresses idle: bump the generation and cancel any pending idle timer for this id.
+        idleGeneration[id] = (idleGeneration[id] ?? 0) + 1
+        idleTaskRegistry.cancel(id)
+        log?.info(tags: [.peripheral(id), .category(.connection)], "Manual connect")
         syncReconnectIntent(id: id)
     }
 
@@ -1481,8 +1496,12 @@ actor BluetoothActor {
         manualConnectHold.removeValue(forKey: id)
         syncReconnectIntent(id: id)
 
-        // Cancel the Tier-1 ladder.
+        log?.info(tags: [.peripheral(id), .category(.connection)], "Manual disconnect")
+
+        // Cancel the Tier-1 ladder and any pending idle timer. A manual disconnect does not start one.
         taskRegistry.cancel(id)
+        idleGeneration[id] = (idleGeneration[id] ?? 0) + 1
+        idleTaskRegistry.cancel(id)
         reconnectAttempts[id] = nil
 
         guard let cbPeripheral = cbPeripherals[id] else { return }
@@ -1507,6 +1526,10 @@ actor BluetoothActor {
     func acquireWorkLease(id: String) async throws -> WorkLeaseToken {
         guard cbPeripherals[id] != nil else { throw PeripheralError.notFound }
 
+        // Work arriving suppresses idle: bump the generation and cancel any pending idle timer.
+        idleGeneration[id] = (idleGeneration[id] ?? 0) + 1
+        idleTaskRegistry.cancel(id)
+
         let leaseID = UUID()
         activeLeases[id, default: []].insert(leaseID)
         syncReconnectIntent(id: id)
@@ -1521,7 +1544,81 @@ actor BluetoothActor {
             return
         }
         syncReconnectIntent(id: token.id)
-        // TODO(step 5): begin idle grace if demand(id) is now false.
+        if !demand(id: token.id) {
+            beginIdleGrace(id: token.id)
+        }
+    }
+
+    /// Arms (or, for states with nothing to tear down, immediately settles) the idle-grace timer for
+    /// a peripheral whose demand has dropped to zero (D-1 event 6).
+    ///
+    /// Proceeds only when ``demand(id:)`` is false. For a peripheral in `.connected`, `.connecting`,
+    /// or system-`.reconnecting`, increments the generation guard, cancels any prior idle task, and
+    /// schedules ``fireIdle(id:generation:)`` after ``idleDisconnectInterval``. For a peripheral in a
+    /// state where nothing is teared down (library-`.reconnecting`, `.disconnected`, `.failed`),
+    /// cancels the reconnect ladder and settles synchronously to `.disconnected(reason: nil)` with no
+    /// timer and no CoreBluetooth cancel.
+    private func beginIdleGrace(id: String) {
+        guard !demand(id: id) else { return }
+
+        switch connectionStates[id] {
+        case .connected, .connecting, .reconnecting(source: .system, attempt: _, nextRetryAt: _):
+            // Arm the idle timer.
+            let generation = (idleGeneration[id] ?? 0) + 1
+            idleGeneration[id] = generation
+            idleTaskRegistry.cancel(id)
+
+            log?.info(tags: [.peripheral(id), .category(.connection)], "Idle timer armed for \(id)")
+
+            let interval = idleDisconnectInterval
+            let task = Task { [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(max(0, interval) * 1_000_000_000))
+                } catch {
+                    return // Cancelled — superseded by a newer arm or an acquire/hold/disconnect.
+                }
+                guard let self else { return }
+                await self.fireIdle(id: id, generation: generation)
+            }
+            idleTaskRegistry.insert(id, task)
+
+        case .reconnecting(source: .library, attempt: _, nextRetryAt: _), .disconnected, .failed, .none:
+            // Nothing linked to tear down: cancel the ladder and settle synchronously.
+            taskRegistry.cancel(id)
+            reconnectAttempts[id] = nil
+            setConnectionState(.disconnected(reason: nil), for: id)
+
+        case .disconnecting:
+            // A teardown is already in flight; leave it to resolve via `didDisconnect`. No timer, no settle.
+            break
+        }
+    }
+
+    /// Fires the idle-grace timer for a peripheral (D-1 event 7).
+    ///
+    /// No-ops when the captured generation is stale (a newer arm, acquire, hold, or disconnect
+    /// superseded this timer) or demand has since returned. Otherwise logs the idle disconnect and runs
+    /// the intentional-cancel path, which drops Tier-0; the result is `.disconnecting` →
+    /// `.disconnected(reason: nil)`, deliberately indistinguishable from an app disconnect to the
+    /// reconnect policy (FR-11.5 "intentional").
+    private func fireIdle(id: String, generation: UInt64) {
+        guard idleGeneration[id] == generation, !demand(id: id) else { return }
+
+        log?.info(tags: [.peripheral(id), .category(.connection)], "Idle disconnect fired for \(id)")
+
+        taskRegistry.cancel(id)
+        reconnectAttempts[id] = nil
+
+        // Settling rule: never publish an optimistic `.disconnecting` unless the peripheral is
+        // currently connected. Verify against the live `CBPeripheral` state, not the cached value.
+        guard let cbPeripheral = cbPeripherals[id], cbPeripheral.state == .connected else {
+            setConnectionState(.disconnected(reason: nil), for: id)
+            return
+        }
+
+        intentionalDisconnects.insert(id)
+        setConnectionState(.disconnecting, for: id)
+        centralManager?.cancelPeripheralConnection(cbPeripheral)
     }
 
     /// Test-only hook: number of live work leases for `id`.
@@ -1588,10 +1685,17 @@ actor BluetoothActor {
         }
         
         clearReconnectState(for: id)
-        syncReconnectIntent(id: id)
         
         log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral connected")
         setConnectionState(.connected, for: id)
+
+        if demand(id: id) {
+            syncReconnectIntent(id: id)
+        } else {
+            // Event 8: a reconnect landing with zero demand re-arms the idle timer and gets cancelled
+            // again — the accepted Tier-0 grace-window blip from FR-1.2.
+            beginIdleGrace(id: id)
+        }
     }
 
     private func handleDidDisconnect(_ payload: ConnectionPayload) {
@@ -1771,6 +1875,17 @@ actor BluetoothActor {
         guard let cbPeripheral = cbPeripherals[id] else { return }
         let payload = ConnectionPayload(peripheral: cbPeripheral, isReconnecting: isReconnecting, error: error)
         handleDidDisconnect(payload)
+    }
+
+    /// Test-only hook: injects a connect event, routing through the same ``handleDidConnect(_:)``
+    /// path as a real delegate callback.
+    ///
+    /// Used to simulate a Tier-0 reconnect landing with zero demand (D-1 event 8), which the mock
+    /// cannot drive directly once the link has been torn down.
+    func testInjectConnect(for id: String) {
+        guard let cbPeripheral = cbPeripherals[id] else { return }
+        let payload = ConnectionPayload(peripheral: cbPeripheral, isReconnecting: false, error: nil)
+        handleDidConnect(payload)
     }
 
     /// Test-only hook: runs the same peripheral invalidation as a Bluetooth reset/unauthorized path.
