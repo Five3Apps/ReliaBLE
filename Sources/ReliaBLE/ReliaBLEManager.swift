@@ -71,6 +71,7 @@ public final class ReliaBLEManager: Sendable {
             log: loggingService,
             reconnectPolicy: config.reconnectPolicy,
             restoreIdentifier: config.restoreIdentifier,
+            idleDisconnectInterval: config.idleDisconnectInterval,
             registry: handleRegistry
         )
 

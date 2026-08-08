@@ -171,6 +171,12 @@ actor BluetoothActor {
     /// resumed together once `CBCentralManager.authorization` resolves away from `.notDetermined`.
     private var authorizationContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
 
+    /// Continuations for in-flight ``waitUntilPoweredOn()`` calls parked on a transient radio state
+    /// (`.resetting` / `.unknown`), keyed by a per-call UUID so a cancelled call can resume just its own
+    /// continuation. All pending continuations are resumed together from ``resolvePoweredOnWaiters()`` on
+    /// the next central state update.
+    private var poweredOnContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+
     /// The current Bluetooth state.
     var currentBluetoothState: BluetoothState = .unknown
 
@@ -205,6 +211,9 @@ actor BluetoothActor {
     private var reconnectPolicy: ReconnectPolicy
     /// Stable CoreBluetooth restore identifier; `nil` disables state restoration.
     private var restoreIdentifier: String?
+    /// Idle interval (seconds) before a per-peripheral link with no demand is torn down. `0` tears
+    /// down as soon as demand reaches zero. Mutated by the test-only ``setIdleDisconnectInterval(_:)`` hook.
+    private var idleDisconnectInterval: TimeInterval
     /// Scan filter restored via `willRestoreState` when the central was not yet powered on.
     private var pendingRestoredScanServices: [CBUUID]?
     private var pendingRestoredScanOptions: RestoredScanOptions?
@@ -228,11 +237,17 @@ actor BluetoothActor {
         log: LoggingService,
         reconnectPolicy: ReconnectPolicy,
         restoreIdentifier: String?,
+        idleDisconnectInterval: TimeInterval,
         registry: PeripheralRegistryBridge
     ) {
         self.log = log
         self.reconnectPolicy = reconnectPolicy
         self.restoreIdentifier = restoreIdentifier
+        if !idleDisconnectInterval.isFinite || idleDisconnectInterval < 0 {
+            self.idleDisconnectInterval = 5.0
+        } else {
+            self.idleDisconnectInterval = idleDisconnectInterval
+        }
         self.registry = registry
     }
 
@@ -265,6 +280,12 @@ actor BluetoothActor {
         authorizationContinuations.removeAll()
         for continuation in pendingAuth.values {
             continuation.resume(throwing: CancellationError())
+        }
+
+        let pendingPoweredOn = poweredOnContinuations
+        poweredOnContinuations.removeAll()
+        for continuation in pendingPoweredOn.values {
+            continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
         }
 
         centralManager = nil
@@ -610,6 +631,83 @@ actor BluetoothActor {
         }
     }
 
+    // MARK: - PoweredOn
+
+    /// Suspends until the central manager is in a usable state, or throws a typed error for
+    /// terminal states. Mirrors the authorization-continuation pattern.
+    ///
+    /// - Shut down or no central → ``PeripheralError/bluetoothUnavailable``
+    /// - `.poweredOff` → ``PeripheralError/bluetoothPoweredOff``
+    /// - `.unsupported` → ``PeripheralError/bluetoothUnsupported``
+    /// - `.unauthorized` → ``PeripheralError/bluetoothUnavailable``
+    /// - `.resetting` / `.unknown` → parks a continuation until the next state update
+    /// - Task cancellation → ``CancellationError``
+    func waitUntilPoweredOn() async throws {
+        guard !isShutdown else { throw PeripheralError.bluetoothUnavailable }
+        guard let centralManager else { throw PeripheralError.bluetoothUnavailable }
+        switch centralManager.state {
+        case .poweredOn:
+            return
+        case .poweredOff:
+            throw PeripheralError.bluetoothPoweredOff
+        case .unsupported:
+            throw PeripheralError.bluetoothUnsupported
+        case .unauthorized:
+            throw PeripheralError.bluetoothUnavailable
+        case .resetting, .unknown:
+            try await suspendForPoweredOn()
+        @unknown default:
+            throw PeripheralError.bluetoothUnavailable
+        }
+    }
+
+    /// Parks a continuation for ``waitUntilPoweredOn()`` until the radio becomes usable.
+    private func suspendForPoweredOn() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            guard !Task.isCancelled else {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            let id = UUID()
+            poweredOnContinuations[id] = continuation
+        }
+    }
+
+    /// Resolves all pending ``waitUntilPoweredOn()`` calls based on the current radio state.
+    ///
+    /// Called from ``handleCentralManagerStateUpdate()`` on every state update. Terminal states
+    /// fail all waiters; `.poweredOn` resumes them successfully; transient states leave them parked.
+    private func resolvePoweredOnWaiters() {
+        guard !poweredOnContinuations.isEmpty else { return }
+        guard let centralManager else { return }
+        let result: Result<Void, Error>
+        switch centralManager.state {
+        case .poweredOn:
+            result = .success(())
+        case .poweredOff:
+            result = .failure(PeripheralError.bluetoothPoweredOff)
+        case .unsupported:
+            result = .failure(PeripheralError.bluetoothUnsupported)
+        case .unauthorized:
+            result = .failure(PeripheralError.bluetoothUnavailable)
+        case .resetting, .unknown:
+            return
+        @unknown default:
+            result = .failure(PeripheralError.bluetoothUnavailable)
+        }
+        let pending = poweredOnContinuations
+        poweredOnContinuations.removeAll()
+        for continuation in pending.values {
+            continuation.resume(with: result)
+        }
+    }
+
+    /// Resumes a single pending ``waitUntilPoweredOn()`` continuation with a `CancellationError`,
+    /// if still pending. Invoked from a `withTaskCancellationHandler` onCancel.
+    func cancelPoweredOnContinuation(_ id: UUID) {
+        poweredOnContinuations.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+
     // MARK: - Scanning
 
     func startScanning(services: sending [CBUUID]? = nil) {
@@ -857,6 +955,7 @@ actor BluetoothActor {
 
         updateState()
         resolvePendingAuthorization()
+        resolvePoweredOnWaiters()
     }
 
     func handlePeripheralDiscovered(
@@ -1330,6 +1429,21 @@ actor BluetoothActor {
     /// Test-only hook
     func setReconnectPolicy(_ policy: ReconnectPolicy) {
         reconnectPolicy = policy
+    }
+
+    /// Test-only hook: overrides the idle disconnect interval (seconds). `0` tears down as soon
+    /// as demand reaches zero.
+    func setIdleDisconnectInterval(_ interval: TimeInterval) {
+        if !interval.isFinite || interval < 0 {
+            idleDisconnectInterval = 5.0
+        } else {
+            idleDisconnectInterval = interval
+        }
+    }
+
+    /// Test-only hook: number of continuations currently parked by ``waitUntilPoweredOn()``.
+    func testPendingPoweredOnWaiterCount() -> Int {
+        poweredOnContinuations.count
     }
 
     /// Test-only hook: injects a disconnect event with the specified `isReconnecting` flag,
