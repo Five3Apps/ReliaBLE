@@ -45,12 +45,13 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
 ### Connection model (work-driven primary)
 
 - **Primary path:** work drives the link. A non-empty per-`Peripheral` command queue causes auto-connect (and discovery to *ready* when required). When the queue is empty and there is no manual-connect hold, start **idle disconnect** (global config, **default 5 seconds**).
-- **Manual connect:** `Peripheral.connect(autoReconnect:)` / `disconnect()` set a manual-connect hold that suppresses idle teardown while held. Documented as Advanced; expected to be rare. Same ensure-linked path as work-driven connect—not a second connection stack or either-or mode enum.
+- **Manual connect:** `Peripheral.connect(autoReconnect:)` / `disconnect()` set a manual-connect hold that suppresses idle teardown while held. Documented as Advanced; expected to be rare. Same ensure-linked path as work-driven connect—not a second connection stack or either-or mode enum. Holds are durable across relaunch when state restoration is configured; work is process-scoped and never restored (FR-11.6.3).
 - **Reconnect (Approach B):**
   - **Tier-0** (OS `CBConnectPeripheralOptionEnableAutoReconnect`): enabled on work-driven connects while the link is up; **ended** when idle teardown or intentional disconnect cancels the connection.
   - **Tier-1** (library exponential-backoff ladder): armed on unexpected disconnect **only while** the command queue is non-empty (or a manual-connect hold with reconnect desired). Disarmed when the queue is empty and there is no such hold.
   - Accepted gap: during the idle grace window, Tier-0 may reconnect once with an empty queue; if still quiet and no manual-connect hold, cancel again.
 - **PoweredOn:** work submission (scan, connect, command/`run`) **awaits** a usable radio (`PoweredOn`) rather than silently no-op’ing. Terminal states (unauthorized, unsupported, powered off per policy) **fail** promptly with typed errors. Bluetooth state remains observable for UI gating.
+- **Demand across outages:** a radio power cycle invalidates live peripheral references but preserves demand; demanded links re-establish when the radio returns, and the waiting period is visible as `reconnecting` without attempt values (FR-11.6).
 - Manager-level `connect(to:)` as the primary app API is a **refactor target**: connect/disconnect/run/discovery belong on **`Peripheral`**.
 
 ### Implementation sequencing (v1)
@@ -71,11 +72,11 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
 1. Reliability of Communication:
 
 - FR-1.1: Implement error detection and correction mechanisms for each BLE transaction (command/watchdog layer; builds on FR-4/FR-5 after FR-10).
-- FR-1.2: Ensure automatic reconnection per the connection model (Approach B: Tier-0 while linked on work-driven connects; Tier-1 ladder with exponential backoff while work is pending or a manual-connect hold requests reconnect). On reconnection, services and characteristics must be re-discovered rather than reused, as part of returning to a discovery-*ready* state (FR-10.6, FR-10.3); a re-established link alone is not sufficient to resume characteristic I/O. Command-layer reconnect-and-rerun (FR-4/FR-5) depends on this ready transition rather than treating "connected again" as enough. (Tier-1 backoff substrate exists; queue/hold gating, idle cancel of Tier-0, and discovery re-run remain open.)
+- FR-1.2: Ensure automatic reconnection per the connection model (Approach B: Tier-0 while linked on work-driven connects; Tier-1 ladder with exponential backoff while work is pending or a manual-connect hold requests reconnect). On reconnection, services and characteristics must be re-discovered rather than reused, as part of returning to a discovery-*ready* state (FR-10.6, FR-10.3); a re-established link alone is not sufficient to resume characteristic I/O. Command-layer reconnect-and-rerun (FR-4/FR-5) depends on this ready transition rather than treating "connected again" as enough. (Both tiers are gated on demand—pending work or a reconnect-desiring manual-connect hold—and idle teardown cancels the connection, which ends Tier-0. Discovery re-run on reconnection remains open, pending FR-10.)
 - FR-1.3: Provide status updates on connection stability and data transmission integrity.
     - ✅ FR-1.3.1: Provide status updates on connection stability (e.g. connected, disconnected, reconnecting), exposed in a device-centric way on `Peripheral` (and/or equivalent streams) as the type model lands.
     - FR-1.3.2: Provide status updates on data transmission integrity (command/transaction layer).
-- ✅ FR-1.4: **PoweredOn gating for work:** Scan, connect, and command submission must await `PoweredOn` (or equivalent usable state) instead of silently no-op’ing when the radio is not ready. Terminal unusable states fail with typed errors. Observability of Bluetooth state for UI remains required.
+- ✅ FR-1.4: **PoweredOn gating for work:** Scan, connect, and command submission must await `PoweredOn` (or equivalent usable state) instead of silently no-op’ing when the radio is not ready. Terminal unusable states fail with typed errors. Observability of Bluetooth state for UI remains required. Transient states (`resetting`, `unknown`, and the pre-first-state window) await; `poweredOff`, `unsupported`, and `unauthorized` are terminal and fail immediately. Scan and connect satisfy this today; command submission inherits the same await when FR-4/FR-5 land, and the internal work-acquisition path must adopt it at that point.
 - ✅ FR-1.5: **Idle disconnect:** When a `Peripheral` has no pending/queued commands and no manual-connect hold, disconnect after a configurable idle interval. Default interval is **5 seconds**. Configuration is **global** (not per-peripheral) unless a future requirement explicitly adds per-device overrides.
 
 
@@ -120,7 +121,7 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - FR-4.2.3: Read-write (both read from and write to peripherals).
     - FR-4.2.4: Write-only (send data to peripherals).
 - FR-4.3: Implement parsing of responses from peripherals into a usable Swift data structure (app-supplied decode as appropriate).
-- FR-4.4: **Work-driven link:** Enqueueing/running a command on a disconnected `Peripheral` must auto-connect (and run discovery to ready as needed) without requiring a prior Manual `connect`, unless product policy for never-seen ids chooses fail-fast (implementation planning).
+- FR-4.4: **Work-driven link:** Enqueueing/running a command on a disconnected `Peripheral` must auto-connect (and run discovery to ready as needed) without requiring a prior Manual `connect`. **Never-seen-id policy is fail-fast:** work targeting an id with no live CoreBluetooth peripheral fails with a typed not-found error. The library does not start a scan and does not retry behind that failure; recovery is retrieve-only (system cache / known-id retrieval), plus an opportunistic relink when an app-driven scan rediscovers an id that already has outstanding demand. Demand is **retained** across such a failure—it is dropped only by explicit `disconnect()` or work completion—so the failure is reported to the caller without silently discarding intent. Library-owned scan policy that would close this gap belongs to FR-8.2.
 - FR-4.5: **Reconnect-and-rerun:** On unexpected disconnect with commands still queued or in flight, after link recovery and return to discovery-*ready*, retry/resume command execution so transient drops do not require the app to re-drive the queue (idempotent command design preferred).
 - FR-4.6: **Exactly-once completion:** Each command finishes with a single terminal success or failure (no double completion).
 - FR-4.7: **Watchdogs:** Enforce per-step (or per-command) timeouts; streaming/multi-frame commands may reset the watchdog per frame as specified in implementation.
@@ -177,7 +178,7 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - FR-8.5.3: Once identified, maintain this mapping of the unique identifier to the peripheral's BLE address or other identifying characteristics to ensure consistent tracking across sessions or reconnections. Handle interning and discovery matching (FR-2.4, FR-10.6.2) must adopt this identity model when available.
     - FR-8.5.4: Settle how the raw advertisement feed (FR-8.1.3, FR-8.1.4) correlates to the identity model — specifically whether `PeripheralDiscoveryEvent` (or equivalent) exposes the app-facing peripheral id alongside the CoreBluetooth identifier. This is deferred here deliberately: resolving it before FR-8.5 would bake in the interim name-derived identity (`name → localName → uuidString`) and force a second breaking change once manufacturer-data identity lands.
 
-- FR-8.6: Scanning respects FR-1.4 (await PoweredOn / fail terminal states)—no silent no-op when the radio is not ready.
+- ✅ FR-8.6: Scanning respects FR-1.4 (await PoweredOn / fail terminal states)—no silent no-op when the radio is not ready. A scan parked on a transient state completes successfully without scanning if `stopScanning()` is called or a later scan request supersedes it; only task cancellation surfaces as a cancellation error.
 
 
 9. Logging Support:
@@ -194,7 +195,7 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
     - Command successes or failures
     - ✅ Scanning start/stop
     - Service/characteristic discovery events (discovery start/completion/failure, readiness transitions, GATT table changes, subscription state changes)
-    - Idle connect/disconnect and Manual connect/disconnect
+    - ✅ Idle connect/disconnect and Manual connect/disconnect
     - Security events (e.g., encryption initiation or failure)
     - Data chunking operations
 
@@ -259,10 +260,15 @@ only where the gate must be honored.
 11. Connection Lifecycle on `Peripheral`:
 
 - ✅ FR-11.1: **Work-driven connect:** When work requires a link (non-empty command queue, or other library-defined work that needs a connection), the library connects the `Peripheral` without a prior Manual `connect` call.
-- ✅ FR-11.2: **Manual connect:** `Peripheral.connect(autoReconnect: Bool)` sets a manual-connect hold (suppresses idle teardown). `Peripheral.disconnect()` clears the hold and intentionally cancels the connection. The `autoReconnect` flag controls whether Tier-0/Tier-1 apply for that hold, consistent with Approach B. Primary docs emphasize work-driven usage; the manual-connect APIs are documented as Advanced.
+- ✅ FR-11.2: **Manual connect:** `Peripheral.connect(autoReconnect: Bool)` sets a manual-connect hold (suppresses idle teardown). `Peripheral.disconnect()` clears the hold and intentionally cancels the connection. The `autoReconnect` flag controls whether Tier-0/Tier-1 apply for that hold, consistent with Approach B. Primary docs emphasize work-driven usage; the manual-connect APIs are documented as Advanced. The hold is registered **before** the radio await, so `connect()` while Bluetooth is off records the intent and still reports the typed error; the link establishes when the radio returns if `autoReconnect` is true. `disconnect()` succeeds even when there is no live link to cancel—dropping intent must always be possible.
 - ✅ FR-11.3: **Idle teardown:** Per FR-1.5—only when queue empty and no manual-connect hold; cancel connection (drops Tier-0).
-- ✅ FR-11.4: **Single state machine:** Work-driven connect and Manual connect share one ensure-linked implementation (PoweredOn await, connect, discover to ready). No parallel connection stacks.
-- ✅ FR-11.5: Connection-state observation remains available (FR-1.3.1) and must distinguish intentional disconnect, unexpected drop, and reconnecting where applicable.
+- ✅ FR-11.4: **Single state machine:** Work-driven connect and Manual connect share one ensure-linked implementation (PoweredOn await, connect, discover to ready). No parallel connection stacks. The link half is delivered; the discover-to-ready stage joins the same path with FR-10.
+- ✅ FR-11.5: Connection-state observation remains available (FR-1.3.1) and must distinguish intentional disconnect, unexpected drop, and reconnecting where applicable. Idle teardown is indistinguishable from an app-initiated disconnect and is reported as intentional. On `reconnecting`, an absent attempt/retry time means "waiting for a usable radio, not yet on the backoff ladder," distinct from an armed ladder step carrying real values.
+
+- ✅ FR-11.6: **Demand durability:** Demand (pending work, or a manual-connect hold) is the single signal that keeps a link alive, and it outlives radio outages:
+    - FR-11.6.1: A Bluetooth power cycle invalidates live peripheral references and reports each tracked peripheral as disconnected due to Bluetooth unavailability. Demand is preserved across the outage, and links for which demand wants reconnect are re-established when the radio returns.
+    - FR-11.6.2: While a demanded link is waiting for the radio to return, connection state reports `reconnecting` (library source, no attempt/retry values) so the app can distinguish "the library will bring this back" from "this is over." A hold created with `autoReconnect: false` settles at disconnected instead, because nothing will re-issue for it.
+    - FR-11.6.3: **Manual-connect holds are durable across process relaunch** when a restore identifier is configured: the hold—including its `autoReconnect` value—is persisted and rehydrated during state restoration, so a restored link the app explicitly asked for is retained rather than idled out. Work is process-scoped and is never resurrected: a restored link with no persisted hold starts the idle timer (FR-1.5). Manager shutdown and transient radio invalidation must not erase persisted holds.
 
 
 ### Non-Functional Requirements
@@ -283,7 +289,7 @@ only where the gate must be honored.
 3. Performance:
 
 - NFR-3.1: Ensure low latency in command execution and response handling to meet real-time application needs.
-- NFR-3.2: Optimize for battery life on iOS devices by minimizing unnecessary BLE activity (including idle disconnect and filtered discovery).
+- NFR-3.2: Optimize for battery life on iOS devices by minimizing unnecessary BLE activity (including idle disconnect and filtered discovery). Durable manual-connect holds (FR-11.6.3) are an explicit, documented exception: they trade battery for session continuity across relaunch, and apply only to links the app explicitly requested. Links the app never asked for—residual, OS-reconnected, or restored without a hold—still idle out.
 
 
 4. Scalability and Maintainability:
