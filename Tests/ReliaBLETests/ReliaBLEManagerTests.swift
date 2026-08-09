@@ -3054,7 +3054,12 @@ struct ReliaBLEManagerTests {
         // the live `CBPeripheral` is no longer connected and the cached state moves to
         // `.reconnecting(.system)`. Unlike `testInjectDisconnect` (which bypasses the mock and leaves
         // it connected), this drives the actual limbo the idle-torn guard protects: a physically
-        // dropped link the OS is still trying to relink.
+        // dropped link the OS is still trying to relink a now-unwanted link. Force the mock's relink
+        // attempt to fail so the peripheral is deterministically STUCK in the non-connected limbo for the
+        // assertions below, instead of racing the mock's auto-reconnect (which on a slower CI box re-links
+        // it back to `.connected` before we can observe the limbo). A failed connection request leaves the
+        // mock peripheral `.disconnected` (see `CBMPeripheralMock.connect`), never back to `.connected`.
+        Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
         await Mock.simulateDisconnection()
         #expect(await pollUntil(timeout: 3.0) {
             if case .reconnecting(.system, _, _) = await manager.currentConnectionStates[handle.id] {
