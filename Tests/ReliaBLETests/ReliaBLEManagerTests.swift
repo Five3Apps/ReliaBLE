@@ -459,7 +459,7 @@ struct ReliaBLEManagerTests {
         await manager.stopScanning()
     }
 
-    @Test func cancellingSupersededScanWaiterDoesNotCancelNewerRequest() async throws {
+    @Test func cancelScanWaiterIgnoresNonMatchingWaiterID() async throws {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
@@ -468,24 +468,20 @@ struct ReliaBLEManagerTests {
 
         let scanUUID = CBUUID(string: "180D")
 
-        // Waiter A parks with a NIL filter while the radio is transient.
-        let first = Task { try await manager.startScanning(services: nil) }
+        // A scan task parks with a NON-nil filter while the radio is transient.
+        let scanTask = Task { try await manager.startScanning(services: [scanUUID]) }
         _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
 
-        // Waiter B (with a NON-nil filter) supersedes A, which completes successfully without
-        // scanning. B now owns the single-slot scan waiter.
-        let second = Task { try await manager.startScanning(services: [scanUUID]) }
-        _ = try await first.value // superseded — success, no scan, no error
-        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+        // Call cancelScanWaiter with a foreign, non-matching id — this must NOT
+        // cancel the parked waiter. Against the pre-fix global cancel, this would
+        // have resumed the waiter with a CancellationError.
+        await manager.bluetooth.cancelScanWaiter(UUID())
 
-        // Cancelling A's task must NOT steal B's parked waiter — cancellation is waiter-specific.
-        first.cancel()
-        _ = try await first.value // still completes; superseded return already delivered
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 1)
 
-        // Power on: B still owns the request and starts scanning with B's filter, and did not throw.
+        // Power on: the waiter resolves and starts scanning with its filter.
         CBMCentralManagerMock.simulatePowerOn()
-        _ = try await second.value
+        _ = try await scanTask.value  // Must NOT throw
 
         #expect(await Mock.waitForState("Scanning", on: manager))
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
