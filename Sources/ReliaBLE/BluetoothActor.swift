@@ -159,6 +159,26 @@ enum LinkReason: Sendable {
     case discoveredWhileDemanded
 }
 
+/// How a parked ``startScanning(services:)`` waiter was resolved, used by its resumed code to
+/// decide whether to issue a scan, re-park, or return (D-2 resume-reason table).
+private enum ScanWaiterResumeReason: Sendable {
+    /// Radio reached `.poweredOn`; the scan was issued (or is issuable by the current owner).
+    case poweredOn
+    /// ``stopScanning()`` resolved the waiter — successful void, no scan.
+    case stopped
+    /// Superseded by a later ``startScanning(services:)`` — successful void, no scan.
+    case superseded
+}
+
+/// A single parked ``startScanning(services:)`` invocation. There is at most one at a time, but each
+/// waiter carries its **own** identity and filter so a superseded waiter must consult itself, never a
+/// shared slot, when it resumes — fixing the earlier conflation of "current waiter" and "pending
+/// request" (D-2).
+private struct ScanWaiter {
+    let id: UUID
+    let services: [CBUUID]?
+    let continuation: CheckedContinuation<ScanWaiterResumeReason, Error>
+}
 // MARK: - BluetoothActor
 
 /// Actor that serializes all CoreBluetooth interactions for a single ``ReliaBLEManager`` stack.
@@ -210,12 +230,15 @@ actor BluetoothActor {
     /// the next central state update.
     private var poweredOnContinuations: [UUID: CheckedContinuation<Void, Error>] = [:]
 
-    /// Continuation for a parked ``startScanning()`` call awaiting a usable radio. There is at most one
-    /// pending scan at a time, so a single slot suffices.
-    private var scanWaiterContinuation: CheckedContinuation<Void, Error>?
+    /// A single parked ``startScanning()`` call awaiting a usable radio. There is at most one pending
+    /// scan at a time, so a single slot suffices. The waiter carries its **own** identity and filter
+    /// (see ``ScanWaiter``) so a superseded waiter can never mistake a newer request's services for
+    /// its own when it resumes.
+    private var scanWaiter: ScanWaiter?
 
-    /// Service filter requested by the currently parked scan waiter, or `nil` if none is parked.
-    private var scanWaiterServices: [CBUUID]?
+    /// Test-only: the service filter of the most recently started scan, recorded by ``beginScan``.
+    /// Lets a test assert which caller's filter actually reached the radio (D-2 supersede precedence).
+    private var lastScanServices: [CBUUID]?
 
     /// The restored-scan deferral (``pendingRestoredScanServices``) and this scan waiter are two
     /// distinct mechanisms kept deliberately separate rather than collapsed into one (plan D-2 open
@@ -355,10 +378,9 @@ actor BluetoothActor {
             continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
         }
 
-        if let continuation = scanWaiterContinuation {
-            scanWaiterContinuation = nil
-            scanWaiterServices = nil
-            continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
+        if let waiter = scanWaiter {
+            scanWaiter = nil
+            waiter.continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
         }
 
         centralManager = nil
@@ -757,19 +779,18 @@ actor BluetoothActor {
     /// Called from ``handleCentralManagerStateUpdate()`` on every state update. Terminal states
     /// fail all waiters; `.poweredOn` resumes them successfully; transient states leave them parked.
     private func resolvePoweredOnWaiters() {
-        let hasScanWaiter = scanWaiterContinuation != nil
+        let hasScanWaiter = scanWaiter != nil
         guard !poweredOnContinuations.isEmpty || hasScanWaiter else { return }
         guard let centralManager else { return }
 
         switch centralManager.state {
         case .poweredOn:
-            // A parked scan waiter gets its scan issued and completes successfully on power-on.
-            if let continuation = scanWaiterContinuation {
-                scanWaiterContinuation = nil
-                let services = scanWaiterServices
-                scanWaiterServices = nil
-                beginScan(services: services)
-                continuation.resume(returning: ())
+            // A parked scan waiter gets its scan issued and completes successfully on power-on. The
+            // waiter's own filter is used, so a superseded waiter never supplies a stale/reused filter.
+            if let waiter = scanWaiter {
+                scanWaiter = nil
+                beginScan(services: waiter.services)
+                waiter.continuation.resume(returning: .poweredOn)
             }
             if !poweredOnContinuations.isEmpty {
                 let pending = poweredOnContinuations
@@ -794,10 +815,9 @@ actor BluetoothActor {
     /// Fails every parked ``waitUntilPoweredOn()`` continuation and any parked scan waiter with a
     /// terminal radio-state error.
     private func failPoweredOnAndScanWaiters(with error: PeripheralError) {
-        if let continuation = scanWaiterContinuation {
-            scanWaiterContinuation = nil
-            scanWaiterServices = nil
-            continuation.resume(throwing: error)
+        if let waiter = scanWaiter {
+            scanWaiter = nil
+            waiter.continuation.resume(throwing: error)
         }
         if !poweredOnContinuations.isEmpty {
             let pending = poweredOnContinuations
@@ -870,62 +890,47 @@ actor BluetoothActor {
     /// resumed continuation runs on a later actor turn and the radio may have flipped again.
     private func parkScanWaiter(services: sending [CBUUID]?) async throws {
         // A later startScanning supersedes a parked one: resolve the previous waiter successfully.
-        if let previous = scanWaiterContinuation {
-            scanWaiterContinuation = nil
-            scanWaiterServices = nil
-            previous.resume(returning: ())
+        // The previous waiter carries its OWN identity/service-filter (D-2), so when it resumes it
+        // can tell it was superseded and must not re-park or scan — the newer request owns the scan.
+        if let previous = scanWaiter {
+            scanWaiter = nil
+            previous.continuation.resume(returning: .superseded)
         }
 
         // An app-requested scan supersedes any deferred restored scan (D-2 filter precedence).
         pendingRestoredScanServices = nil
         pendingRestoredScanOptions = nil
 
-        scanWaiterServices = services
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        let reason: ScanWaiterResumeReason = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ScanWaiterResumeReason, Error>) in
             guard !Task.isCancelled else {
                 continuation.resume(throwing: CancellationError())
                 return
             }
-            scanWaiterContinuation = continuation
+            scanWaiter = ScanWaiter(id: UUID(), services: services, continuation: continuation)
         }
 
-        // Resumed. Re-read the radio because it may have flipped since the waiter was resolved.
-        guard let centralManager else { throw PeripheralError.bluetoothUnavailable }
-        switch centralManager.state {
+        // Resumed. Decide from OUR OWN resume reason and identity — never a global slot field.
+        switch reason {
+        case .stopped, .superseded:
+            // ``stopScanning()`` resolved this waiter (successful void, no scan), or a newer
+            // ``startScanning`` superseded it (earlier waiter completes successfully without
+            // scanning; the newer request owns the pending scan). Either way, return.
+            return
         case .poweredOn:
-            // If ``resolvePoweredOnWaiters()`` already issued the scan, nothing left to do. If this
-            // waiter was resolved by ``stopScanning()``, ``scanWaiterServices`` is nil and we must
-            // not start a scan. Otherwise issue it now (e.g. after a transient re-park above).
-            if scanWaiterServices != nil, centralManager.isScanning == false {
-                let services = scanWaiterServices
-                scanWaiterServices = nil
-                beginScan(services: services)
-            }
-        case .resetting, .unknown:
-            // The radio regressed to a transient state while we held the continuation; re-park
-            // only while a scan is still requested. If ``stopScanning()`` resolved this waiter, it
-            // cleared ``scanWaiterServices`` — return successfully, no scan, rather than re-parking.
-            if scanWaiterServices != nil {
-                try await parkScanWaiter(services: scanWaiterServices)
-            }
-        case .poweredOff:
-            throw PeripheralError.bluetoothPoweredOff
-        case .unsupported:
-            throw PeripheralError.bluetoothUnsupported
-        case .unauthorized:
-            throw PeripheralError.bluetoothUnavailable
-        @unknown default:
-            throw PeripheralError.bluetoothUnavailable
+            // The radio reached `.poweredOn` and ``resolvePoweredOnWaiters()`` issued the scan using
+            // OUR OWN filter. If ``stopScanning()`` raced in meanwhile, ``scanWaiter`` is nil and we
+            // must not start a scan; otherwise ``resolvePoweredOnWaiters()`` already issued it. Either
+            // way there is nothing left to do.
+            return
         }
     }
 
     /// Cancels a parked ``startScanning(services:)`` waiter, invoked from a
     /// `withTaskCancellationHandler` onCancel. No-op when no waiter is parked.
     func cancelScanWaiter() {
-        guard let continuation = scanWaiterContinuation else { return }
-        scanWaiterContinuation = nil
-        scanWaiterServices = nil
-        continuation.resume(throwing: CancellationError())
+        guard let waiter = scanWaiter else { return }
+        scanWaiter = nil
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
     /// Issues `scanForPeripherals` for the given filter and broadcasts the resulting state.
@@ -938,6 +943,7 @@ actor BluetoothActor {
         }
 
         guard let centralManager else { return }
+        lastScanServices = services
         centralManager.scanForPeripherals(withServices: services, options: nil)
 
         if centralManager.isScanning {
@@ -956,10 +962,9 @@ actor BluetoothActor {
     /// not an error (D-2).
     func stopScanning() {
         // Complete any parked scan waiter successfully before tearing down the scan.
-        if let continuation = scanWaiterContinuation {
-            scanWaiterContinuation = nil
-            scanWaiterServices = nil
-            continuation.resume(returning: ())
+        if let waiter = scanWaiter {
+            scanWaiter = nil
+            waiter.continuation.resume(returning: .stopped)
         }
 
         guard !isShutdown else {
@@ -1513,6 +1518,13 @@ actor BluetoothActor {
         workCount(for: id) > 0 || manualConnectHold[id]?.reconnectDesired == true
     }
 
+    /// Whether the cached state for `id` is a Tier-0 OS reconnect in limbo
+    /// (`.reconnecting(source: .system, ...)`), i.e. CoreBluetooth still has pending connect work.
+    private func cachedSystemReconnect(id: String) -> Bool {
+        if case .reconnecting(source: .system, _, _) = connectionStates[id] { return true }
+        return false
+    }
+
     /// The only place in the codebase that may call `centralManager.connect(_:options:)`.
     ///
     /// Side-effect free apart from its two intended effects: an optimistic `.connecting` via
@@ -1683,8 +1695,15 @@ actor BluetoothActor {
             // Settling rule: never publish an optimistic `.disconnecting` unless the peripheral is
             // currently `.connected`. Settle synchronously and do NOT mark intentional — a late
             // `didDisconnect` is then classified as unexpected, and `armReconnect` is gated off by
-            // `wantsReconnect`, so the late callback is a no-op.
+            // `wantsReconnect`, so the late callback is a no-op. The cancel below is still issued for
+            // non-connected states that represent pending CoreBluetooth work: a peripheral in
+            // `.connecting` or a cached `.reconnecting(source: .system, ...)` (Tier-0 limbo) has work
+            // only `cancelPeripheralConnection` can stop (FR-1.2 / D-tier — cancelling ends Tier-0).
+            // It is fire-and-forget and deliberately NOT inserted into `intentionalDisconnects`.
             setConnectionState(.disconnected(reason: nil), for: id)
+            if cbPeripheral.state == .connecting || cachedSystemReconnect(id: id) {
+                centralManager?.cancelPeripheralConnection(cbPeripheral)
+            }
         }
     }
 
@@ -1781,7 +1800,15 @@ actor BluetoothActor {
         // Settling rule: never publish an optimistic `.disconnecting` unless the peripheral is
         // currently connected. Verify against the live `CBPeripheral` state, not the cached value.
         guard let cbPeripheral = cbPeripherals[id], cbPeripheral.state == .connected else {
+            // Settle synchronously. A non-connected state may still have pending CoreBluetooth work
+            // (`.connecting`, or a cached `.reconnecting(source: .system, ...)` Tier-0 limbo) that
+            // only `cancelPeripheralConnection` can stop (FR-1.2 / D-tier — cancelling ends Tier-0).
+            // Issue it fire-and-forget, still WITHOUT inserting into `intentionalDisconnects` (there
+            // is no `.disconnecting` to settle) and without publishing `.disconnecting`.
             setConnectionState(.disconnected(reason: nil), for: id)
+            if let live = cbPeripherals[id], live.state == .connecting || cachedSystemReconnect(id: id) {
+                centralManager?.cancelPeripheralConnection(live)
+            }
             return
         }
 
@@ -2030,7 +2057,52 @@ actor BluetoothActor {
         else {
             return
         }
-        
+
+        // Gate the ladder on the same radio / link checks ``reevaluateLink`` centralizes, instead of
+        // issuing blindly (defect: a ladder woke after the radio flipped off but before the delegate
+        // state-update invalidated peripherals, and issued a connect against a dead radio). We read the
+        // CACHED ``connectionStates[id]`` for the connecting/system-reconnecting check rather than the
+        // live `cbPeripheral.state` here: the ladder only ever runs for a genuinely `.reconnecting`
+        // library state, and the cached mirror is what the state machine actually publishes. (Routing
+        // through ``reevaluateLink`` outright would break on its live `.connected` short-circuit; see
+        // the reconnect tests.)
+        guard !isShutdown, let centralManager else {
+            failLadderRadio(.bluetoothUnavailable, id: id)
+            return
+        }
+        switch centralManager.state {
+        case .poweredOn:
+            break
+        case .poweredOff:
+            failLadderRadio(.bluetoothPoweredOff, id: id)
+            return
+        case .unsupported:
+            failLadderRadio(.bluetoothUnsupported, id: id)
+            return
+        case .unauthorized:
+            failLadderRadio(.bluetoothUnavailable, id: id)
+            return
+        case .resetting, .unknown:
+            return // Radio transient — the radio-return sweep will re-drive the ladder later (D-radio).
+        @unknown default:
+            failLadderRadio(.bluetoothUnavailable, id: id)
+            return
+        }
+
+        guard cbPeripherals[id] != nil else {
+            failLadderRadio(.notFound, id: id)
+            return
+        }
+
+        // Already connecting (our own optimistic state) or a Tier-0 / system reconnect is in flight —
+        // let it run rather than issuing a redundant connect.
+        switch connectionStates[id] {
+        case .connecting, .reconnecting(source: .system, attempt: _, nextRetryAt: _):
+            return
+        default:
+            break
+        }
+
         do {
             try issueConnect(id: id, enableAutoReconnect: wantsReconnect(id: id))
         } catch {
@@ -2039,6 +2111,14 @@ actor BluetoothActor {
             log?.warn(tags: [.peripheral(id), .category(.connection)], "Reconnect attempt failed: \(reason)")
             setConnectionState(.failed(reason: reason), for: id)
         }
+    }
+
+    /// Clears the ladder and publishes a terminal `.failed` for a reconnect attempt that was gated out
+    /// by a dead radio / missing peripheral, mirroring ``reevaluateLink``'s error surfacing.
+    private func failLadderRadio(_ error: PeripheralError, id: String) {
+        clearReconnectState(for: id)
+        log?.warn(tags: [.peripheral(id), .category(.connection)], "Reconnect attempt gated: \(error)")
+        setConnectionState(.failed(reason: error), for: id)
     }
     
     private func clearReconnectState(for id: String) {
@@ -2074,7 +2154,12 @@ actor BluetoothActor {
 
     /// Test-only hook: whether a ``startScanning(services:)`` waiter is currently parked.
     func testPendingScanWaiterCount() -> Int {
-        scanWaiterContinuation == nil ? 0 : 1
+        scanWaiter == nil ? 0 : 1
+    }
+
+    /// Test-only hook: the service filter of the most recently started scan, or `nil` if none.
+    func testLastScanServices() -> [CBUUID]? {
+        lastScanServices
     }
 
     /// Test-only hook: injects a disconnect event with the specified `isReconnecting` flag,

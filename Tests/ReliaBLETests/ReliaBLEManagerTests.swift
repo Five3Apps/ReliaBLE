@@ -427,6 +427,38 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
     }
 
+    @Test func supersededScanWaiterDoesNotStealNewerRequest() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let scanUUID = CBUUID(string: "180D")
+
+        // First waiter parks with a NIL filter while the radio is transient.
+        let first = Task { try await manager.startScanning(services: nil) }
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        // A second waiter with a NON-nil filter supersedes the first. The first must complete
+        // successfully WITHOUT scanning, and the second must keep ownership of the pending scan.
+        let second = Task { try await manager.startScanning(services: [scanUUID]) }
+
+        _ = try await first.value // superseded — success, no scan, no error
+
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 1)
+
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = try await second.value
+
+        #expect(await Mock.waitForState("Scanning", on: manager))
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
+        // The scan that actually started must use the SECOND caller's filter, not the first's nil.
+        #expect(await manager.bluetooth.testLastScanServices() == [scanUUID])
+
+        await manager.stopScanning()
+    }
+
     @Test func startScanningCancellationUnblocksWaiter() async throws {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
@@ -2864,6 +2896,99 @@ struct ReliaBLEManagerTests {
         #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
     }
 
+    // Defect 1: a manual disconnect issued while a connect is still pending (`.connecting`) must cancel
+    // the pending CoreBluetooth connect — not just settle the library state — so the OS cannot complete
+    // the link later (FR-1.2 / D-tier).
+    @Test func manualDisconnectDuringConnectingCancelsPendingConnect() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let changes = manager.connectionStateChanges
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        _ = await firstConnectionStateChange(from: changes, withinNanoseconds: 5_000_000_000) // .connecting
+
+        try await handle.disconnect()
+
+        // Settled synchronously to a clean disconnected, never a stuck .disconnecting.
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+        #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
+
+        // The pending connect must be suppressed: drain long enough for the mock to have completed the
+        // connect if the cancel had not fired, and assert no later `.connected` ever lands.
+        let later = await drainConnectionStateChanges(from: changes, withinNanoseconds: 2_000_000_000)
+        let anyConnected = later.contains { $0.state == .connected }
+        #expect(!anyConnected)
+        #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
+    }
+
+    // Defect 1: idle teardown while a Tier-0 / system reconnect is in progress (.reconnecting(.system))
+    // must settle AND cancel, so the OS cannot relink a link nobody wants (FR-1.2 / D-tier).
+    @Test func idleTeardownDuringSystemReconnectCancels() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        let changes = manager.connectionStateChanges
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        // A work lease links the peripheral with the Tier-0 (auto-reconnect) option active.
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // OS-delivered Tier-0 reconnect: cached state moves to .reconnecting(.system).
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: true)
+        #expect(await pollUntil(timeout: 3.0) {
+            if case .reconnecting(.system, _, _) = await manager.currentConnectionStates[handle.id] {
+                return true
+            }
+            return false
+        })
+
+        // Demand drops mid-system-reconnect: idle teardown must settle AND cancel the OS's pending work.
+        await handle.releaseWorkLease(token)
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+        #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
+
+        // No later .connected may arrive from the suppressed Tier-0 reconnect. First flush the events
+        // already observed (the buffer includes the initial .connecting/.connected from lease acquisition
+        // and the .reconnecting(.system) above), THEN drain a fresh window and assert nothing links again.
+        _ = await drainConnectionStateChanges(from: changes, withinNanoseconds: 400_000_000)
+        let later = await drainConnectionStateChanges(from: changes, withinNanoseconds: 2_000_000_000)
+        let anyConnected = later.contains { $0.state == .connected }
+        #expect(!anyConnected)
+        #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
+    }
+
     @Test func zeroIdleIntervalTearsDownImmediately() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
@@ -3118,6 +3243,70 @@ struct ReliaBLEManagerTests {
         CBMCentralManagerMock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
         try? await handle.disconnect()
+    }
+
+    // Defect 2: a reconnect ladder step must not issue a connect against a dead radio. A ladder retry
+    // that wakes only reads `centralManager.state`; the synchronous flip on `simulatePowerOff` is
+    // observed before the deferred delegate invalidation cancels the ladder, so without the radio gate
+    // a redundant connect could be issued. We assert the ladder never reaches `.connecting` on a dead
+    // radio and instead surfaces `.bluetoothPoweredOff` after the gate.
+    @Test func reconnectLadderDoesNotIssueAgainstDeadRadio() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        var policy = ReconnectPolicy()
+        policy.maxAttempts = 5
+        policy.initialDelay = 0.1
+        policy.jitter = 0.0
+        let manager = await Mock.makeManager(reconnectPolicy: policy)
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        let changes = manager.connectionStateChanges
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Unexpected drop arms the Tier-1 ladder.
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
+        #expect(await pollUntil(timeout: 3.0) {
+            if case .reconnecting(.library, _, _) = await manager.currentConnectionStates[handle.id] {
+                return true
+            }
+            return false
+        })
+
+        // Flip the radio off while the ladder is sleeping. The ladder's performReconnect reads
+        // centralManager.state synchronously (now .poweredOff) and must refuse to issue a connect.
+        CBMCentralManagerMock.simulatePowerOff()
+        _ = await Mock.waitForState("Powered Off", on: manager)
+
+        // Allow any racing ladder step to run; then assert no `.connecting` was issued on the dead radio.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        #expect(await manager.currentConnectionStates[handle.id] != .connecting)
+
+        // Flush the events already observed (buffer includes the .connecting/.connected from lease
+        // acquisition), then assert no additional `.connecting` was issued after the radio died.
+        _ = await drainConnectionStateChanges(from: changes, withinNanoseconds: 400_000_000)
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 2_000_000_000)
+        let issuedConnecting = events.contains { $0.state == .connecting }
+        #expect(!issuedConnecting, "Ladder must not issue a connect against a dead radio")
+
+        // Cleanup: restore the radio and tear down the lease.
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+        await handle.releaseWorkLease(token)
     }
 
     @Test func radioDropWithoutWantsReconnectShowsNoReconnecting() async throws {
