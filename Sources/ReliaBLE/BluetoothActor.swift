@@ -236,10 +236,6 @@ actor BluetoothActor {
     /// its own when it resumes.
     private var scanWaiter: ScanWaiter?
 
-    /// Test-only: the service filter of the most recently started scan, recorded by ``beginScan``.
-    /// Lets a test assert which caller's filter actually reached the radio (D-2 supersede precedence).
-    private var lastScanServices: [CBUUID]?
-
     /// The restored-scan deferral (``pendingRestoredScanServices``) and this scan waiter are two
     /// distinct mechanisms kept deliberately separate rather than collapsed into one (plan D-2 open
     /// item): the restored-scan stash is driven by ``handleCentralManagerStateUpdate()``'s `.poweredOn`
@@ -292,11 +288,6 @@ actor BluetoothActor {
     private var intentionalDisconnects: Set<String> = []
     private var reconnectAttempts: [String: Int] = [:]
 
-    /// Test-only: number of `cancelPeripheralConnection` calls issued per peripheral id, so a test
-    /// can pin that a cancel was actually issued (mirrors the ``testLastScanServices`` hook style).
-    /// Incremented at the single choke point ``issueCancel(_:)`` so it cannot drift from reality.
-    private var cancelCallCounts: [String: Int] = [:]
-
     /// Live work-lease UUIDs per peripheral. `workCount(id)` is `activeLeases[id]?.count ?? 0`.
     /// A `Set<UUID>` rather than a bare `Int` so an already-released token is *detectable*.
     private var activeLeases: [String: Set<UUID>] = [:]
@@ -348,63 +339,6 @@ actor BluetoothActor {
         eventPipeline.finish()
         taskRegistry.cancelAll()
         idleTaskRegistry.cancelAll()
-    }
-
-    /// Terminal teardown for tests/harness. Clears volatile state only — does **not** touch
-    /// persisted reconnect-intent `UserDefaults`.
-    func shutdown() {
-        guard !isShutdown else { return }
-        isShutdown = true
-
-        eventPipeline.finish()
-        taskRegistry.cancelAll()
-        idleTaskRegistry.cancelAll()
-        delegateEventTask?.cancel()
-        delegateEventTask = nil
-
-        for continuation in stateContinuations.values { continuation.finish() }
-        for continuation in discoveryContinuations.values { continuation.finish() }
-        for continuation in peripheralsContinuations.values { continuation.finish() }
-        for continuation in connectionStateChangesContinuations.values { continuation.finish() }
-        stateContinuations.removeAll()
-        discoveryContinuations.removeAll()
-        peripheralsContinuations.removeAll()
-        connectionStateChangesContinuations.removeAll()
-
-        let pendingAuth = authorizationContinuations
-        authorizationContinuations.removeAll()
-        for continuation in pendingAuth.values {
-            continuation.resume(throwing: CancellationError())
-        }
-
-        let pendingPoweredOn = poweredOnContinuations
-        poweredOnContinuations.removeAll()
-        for continuation in pendingPoweredOn.values {
-            continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
-        }
-
-        if let waiter = scanWaiter {
-            scanWaiter = nil
-            waiter.continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
-        }
-
-        centralManager = nil
-        delegateShim = nil
-        cbPeripherals.removeAll()
-        discoveredPeripherals.removeAll()
-        clearConnectionStates()
-        // Drop interned handles along with the stack they belong to. Handles the app still holds keep working,
-        // orphaned, throwing `.bluetoothUnavailable`. A radio reset (`invalidatePeripherals`) deliberately does not
-        // do this — a handle must survive one with its metadata intact.
-        registry.removeAllHandles()
-        reconnectEnabled.removeAll()
-        intentionalDisconnects.removeAll()
-        reconnectAttempts.removeAll()
-        activeLeases.removeAll()
-        manualConnectHold.removeAll()
-        idleGeneration.removeAll()
-        reconnectGeneration.removeAll()
-        pendingRestoredScanServices = nil
     }
 
     // MARK: - Event Streams
@@ -1851,16 +1785,6 @@ actor BluetoothActor {
         issueCancel(cbPeripheral)
     }
 
-    /// Test-only hook: number of live work leases for `id`.
-    func testWorkCount(for id: String) -> Int {
-        workCount(for: id)
-    }
-
-    /// Test-only hook: whether a manual-connect hold exists for `id`.
-    func testHasManualConnectHold(for id: String) -> Bool {
-        manualConnectHold[id] != nil
-    }
-
     /// The single write path for per-peripheral connection state.
     ///
     /// Records the state, mirrors it onto the interned handle so ``Peripheral/connectionState`` stays in step, and
@@ -2166,6 +2090,84 @@ actor BluetoothActor {
         intentionalDisconnects.remove(id)
     }
 
+    // MARK: - Testing Helpers
+
+    /// Test-only: the service filter of the most recently started scan, recorded by ``beginScan``.
+    /// Lets a test assert which caller's filter actually reached the radio (D-2 supersede precedence).
+    private var lastScanServices: [CBUUID]?
+
+    /// Test-only: number of `cancelPeripheralConnection` calls issued per peripheral id, so a test
+    /// can pin that a cancel was actually issued (mirrors the ``testLastScanServices`` hook style).
+    /// Incremented at the single choke point ``issueCancel(_:)`` so it cannot drift from reality.
+    private var cancelCallCounts: [String: Int] = [:]
+
+    /// Terminal teardown for tests/harness. Clears volatile state only — does **not** touch
+    /// persisted reconnect-intent `UserDefaults`.
+    func shutdown() {
+        guard !isShutdown else { return }
+        isShutdown = true
+
+        eventPipeline.finish()
+        taskRegistry.cancelAll()
+        idleTaskRegistry.cancelAll()
+        delegateEventTask?.cancel()
+        delegateEventTask = nil
+
+        for continuation in stateContinuations.values { continuation.finish() }
+        for continuation in discoveryContinuations.values { continuation.finish() }
+        for continuation in peripheralsContinuations.values { continuation.finish() }
+        for continuation in connectionStateChangesContinuations.values { continuation.finish() }
+        stateContinuations.removeAll()
+        discoveryContinuations.removeAll()
+        peripheralsContinuations.removeAll()
+        connectionStateChangesContinuations.removeAll()
+
+        let pendingAuth = authorizationContinuations
+        authorizationContinuations.removeAll()
+        for continuation in pendingAuth.values {
+            continuation.resume(throwing: CancellationError())
+        }
+
+        let pendingPoweredOn = poweredOnContinuations
+        poweredOnContinuations.removeAll()
+        for continuation in pendingPoweredOn.values {
+            continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
+        }
+
+        if let waiter = scanWaiter {
+            scanWaiter = nil
+            waiter.continuation.resume(throwing: PeripheralError.bluetoothUnavailable)
+        }
+
+        centralManager = nil
+        delegateShim = nil
+        cbPeripherals.removeAll()
+        discoveredPeripherals.removeAll()
+        clearConnectionStates()
+        // Drop interned handles along with the stack they belong to. Handles the app still holds keep working,
+        // orphaned, throwing `.bluetoothUnavailable`. A radio reset (`invalidatePeripherals`) deliberately does not
+        // do this — a handle must survive one with its metadata intact.
+        registry.removeAllHandles()
+        reconnectEnabled.removeAll()
+        intentionalDisconnects.removeAll()
+        reconnectAttempts.removeAll()
+        activeLeases.removeAll()
+        manualConnectHold.removeAll()
+        idleGeneration.removeAll()
+        reconnectGeneration.removeAll()
+        pendingRestoredScanServices = nil
+    }
+
+    /// Test-only hook: number of live work leases for `id`.
+    func testWorkCount(for id: String) -> Int {
+        workCount(for: id)
+    }
+
+    /// Test-only hook: whether a manual-connect hold exists for `id`.
+    func testHasManualConnectHold(for id: String) -> Bool {
+        manualConnectHold[id] != nil
+    }
+
     /// Test-only hook
     func setReconnectPolicy(_ policy: ReconnectPolicy) {
         reconnectPolicy = policy
@@ -2395,7 +2397,7 @@ actor BluetoothActor {
         UserDefaults.standard.removeObject(forKey: key)
     }
 
-    }
+}
 
 // MARK: - BluetoothDelegateShim
 
