@@ -7,9 +7,9 @@
 | **Plan** | `docs/plans/work-driven-connection-lifecycle-2026-08-02.md` |
 | **App under test** | **ReliaBLE Demo** (Xcode → physical devices) |
 | **Library** | ReliaBLE (local package dependency) |
-| **Date** | 2026-08-09 |
+| **Date** | 2026-08-09 (Faraday box notes added same day) |
 | **Scope** | Feature validation of Phase 2 lifecycle + regression of scan/connect/restore/background |
-| **Audience** | Manual execution on real hardware (2–3 Apple devices) |
+| **Audience** | Manual execution on real hardware (2–3 Apple devices) + Faraday box for RF drops |
 
 ---
 
@@ -111,27 +111,84 @@ Optional swaps: use iPad as P1 or C1 if convenient. Prefer two physical centrals
 | Idle default | `5.0` s (Settings → change + **force quit & relaunch** to apply) |
 | Restore ID | `com.five3apps.relia-ble-demo.central` (hard-coded in app) |
 
-### 3.4 Console logging
+### 3.4 Faraday box (preferred for RF drop / reconnect)
+
+You have a **Faraday box without USB passthrough**. That does **not** change which behaviors to test; it **does** change how drop cases are run and how evidence is collected.
+
+#### Preferred geometry: isolate the **peripheral**, observe the **central**
+
+| Role | Where | Why |
+|------|--------|-----|
+| **P1** (advertiser) | **Inside** the sealed box for the outage window | Drops the ACL/RF path cleanly and repeatably |
+| **C1** (ReliaBLE under test) | **Outside** the box | You can watch connection captions live; Xcode/Console may stay attached to C1 |
+| **C2** | Outside (multi-central cases) | Same as C1 |
+
+Do **not** put C1 in the box for primary F3/F10 runs unless you are specifically testing “central RF isolation.” Without USB passthrough you lose the debug cable, and opaque boxes prevent watching the central UI during the critical transition.
+
+#### Standard drop / restore procedure
+
+1. Outside the box: P1 **Start Advertising**, C1 scan → connect to the desired Auto Reconnect setting → confirm **Connected**.
+2. Keep C1 screen awake on P1’s device detail (connection caption visible). Optional: leave Xcode/Console attached to **C1 only**.
+3. Place **P1** in the Faraday box, close/seal fully. Do not rely on a USB cable to P1.
+4. On C1, note time-to-leave-Connected and intermediate captions (`System reconnecting…`, library reconnect, disconnected reason, etc.).
+5. For recovery cases: open box / remove P1 (still advertising if the app was not killed) → note time-to-**Connected** on C1 without tapping Connect.
+6. For “stay dead” cases (Auto Reconnect OFF): leave P1 out and advertising ≥ 30–60 s → must **not** auto-connect.
+
+#### Constraints the box imposes (non-blocking)
+
+| Constraint | Impact | Mitigation |
+|------------|--------|------------|
+| No USB while sealed | Cannot keep Xcode debugger on the **device inside** the box | Put only P1 inside; instrument C1 outside |
+| Opaque enclosure | Cannot watch UI on the boxed device mid-outage | Observe C1; only glance at P1 after unsealing if needed |
+| Wireless debug / Console to boxed device | Often fails or is flaky inside RF shield | Prefer Console/Xcode on C1; treat P1 as a dumb advertiser for drop suites |
+| App may suspend on locked P1 | Advertising can stop if P1 sleeps aggressively | Before boxing: keep P1 unlocked, screen on, Low Power Mode off; Guided Access optional; confirm **Advertising** still true |
+| Charge | Long sealed runs drain battery | Start drop suites with P1 ≥ ~50% battery |
+| Incomplete seal / lid ajar | Partial isolation → flaky “still connected” | If Connected never drops after ~30–60 s, reseal and retry once before PARTIAL |
+
+#### What still does **not** use the Faraday box
+
+Leave these as Control Center / Settings / app lifecycle tests (box adds nothing):
+
+- F1 radio gating (central BT off)
+- F2 hold / idle suppression
+- F4 **central** Bluetooth power cycle
+- F5 force quit / restore
+- F6–F9 multi-central, filters, settings
+
+#### When to put the **central** in the box (optional, rare)
+
+Only if you want a secondary check that C1 loses the peer when *its* RF is blocked. Then:
+
+1. Pre-deploy Demo to C1 from Xcode; disconnect the cable.
+2. Launch Demo from the home screen (standalone).
+3. Connect to P1 (P1 outside, advertising).
+4. Seal C1 in the box; you will **not** see live UI — use a wall-clock timer.
+5. Unseal and read the connection caption (may already show reconnecting/connected/disconnected).
+
+This is inferior to P1-in-box for pass/fail of intermediate states; treat as optional stress, not the ship bar.
+
+### 3.5 Console logging
 
 Demo enables logging by default (`OSLogWriter`, subsystem `com.five3apps.relia-ble-demo`, category `BLE`). Optional:
 
-1. Mac: Console.app → select the device → filter `relia-ble` or `BLE`.
-2. Xcode: Devices and Simulators → Open Console, or keep the debug session attached.
+1. Mac: Console.app → select the **outside** central (C1) → filter `relia-ble` or `BLE`.
+2. Xcode: keep the debug session on **C1** for Faraday drop suites; do not depend on a cable to P1.
 3. Settings → **Enable Logging** if you turned it off.
+4. Wireless logging to a device **inside** the sealed box is unreliable — do not require it for PASS/FAIL.
 
 Useful log themes (info): Manual connect, Manual disconnect, idle timer armed / idle disconnect (latter mainly if demand hits zero — rare via pure Manual path).
 
-### 3.5 Pass / fail conventions
+### 3.6 Pass / fail conventions
 
 | Result | Meaning |
 |--------|---------|
 | **PASS** | Observed behavior matches Expected |
 | **FAIL** | Deviates; capture device, OS, steps, UI/console evidence |
-| **BLOCKED** | Could not run (no advertiser, permission stuck, OS limitation) |
+| **BLOCKED** | Could not run (no advertiser, permission stuck, OS limitation, box isolation failure after retry) |
 | **N/A** | Not applicable to this hardware (e.g. Tier-0 on iOS &lt; 17) |
 | **PARTIAL** | Behavior close but timing/UI ambiguity; note details |
 
-Mark flaky RF issues (range, crowded 2.4 GHz) as **BLOCKED** or **PARTIAL** only after one retry closer / quieter environment.
+Prefer the Faraday box over walking-away for RF drops. If Connected never drops with P1 sealed, reseal once; then mark **BLOCKED** (isolation) rather than library FAIL. Crowded 2.4 GHz is less relevant for sealed-box runs but still applies to multi-central discovery suites.
 
 ---
 
@@ -311,21 +368,22 @@ For cases that wait multiple idle multiples (e.g. “still connected after 3× i
 
 **Goal:** Unexpected drops recover only when Auto Reconnect demand wants them; system vs library captions make sense.
 
-#### F3.1 Range drop with Auto Reconnect ON (Tier-0 / system path)
+#### F3.1 RF drop with Auto Reconnect ON (Tier-0 / system path) — **Faraday**
 
 | | |
 |--|--|
-| **Devices** | C1 + P1 (iOS 17+) |
-| **Steps** | 1. Connect Auto Reconnect **ON** → Connected. 2. Move P1 far away / put in another room / enclose in RF-hostile bag, **or** force-stop advertising on P1 then restart later. 3. Observe C1 caption during outage. 4. Bring P1 back in range / advertising. |
+| **Devices** | C1 outside + P1 (iOS 17+ preferred); Faraday box |
+| **Steps** | 1. Outside box: Connect Auto Reconnect **ON** → Connected. Keep C1 on device detail. 2. Place **P1** in Faraday box and seal (§3.4). 3. Observe **C1** caption during outage (note timestamps). 4. Unseal / remove P1 (still advertising). 5. Wait for recovery on C1 — do not tap Connect. |
 | **Expected** | During outage: often `System reconnecting…` and/or disconnected/reconnecting captions — **not** permanent silent stuck “Connected”. On return: **Connected** again without tapping Connect. |
 | **PARTIAL OK** | Exact system vs library wording depends on CoreBluetooth callbacks; recovery without user Connect is the bar. |
+| **Fallback** | If box isolation fails after reseal, walk P1 away / stop advertising — note method in results log. |
 
-#### F3.2 Range drop with Auto Reconnect OFF
+#### F3.2 RF drop with Auto Reconnect OFF — **Faraday**
 
 | | |
 |--|--|
-| **Devices** | C1 + P1 |
-| **Steps** | 1. Connect Auto Reconnect **OFF** → Connected. 2. Take P1 out of range / stop advertising until C1 leaves Connected. 3. Restore P1 advertising/range. Wait ≥ 30–60 s. |
+| **Devices** | C1 outside + P1; Faraday box |
+| **Steps** | 1. Connect Auto Reconnect **OFF** → Connected. 2. Seal **P1** in box until C1 leaves Connected. 3. Remove P1 (advertising). Wait ≥ 30–60 s on C1. |
 | **Expected** | Link does **not** come back on its own. Stays disconnected/failed. No library ladder countdown. |
 | **Cleanup** | Disconnect if UI still shows active, then Connect again only if needed. |
 
@@ -333,27 +391,28 @@ For cases that wait multiple idle multiples (e.g. “still connected after 3× i
 
 | | |
 |--|--|
-| **Devices** | C1 + P1 |
+| **Devices** | C1 + P1 (no Faraday required) |
 | **Steps** | Connected with Auto Reconnect ON → reboot P1 (or force-quit Peripheral advertising app and relaunch + Start Advertising). Wait for recovery. |
 | **Expected** | Eventually Connected again (system and/or library). |
+| **Note** | Distinct from Faraday RF block: process death on the advertiser vs RF isolation while the app may still be “Advertising” with no path. |
 
-#### F3.4 Library ladder visibility (optional, timing-sensitive)
+#### F3.4 Library ladder visibility (optional, timing-sensitive) — **Faraday**
 
 | | |
 |--|--|
-| **Devices** | C1 + P1; Settings with short `initialDelay` (e.g. 1.0) after relaunch |
-| **Steps** | Provoke an unexpected disconnect where OS is **not** actively system-reconnecting (hard: OS often claims Tier-0). If you observe `Reconnecting (attempt N)` with **Next retry in: Xs**, note it. |
+| **Devices** | C1 outside + P1; Settings with short `initialDelay` (e.g. 1.0) after relaunch; Faraday box |
+| **Steps** | 1. Connect Auto Reconnect ON → Connected. 2. Seal P1 long enough that OS Tier-0 may give up (can be minutes — document wall time). 3. Watch C1 for `Reconnecting (attempt N)` with **Next retry in: Xs** (library ladder). 4. Optionally unseal mid-ladder to confirm recovery. |
 | **Expected** | If ladder arms: attempt ≥ 1 and countdown present; eventually Connected or Failed after max attempts. |
-| **Note** | Mock gap #40 makes OS give-up hard to unit-test; **this is an on-device observation**. Mark PARTIAL if only system reconnect is seen. |
+| **Note** | Mock gap #40 makes OS give-up hard to unit-test; **this is an on-device observation**. Mark PARTIAL if only system reconnect is seen for the whole sealed window. |
 
-#### F3.4b Idle teardown *during* an OS reconnect attempt (on-device only)
+#### F3.4b Cancel / clear demand *during* an OS reconnect attempt (on-device only) — **Faraday**
 
 | | |
 |--|--|
-| **Devices** | C1 + P1; short idle interval (see §4.3) |
-| **Steps** | 1. Get to Connected with Auto Reconnect **ON**. 2. Drop the link so the OS starts a Tier-0 reconnect (take P1 out of range briefly) — caption shows system reconnecting. 3. While that reconnect is still in flight, remove all demand: **Disconnect** (clearing the manual hold) so nothing wants the link. 4. Bring P1 back in range and wait ≥ 60 s. |
-| **Expected** | The link is torn down and does **not** come back: idle teardown cancels the in-flight OS reconnect. Caption settles to a clean disconnected state, never `Disconnecting…` indefinitely. |
-| **Note** | CoreBluetoothMock always resolves a Tier-0 attempt (relink or `didFailToConnect`), so the in-flight window cannot be held open in unit tests; the cancel is pinned white-box by `idleTeardownDuringCachedSystemReconnectCancels`. **This is the on-device confirmation.** |
+| **Devices** | C1 outside + P1; Faraday box; short idle interval optional (see §4.3) |
+| **Steps** | 1. Get to Connected with Auto Reconnect **ON**. 2. Seal **P1** so the OS starts a Tier-0 reconnect — C1 caption shows system reconnecting (or equivalent). 3. While that reconnect is still in flight, remove demand on C1: **Disconnect** (clearing the manual hold). 4. Unseal P1 (advertising) and wait ≥ 60 s. |
+| **Expected** | The link is torn down and does **not** come back: clearing demand cancels trust in the in-flight OS reconnect. Caption settles to a clean disconnected state, never `Disconnecting…` indefinitely. |
+| **Note** | CoreBluetoothMock always resolves a Tier-0 attempt (relink or `didFailToConnect`), so the in-flight window cannot be held open in unit tests; the cancel is pinned white-box by `idleTeardownDuringCachedSystemReconnectCancels`. **This is the on-device confirmation.** Faraday helps hold the “OS still trying” window open longer than walking away. |
 
 #### F3.5 Quiet after clean disconnect (regression of arming)
 
@@ -587,8 +646,9 @@ Run only if time remains; each is optional.
 | F10.2 | Airplane Mode on C1 mid-connection | Leaves connected cleanly; recovers when mode off + BT on (similar to F4) |
 | F10.3 | Lock screen 2+ minutes while connected | Still connected or recovers on unlock |
 | F10.4 | Low power mode on C1 | Connect/scan still function |
-| F10.5 | Walk out of range until ladder/system gives up, then return | Either auto-recovers if demand remains, or stays failed after budget — document which |
+| F10.5 | **Faraday:** seal P1 until ladder/system gives up, then unseal | Either auto-recovers if demand remains, or stays failed after budget — document which + sealed duration |
 | F10.6 | Cancel connect quickly (Connect then Disconnect within 1 s) | Settles disconnected; no stuck Connecting; no reconnect storm |
+| F10.7 | **Faraday optional:** C1 inside box, P1 outside (standalone C1, no USB) | After unseal, caption is reconnecting/connected/disconnected consistently — intermediate states may be missed |
 
 **Suite F10 result:** ___
 
@@ -616,7 +676,7 @@ Run only if time remains; each is optional.
 | Setup + baseline | §4 | 15 min | All |
 | Radio gating | F1 | 25 min | C1, P1 |
 | Manual hold / idle suppress | F2 | 20 min | C1, P1 |
-| Reconnect | F3 | 30–45 min | C1, P1 |
+| Reconnect (Faraday: P1 in box) | F3 | 30–45 min | C1 outside, P1 in box |
 | Central BT power cycle | F4 | 20 min | C1, P1 |
 | Restore / force quit | F5 | 25 min | C1, P1 |
 | Multi-central | F6 | 20 min | C1, C2, P1 |
@@ -640,6 +700,7 @@ Xcode:
 C1: device model / iOS:
 C2: device model / iOS:
 P1: device model / iOS:
+Faraday box used (Y/N); isolation method for drops (P1-in-box / walk-away / stop advertising):
 Idle interval used:
 Reconnect policy overrides:
 
@@ -699,21 +760,31 @@ Overall: PASS / FAIL / PASS WITH NOTES
 
 1. Disconnect → wait → must not reconnect.
 
-**Prove Auto Reconnect**
+**Prove Auto Reconnect (Faraday)**
 
-1. Walk away / stop advertising / reboot peripheral → return → Connected without Connect tap.
+1. C1 Connected (Auto Reconnect ON), screen on device detail.
+2. Seal **P1** in Faraday box → C1 should leave Connected / show system or library reconnecting.
+3. Unseal P1 → Connected without Connect tap.
 
-**Prove BT power cycle**
+**Prove no reconnect when Auto Reconnect OFF (Faraday)**
 
-1. Connected + Auto Reconnect ON → BT off → reconnecting/disconnected → BT on → Connected.
+1. Connect with toggle OFF → seal P1 → unseal → must **not** auto-connect within 30–60 s.
 
-**Prove restore**
+**Prove BT power cycle** (no box)
+
+1. Connected + Auto Reconnect ON → BT off on **C1** → reconnecting/disconnected → BT on → Connected.
+
+**Prove restore** (no box)
 
 1. Connected + Auto Reconnect ON → force quit → relaunch → Connected without Connect tap.
 
 **Clear stuck demand**
 
 1. Open device → Disconnect (even if already disconnected looking) before starting the next contradictory case.
+
+**Faraday reminder**
+
+1. Instrument **C1 outside**; only **P1** goes in the box (no USB passthrough). Keep P1 unlocked/advertising before sealing.
 
 ---
 
