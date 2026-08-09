@@ -3912,7 +3912,29 @@ struct ReliaBLEManagerTests {
 /// instance before a test runs. The delegate is registered once in ``SimulationConfig/ensureConfigured()``
 /// and shared across all connection tests via ``Mock/connectionTestDelegate``.
 final class ConnectionTestDelegate: @unchecked Sendable {
-    var connectionResult: Result<Void, Error> = .success(())
+
+    /// The connection outcome the mock's main-thread delegate callback returns for an incoming
+    /// connection request.
+    ///
+    /// Written from async test bodies (setting `.failure(...)` before a test and resetting to
+    /// `.success(())` in `defer` blocks) while read on the main thread by the mock's timer-driven
+    /// `peripheralDidReceiveConnectionRequest` callback. Access is guarded by `lock` so the two
+    /// threads never race on the underlying stored value.
+    var connectionResult: Result<Void, Error> {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedConnectionResult
+        }
+        set {
+            lock.lock()
+            storedConnectionResult = newValue
+            lock.unlock()
+        }
+    }
+
+    private let lock = NSLock()
+    private var storedConnectionResult: Result<Void, Error> = .success(())
 }
 
 extension ConnectionTestDelegate: CBMPeripheralSpecDelegate {
