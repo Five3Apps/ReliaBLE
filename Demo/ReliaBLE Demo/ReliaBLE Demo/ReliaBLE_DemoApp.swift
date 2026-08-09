@@ -80,6 +80,8 @@ struct ReliaBLE_DemoApp: App {
         reconnectPolicy.jitter = defaults.object(forKey: "reconnectPolicy.jitter") as? Double ?? 0.2
         config.reconnectPolicy = reconnectPolicy
 
+        config.idleDisconnectInterval = defaults.object(forKey: "idleDisconnectInterval") as? TimeInterval ?? 5.0
+
         return ReliaBLEManager(config: config)
     }()
 

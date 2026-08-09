@@ -109,6 +109,13 @@ struct CentralView: View {
         NavigationSplitView {
             Text("ReliaBLE state: \(viewModel.currentState.description)")
 
+            if let scanError = viewModel.scanError {
+                Text(scanError)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+                    .padding(.horizontal)
+            }
+
             if case BluetoothState.unauthorized(let authState) = viewModel.currentState, authState == .notDetermined {
                 Button("Authorize Bluetooth") {
                     viewModel.authorizeBluetooth()
