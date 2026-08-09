@@ -2976,6 +2976,53 @@ struct ReliaBLEManagerTests {
         #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
     }
 
+    // Defect 1b: manual disconnect while a cached Tier-0 / system reconnect is in limbo (.reconnecting(.system))
+    // with a non-connecting live peripheral must cancel the OS's pending reconnect work (FR-1.2 / D-tier).
+    // This pins the `cachedSystemReconnect(id:)` arm of the `applyManualDisconnect` predicate — the same
+    // bug class as `fireIdle` had in bbff3d1.
+    @Test func manualDisconnectDuringCachedSystemReconnectCancels() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        // White-box Tier-0-limbo setup: put ONLY the cached state into `.reconnecting(.system)` while
+        // the live `CBPeripheral` stays `.disconnected` (never connected in this scenario).
+        await manager.bluetooth.testSeedSystemReconnectState(for: handle.id)
+
+        // Confirm the live peripheral is genuinely non-connecting AND non-connected when the manual
+        // disconnect fires, so the cancel can only be explained by the cached path — not the `.connecting`
+        // arm of the predicate. This cannot silently drift back onto the `.connecting` arm.
+        let liveState = await manager.bluetooth.testCBPeripheralState(for: handle.id)
+        #expect(liveState != .connecting,
+                "Live peripheral must be non-connecting so only the cached path can drive the cancel")
+        #expect(liveState != .connected)
+
+        // Manual disconnect triggers `applyManualDisconnect`, which must clear the hold AND issue exactly
+        // one cancel to stop the OS's pending reconnect work, driven solely by the CACHED
+        // `.reconnecting(.system)` state.
+        try await handle.disconnect()
+
+        #expect(!(await manager.bluetooth.testHasManualConnectHold(for: handle.id)),
+                "Manual disconnect must clear the manual-connect hold")
+        #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
+        #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
+        #expect(await manager.bluetooth.testCancelPeripheralConnectionCount(for: handle.id) == 1,
+                "Manual disconnect must issue exactly one cancel for a CACHED Tier-0 reconnect with a non-connecting live peripheral")
+        #expect(await manager.bluetooth.testContainsIntentionalDisconnect(handle.id) == false,
+                "Manual disconnect of a non-connected cached Tier-0 limbo must not mark the disconnect intentional")
+    }
+
     // Defect 1: idle teardown while a Tier-0 / system reconnect is in progress (.reconnecting(.system))
     // must settle AND cancel, so the OS cannot relink a link nobody wants (FR-1.2 / D-tier).
     @Test func idleTeardownDuringSystemReconnectCancels() async throws {
