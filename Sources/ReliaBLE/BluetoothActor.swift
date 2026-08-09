@@ -1719,8 +1719,15 @@ actor BluetoothActor {
             // `.connecting` or a cached `.reconnecting(source: .system, ...)` (Tier-0 limbo) has work
             // only `cancelPeripheralConnection` can stop (FR-1.2 / D-tier — cancelling ends Tier-0).
             // It is fire-and-forget and deliberately NOT inserted into `intentionalDisconnects`.
+            // The predicate below must be evaluated BEFORE `setConnectionState(.disconnected)` runs:
+            // `cachedSystemReconnect` reads the cached state, which that call would overwrite. Order is
+            // load-bearing here, not stylistic.
+            let shouldCancelPendingWork =
+                cbPeripheral.state == .connecting || cachedSystemReconnect(id: id)
+
             setConnectionState(.disconnected(reason: nil), for: id)
-            if cbPeripheral.state == .connecting || cachedSystemReconnect(id: id) {
+
+            if shouldCancelPendingWork {
                 issueCancel(cbPeripheral)
             }
         }
@@ -1824,8 +1831,16 @@ actor BluetoothActor {
             // only `cancelPeripheralConnection` can stop (FR-1.2 / D-tier — cancelling ends Tier-0).
             // Issue it fire-and-forget, still WITHOUT inserting into `intentionalDisconnects` (there
             // is no `.disconnecting` to settle) and without publishing `.disconnecting`.
+            // The predicate below must be evaluated BEFORE `setConnectionState(.disconnected)` runs:
+            // `cachedSystemReconnect` reads the cached state, which that call would overwrite. Order is
+            // load-bearing here, not stylistic.
+            let live = cbPeripherals[id]
+            let shouldCancelPendingWork =
+                live?.state == .connecting || cachedSystemReconnect(id: id)
+
             setConnectionState(.disconnected(reason: nil), for: id)
-            if let live = cbPeripherals[id], live.state == .connecting || cachedSystemReconnect(id: id) {
+
+            if shouldCancelPendingWork, let live {
                 issueCancel(live)
             }
             return
@@ -2278,6 +2293,18 @@ actor BluetoothActor {
     /// Test-only hook: the live `CBPeripheral`'s CoreBluetooth state for `id`, or `nil` if none.
     func testCBPeripheralState(for id: String) -> CBPeripheralState? {
         cbPeripherals[id]?.state
+    }
+
+    /// Test-only hook: seeds the cached connection state for `id` to a Tier-0 OS reconnect in limbo
+    /// (`.reconnecting(source: .system, ...)`) WITHOUT touching the live `CBPeripheral` or issuing any
+    /// CoreBluetooth call.
+    ///
+    /// Production only produces a `.reconnecting(.system)` together with a live peripheral the mock
+    /// reports as `.connecting` (see ``CBMPeripheralMock``), which means the `.connecting` arm of the
+    /// teardown predicate alone would explain a `cancelPeripheralConnection`. This hook lets a test pin
+    /// the **cached** `cachedSystemReconnect(id:)` arm against a non-connecting live peripheral.
+    func testSeedSystemReconnectState(for id: String) {
+        setConnectionState(.reconnecting(source: .system, attempt: nil, nextRetryAt: nil), for: id)
     }
 
     /// Test-only hook: whether the central is currently scanning.

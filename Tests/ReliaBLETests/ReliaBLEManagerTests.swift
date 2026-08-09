@@ -503,8 +503,17 @@ struct ReliaBLEManagerTests {
         // Cancelling the awaiting task unblocks the parked waiter with a `CancellationError`
         // and leaves no continuation behind.
         scanTask.cancel()
-        await #expect(throws: CancellationError.self) {
-            try await scanTask.value
+        // Bound the wait so a regression (waiter failing to unblock) fails explicitly instead of
+        // wedging the whole test run; a matching cancel surfaces `CancellationError` here.
+        do {
+            try await withTimeout(nanoseconds: 4_000_000_000) {
+                _ = try await scanTask.value
+            }
+            Issue.record("startScanning must throw CancellationError when cancelled, but returned normally")
+        } catch is CancellationError {
+            // Expected: the cancelled waiter surfaces a `CancellationError` through the task value.
+        } catch {
+            throw error
         }
 
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
@@ -3035,6 +3044,99 @@ struct ReliaBLEManagerTests {
         #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
     }
 
+    @Test func idleTeardownDuringCachedSystemReconnectCancels() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.01)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        // White-box Tier-0-limbo setup: put ONLY the cached state into `.reconnecting(.system)` while
+        // the live `CBPeripheral` stays `.disconnected` (never connected in this scenario).
+        await manager.bluetooth.testSeedSystemReconnectState(for: handle.id)
+
+        // A work lease creates demand, but `reevaluateLink` sees the cached `.reconnecting(.system)`
+        // and lets it run without issuing a connect — so the live peripheral never becomes `.connecting`.
+        let token = try await handle.acquireWorkLease()
+        #expect(await manager.currentConnectionStates[handle.id]
+                == .reconnecting(source: .system, attempt: nil, nextRetryAt: nil))
+
+        // Confirm the live peripheral is genuinely non-connecting AND non-connected when idle fires, so
+        // the cancel can only be explained by the cached path — not the `.connecting` arm of the
+        // predicate. This cannot silently drift back onto the `.connecting` arm.
+        let liveState = await manager.bluetooth.testCBPeripheralState(for: handle.id)
+        #expect(liveState != .connecting,
+                "Live peripheral must be non-connecting so only the cached path can drive the cancel")
+        #expect(liveState != .connected)
+
+        // Demand drops mid-Tier-0-limbo: idle teardown must settle AND issue exactly one cancel to stop
+        // the OS's pending reconnect work, driven solely by the CACHED `.reconnecting(.system)` state.
+        await handle.releaseWorkLease(token)
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+        #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
+        #expect(await manager.bluetooth.testCancelPeripheralConnectionCount(for: handle.id) == 1,
+                "Idle teardown must issue exactly one cancel for a CACHED Tier-0 reconnect with a non-connecting live peripheral")
+        #expect(await manager.bluetooth.testContainsIntentionalDisconnect(handle.id) == false,
+                "Idle teardown of a non-connected cached Tier-0 limbo must not mark the disconnect intentional")
+    }
+
+    @Test func idleTeardownDuringLiveConnectingCancels() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.01)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        // Acquire work issues a plain (work-driven, non-manual-hold) connect: the cached state becomes
+        // `.connecting` while the live `CBPeripheral` also reports `.connecting`. Unlike the
+        // system-reconnect tests, cached state is NOT `.reconnecting(.system)`, so only the live
+        // `.connecting` arm of the teardown predicate can explain a cancel.
+        let token = try await handle.acquireWorkLease()
+        #expect(await manager.currentConnectionStates[handle.id] == .connecting)
+        if case .reconnecting = await manager.currentConnectionStates[handle.id] {
+            Issue.record("Cached state must be `.connecting` (not system reconnecting) so only the live arm drives the cancel")
+        }
+        // The mock hands out `.connecting` synchronously on `issueConnect`; it resolves to `.connected`
+        // only after its ~45ms connection interval, which comfortably out-lasts our 10ms idle timer.
+        #expect((await manager.bluetooth.testCBPeripheralState(for: handle.id)) == .connecting,
+                "Scenario must leave the live peripheral `.connecting` so the live arm can drive the cancel")
+
+        // Drop demand so idle teardown fires (10ms) before the pending connect resolves (~45ms).
+        await handle.releaseWorkLease(token)
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
+        })
+        #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
+        #expect(await manager.bluetooth.testCancelPeripheralConnectionCount(for: handle.id) == 1,
+                "Idle teardown must issue exactly one cancel for a live `.connecting` peripheral")
+        // The settle path never flags the disconnect intentional. If this assert fails, idle has drifted
+        // onto the `.connected` branch (which DOES flag it) — meaning the live `.connecting` arm is not
+        // actually the thing being pinned.
+        #expect(await manager.bluetooth.testContainsIntentionalDisconnect(handle.id) == false)
+    }
+
     @Test func zeroIdleIntervalTearsDownImmediately() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
@@ -4115,6 +4217,31 @@ actor SimulationConfig {
 extension BluetoothActor {
     var hasCentralManager: Bool { centralManager != nil }
     var isCentralPoweredOn: Bool { centralManager?.state == .poweredOn }
+}
+
+// MARK: - Timeout Helper
+
+/// Sentinel thrown by ``withTimeout(nanoseconds:_:)`` when an operation does not complete in time.
+struct TimedOut: Error {}
+
+/// Executes `operation` but fails with ``TimedOut`` if it does not complete within `nanoseconds`.
+///
+/// Prevents an await that *should* return (or throw) from hanging the whole test run when the
+/// underlying behavior regresses — the racing sleep converts a wedge into an explicit, bounded failure.
+func withTimeout<T: Sendable>(
+    nanoseconds: UInt64,
+    _ operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: nanoseconds)
+            throw TimedOut()
+        }
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
+    }
 }
 
 // MARK: - Polling Helper
