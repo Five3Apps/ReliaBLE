@@ -63,6 +63,11 @@ await bleManager.startScanning(services: [CBUUID(string: "180D")])
 > to foreground scans. ``AdvertisementData`` fields that originate from scan
 > response data (such as local name) are especially affected.
 
+> Note: True continuous background scanning — the library keeping a scan going
+> on its own, driven by demand — is out of scope here. Neither a manual-connect
+> hold nor pending work implies "keep scanning"; a hold or lease keeps a *link*
+> alive, not a scan. Demand-driven scan policy is a separate, future concern.
+
 ## Restored connections
 
 If your app had connected or connecting peripherals when it was terminated,
@@ -80,6 +85,18 @@ Restored peripherals are **not** emitted on
 ``ReliaBLEManager/peripheralDiscoveries`` — restoration carries no
 advertisement payload or RSSI, so that feed remains reserved for real
 advertisements.
+
+### What survives restoration
+
+Restoration is governed by a **restore matrix** that decides, per restored
+link, whether it is kept alive or torn down:
+
+| Case | Restored link | Persisted manual-connect hold | Result |
+|------|---------------|-------------------------------|--------|
+| 1 | Yes | Yes | Hold rehydrates and keeps the link — no idle timer. Reconnect intent is re-armed with the `autoReconnect` value the app originally asked for. |
+| 2 | Yes | No | No hold — the link idles out after ``ReliaBLEConfig/idleDisconnectInterval`` (default 5s). |
+| 3 | — | — | **Work never survives process death.** Work leases are process-scoped and are never persisted or rehydrated. |
+| 4 | Yes | Yes, `autoReconnect: false` | Hold survives and suppresses idle, but arms neither reconnect tier and is not re-issued on radio return. |
 
 The Tier-0 system-managed reconnection (``ReconnectSource/system``) survives
 app termination because it runs in the iOS daemon. Tier-1 library-managed

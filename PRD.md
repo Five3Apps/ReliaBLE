@@ -75,8 +75,8 @@ Detail and rationale: `docs/designs/discovered-peripheral-vs-peripheral-2026-07-
 - FR-1.3: Provide status updates on connection stability and data transmission integrity.
     - ✅ FR-1.3.1: Provide status updates on connection stability (e.g. connected, disconnected, reconnecting), exposed in a device-centric way on `Peripheral` (and/or equivalent streams) as the type model lands.
     - FR-1.3.2: Provide status updates on data transmission integrity (command/transaction layer).
-- FR-1.4: **PoweredOn gating for work:** Scan, connect, and command submission must await `PoweredOn` (or equivalent usable state) instead of silently no-op’ing when the radio is not ready. Terminal unusable states fail with typed errors. Observability of Bluetooth state for UI remains required.
-- FR-1.5: **Idle disconnect:** When a `Peripheral` has no pending/queued commands and no manual-connect hold, disconnect after a configurable idle interval. Default interval is **5 seconds**. Configuration is **global** (not per-peripheral) unless a future requirement explicitly adds per-device overrides.
+- ✅ FR-1.4: **PoweredOn gating for work:** Scan, connect, and command submission must await `PoweredOn` (or equivalent usable state) instead of silently no-op’ing when the radio is not ready. Terminal unusable states fail with typed errors. Observability of Bluetooth state for UI remains required.
+- ✅ FR-1.5: **Idle disconnect:** When a `Peripheral` has no pending/queued commands and no manual-connect hold, disconnect after a configurable idle interval. Default interval is **5 seconds**. Configuration is **global** (not per-peripheral) unless a future requirement explicitly adds per-device overrides.
 
 
 2. Public Interface for Easy Integration:
@@ -258,11 +258,11 @@ only where the gate must be honored.
 
 11. Connection Lifecycle on `Peripheral`:
 
-- FR-11.1: **Work-driven connect:** When work requires a link (non-empty command queue, or other library-defined work that needs a connection), the library connects the `Peripheral` without a prior Manual `connect` call.
-- FR-11.2: **Manual connect:** `Peripheral.connect(autoReconnect: Bool)` sets a manual-connect hold (suppresses idle teardown). `Peripheral.disconnect()` clears the hold and intentionally cancels the connection. The `autoReconnect` flag controls whether Tier-0/Tier-1 apply for that hold, consistent with Approach B. Primary docs emphasize work-driven usage; the manual-connect APIs are documented as Advanced.
-- FR-11.3: **Idle teardown:** Per FR-1.5—only when queue empty and no manual-connect hold; cancel connection (drops Tier-0).
-- FR-11.4: **Single state machine:** Work-driven connect and Manual connect share one ensure-linked implementation (PoweredOn await, connect, discover to ready). No parallel connection stacks.
-- FR-11.5: Connection-state observation remains available (FR-1.3.1) and must distinguish intentional disconnect, unexpected drop, and reconnecting where applicable.
+- ✅ FR-11.1: **Work-driven connect:** When work requires a link (non-empty command queue, or other library-defined work that needs a connection), the library connects the `Peripheral` without a prior Manual `connect` call.
+- ✅ FR-11.2: **Manual connect:** `Peripheral.connect(autoReconnect: Bool)` sets a manual-connect hold (suppresses idle teardown). `Peripheral.disconnect()` clears the hold and intentionally cancels the connection. The `autoReconnect` flag controls whether Tier-0/Tier-1 apply for that hold, consistent with Approach B. Primary docs emphasize work-driven usage; the manual-connect APIs are documented as Advanced.
+- ✅ FR-11.3: **Idle teardown:** Per FR-1.5—only when queue empty and no manual-connect hold; cancel connection (drops Tier-0).
+- ✅ FR-11.4: **Single state machine:** Work-driven connect and Manual connect share one ensure-linked implementation (PoweredOn await, connect, discover to ready). No parallel connection stacks.
+- ✅ FR-11.5: Connection-state observation remains available (FR-1.3.1) and must distinguish intentional disconnect, unexpected drop, and reconnecting where applicable.
 
 
 ### Non-Functional Requirements
