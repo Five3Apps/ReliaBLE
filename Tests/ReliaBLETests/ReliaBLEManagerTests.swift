@@ -182,7 +182,7 @@ struct ReliaBLEManagerTests {
 
     @Test func authorizeThrowsWhenDenied() async throws {
         let manager = await Mock.makeManager()
-        CBMCentralManagerMock.simulateAuthorization(.denied)
+        await Mock.simulateAuthorization(.denied)
 
         do {
             try await manager.authorizeBluetooth()
@@ -196,7 +196,7 @@ struct ReliaBLEManagerTests {
 
     @Test func authorizeThrowsWhenRestricted() async throws {
         let manager = await Mock.makeManager()
-        CBMCentralManagerMock.simulateAuthorization(.restricted)
+        await Mock.simulateAuthorization(.restricted)
 
         do {
             try await manager.authorizeBluetooth()
@@ -220,7 +220,7 @@ struct ReliaBLEManagerTests {
 
         // Force the undetermined path so `authorizeBluetooth()` suspends awaiting the user's decision.
         // Cancelling the task must unblock the suspension instead of hanging forever.
-        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        await Mock.simulateAuthorization(.notDetermined)
 
         let task = Task { try await manager.authorizeBluetooth() }
         try? await Task.sleep(nanoseconds: 100_000_000)
@@ -235,20 +235,20 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateAuthorization(.denied)
+        await Mock.simulateAuthorization(.denied)
         await manager.bluetooth.updateState()
         #expect(await manager.currentState.description == "Denied")
 
-        CBMCentralManagerMock.simulateAuthorization(.restricted)
+        await Mock.simulateAuthorization(.restricted)
         await manager.bluetooth.updateState()
         #expect(await manager.currentState.description == "Restricted")
 
-        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        await Mock.simulateAuthorization(.notDetermined)
         await manager.bluetooth.updateState()
         #expect(await manager.currentState.description == "Not Authorized")
 
         // Restore the baseline so later tests start from a known-good authorization.
-        CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
+        await Mock.simulateAuthorization(.allowedAlways)
         await manager.bluetooth.updateState()
     }
 
@@ -256,7 +256,7 @@ struct ReliaBLEManagerTests {
         // Pin auth before construction: ensureConfigured only does this once, and the prior
         // test may have left .allowedAlways. Init's fire-and-forget ensureCentralManager must
         // publish .unauthorized(.notDetermined) even though no central is created.
-        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        await Mock.simulateAuthorization(.notDetermined)
         let manager = await Mock.makeManager()
 
         #expect(await Mock.waitForState("Not Authorized", on: manager))
@@ -305,7 +305,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         #expect(await Mock.waitForState("Powered Off", on: manager))
 
         await #expect(throws: PeripheralError.bluetoothPoweredOff) {
@@ -316,7 +316,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testIsScanning() == false)
 
         // Restore power so later tests start from a known-good state.
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -324,7 +324,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unsupported)
+        await Mock.simulateInitialState(.unsupported)
         #expect(await Mock.waitForState("Unsupported", on: manager))
 
         await #expect(throws: PeripheralError.bluetoothUnsupported) {
@@ -334,7 +334,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testIsScanning() == false)
 
         // Restore power so later tests start from a known-good state.
-        CBMCentralManagerMock.simulateInitialState(.poweredOn)
+        await Mock.simulateInitialState(.poweredOn)
         #expect(await Mock.waitForState("Ready", on: manager))
     }
 
@@ -342,7 +342,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let scanTask = Task { try await manager.startScanning() }
@@ -350,7 +350,7 @@ struct ReliaBLEManagerTests {
         // Wait until the scan waiter is parked on the transient state.
         _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = try await scanTask.value
 
         // The radio reaching `.poweredOn` resolved the waiter and started the scan.
@@ -362,13 +362,13 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let scanTask = Task { try await manager.startScanning() }
         _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         await #expect(throws: PeripheralError.bluetoothPoweredOff) {
             try await scanTask.value
         }
@@ -376,7 +376,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
         #expect(await manager.bluetooth.testIsScanning() == false)
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -384,7 +384,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let scanTask = Task { try await manager.startScanning() }
@@ -397,7 +397,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
         #expect(await manager.bluetooth.testIsScanning() == false)
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -405,7 +405,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let first = Task { try await manager.startScanning(services: [CBUUID(string: "180D")]) }
@@ -420,7 +420,7 @@ struct ReliaBLEManagerTests {
         // The newer request now owns the single-slot scan waiter.
         _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = try await second.value
 
         #expect(await Mock.waitForState("Scanning", on: manager))
@@ -431,7 +431,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let scanUUID = CBUUID(string: "180D")
@@ -448,7 +448,7 @@ struct ReliaBLEManagerTests {
 
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 1)
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = try await second.value
 
         #expect(await Mock.waitForState("Scanning", on: manager))
@@ -463,7 +463,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let scanUUID = CBUUID(string: "180D")
@@ -480,7 +480,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 1)
 
         // Power on: the waiter resolves and starts scanning with its filter.
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = try await scanTask.value  // Must NOT throw
 
         #expect(await Mock.waitForState("Scanning", on: manager))
@@ -494,7 +494,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let scanTask = Task { try await manager.startScanning() }
@@ -519,7 +519,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
         #expect(await manager.bluetooth.testIsScanning() == false)
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -625,10 +625,10 @@ struct ReliaBLEManagerTests {
 
         // Powering off then on drives the `centralManagerDidUpdateState` path, which re-resolves
         // the live references for already-discovered peripherals on power-on.
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         #expect(await Mock.waitForState("Powered Off", on: manager))
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         #expect(await Mock.waitForState("Ready", on: manager))
     }
 
@@ -753,14 +753,14 @@ struct ReliaBLEManagerTests {
         await manager.stopScanning()
         let handle = try #require(discovered).peripheral
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
 
         await #expect(throws: PeripheralError.bluetoothPoweredOff) {
             try await handle.connect()
         }
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -780,7 +780,7 @@ struct ReliaBLEManagerTests {
         // Transition to a transient state. `.unknown` deliberately avoids `.resetting`, which would
         // trigger peripheral invalidation (a later step); here the live reference must survive so
         // connect can proceed once the radio returns.
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let connectTask = Task { try await handle.connect() }
@@ -788,7 +788,7 @@ struct ReliaBLEManagerTests {
             await manager.bluetooth.testPendingPoweredOnWaiterCount() == 1
         }
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         try await connectTask.value
 
         // The parked radio wait was resolved; no continuation is left behind.
@@ -808,7 +808,7 @@ struct ReliaBLEManagerTests {
         await manager.stopScanning()
         let handle = try #require(discovered).peripheral
 
-        CBMCentralManagerMock.simulateInitialState(.unknown)
+        await Mock.simulateInitialState(.unknown)
         _ = await Mock.waitForState("Unknown", on: manager)
 
         let connectTask = Task { try await handle.connect() }
@@ -817,14 +817,14 @@ struct ReliaBLEManagerTests {
         }
 
         // The transient resolves to a terminal `.poweredOff`, failing the waiter with a typed error.
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         await #expect(throws: PeripheralError.bluetoothPoweredOff) {
             try await connectTask.value
         }
 
         #expect(await manager.bluetooth.testPendingPoweredOnWaiterCount() == 0)
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -1054,7 +1054,7 @@ struct ReliaBLEManagerTests {
 
     @Test func connectionStateChangesEmitsConnectFailureSequence() async throws {
         // Pre-condition: no stale connection state from a preceding lifecycle test.
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
 
@@ -1076,7 +1076,7 @@ struct ReliaBLEManagerTests {
 
         // Force a clean disconnection on the spec to reset any lingering
         // `virtualConnections` / `isConnected` state left by a preceding test.
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         // Configure failure only after discovery — a failed connectionResult can
@@ -1170,7 +1170,7 @@ struct ReliaBLEManagerTests {
         #expect(c2?.state == .connected)
 
         // Simulate an unexpected disconnect with the OS auto-reconnect option active.
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
 
         // Tier 0: OS sends isReconnecting=true → library emits .system with nil metadata.
         let c3 = await changes.next()
@@ -1224,7 +1224,7 @@ struct ReliaBLEManagerTests {
         await manager.stopScanning()
 
         // Force a clean disconnection to reset any lingering mock state.
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         try await handle.connect()
@@ -1355,7 +1355,7 @@ struct ReliaBLEManagerTests {
         await manager.stopScanning()
 
         // Force a clean disconnection to reset any lingering mock state.
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         try await handle.connect()
@@ -1752,7 +1752,7 @@ struct ReliaBLEManagerTests {
         let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         try await handle.connect()
@@ -1819,7 +1819,7 @@ struct ReliaBLEManagerTests {
     @Test func ensureInitializedWithoutRestoreIdentifierDoesNotCreateCentralWhenUnauthorized() async throws {
         // Default makeManager pins .notDetermined before construction. A restoreIdentifier of nil
         // must preserve the lazy contract: no central until authorize / allowedAlways.
-        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        await Mock.simulateAuthorization(.notDetermined)
 
         let manager = await Mock.makeManager(restoreIdentifier: nil)
         try? await Task.sleep(nanoseconds: 200_000_000)
@@ -1834,8 +1834,8 @@ struct ReliaBLEManagerTests {
 
         // When authorized, a restoreIdentifier does not relax the auth gate — it only adds the
         // restore-id option to the existing creation path.
-        CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulateAuthorization(.allowedAlways)
+        await Mock.simulatePowerOn()
 
         let manager = await Mock.makeManager(restoreIdentifier: restoreId)
         #expect(await manager.bluetooth.testRestoreIdentifier() == restoreId)
@@ -1857,7 +1857,7 @@ struct ReliaBLEManagerTests {
         #expect(!(await noRestore.bluetooth.testDelegateIsRestoringShim()))
     }
 
-    @Test func willRestoreRepopulatesMapsSeedsConnectionStateAndBroadcasts() async throws {
+    @Test @MainActor func willRestoreRepopulatesMapsSeedsConnectionStateAndBroadcasts() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer {
             Mock.connectionTestDelegate.connectionResult = .success(())
@@ -1948,7 +1948,7 @@ struct ReliaBLEManagerTests {
         await Mock.tearDown(manager2)
     }
 
-    @Test func willRestoreSeedingReconnectOnlyForConnectedOrConnecting() async throws {
+    @Test @MainActor func willRestoreSeedingReconnectOnlyForConnectedOrConnecting() async throws {
         // D-restore case 1: a restored connected/connecting peripheral whose manual-connect hold
         // (autoReconnect: true, reconnectDesired = true) was persisted rehydrates that hold — which
         // supplies demand, re-arms reconnect intent (so the link comes back armed), and suppresses
@@ -2006,7 +2006,7 @@ struct ReliaBLEManagerTests {
         await Mock.tearDown(manager2)
     }
 
-    @Test func willRestoreDoesNotRearmReconnectWithoutPersistedIntent() async throws {
+    @Test @MainActor func willRestoreDoesNotRearmReconnectWithoutPersistedIntent() async throws {
         // D-restore case 2 (no persisted hold): a restored link the app never explicitly requested
         // must NOT come back armed. Reconnect intent is demand-derived (from a rehydrated hold),
         // so with no persisted hold there is no demand and no re-arming; the link is seeded and an
@@ -2074,7 +2074,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testPendingRestoredScanServices() == nil)
     }
 
-    @Test func invalidatePreservesHoldsProjectsReconnectingAndKeepsDeferredScan() async throws {
+    @Test @MainActor func invalidatePreservesHoldsProjectsReconnectingAndKeepsDeferredScan() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer {
             Mock.connectionTestDelegate.connectionResult = .success(())
@@ -2239,7 +2239,7 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         #expect(await Mock.waitForState("Powered Off", on: manager))
 
         let scanUUID = CBUUID(string: "180D")
@@ -2248,7 +2248,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testPendingRestoredScanServices() == [scanUUID])
         #expect(!(await manager.bluetooth.testIsScanning()))
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         let becameScanning = await Mock.waitForState("Scanning", on: manager)
         if !becameScanning {
             #expect(await Mock.waitForState("Ready", on: manager))
@@ -2401,7 +2401,7 @@ struct ReliaBLEManagerTests {
     }
 
     @Test func authorizeCancellationDoesNotAffectOtherManager() async throws {
-        CBMCentralManagerMock.simulateAuthorization(.notDetermined)
+        await Mock.simulateAuthorization(.notDetermined)
 
         let managerA = await Mock.makeManager(tearDownPrevious: true)
         let managerB = await Mock.makeManager(tearDownPrevious: false)
@@ -2423,9 +2423,9 @@ struct ReliaBLEManagerTests {
 
         // Cancelling A must leave B's waiter intact — grant auth and bounce power so B's
         // central receives didUpdateState and resolvePendingAuthorization runs.
-        CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
-        CBMCentralManagerMock.simulatePowerOff()
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulateAuthorization(.allowedAlways)
+        await Mock.simulatePowerOff()
+        await Mock.simulatePowerOn()
 
         try await taskB.value
         #expect(await managerB.bluetooth.hasCentralManager)
@@ -2631,7 +2631,7 @@ struct ReliaBLEManagerTests {
         let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
 
         await #expect(throws: PeripheralError.bluetoothPoweredOff) {
@@ -2641,7 +2641,7 @@ struct ReliaBLEManagerTests {
         // The hold is registered BEFORE the radio wait, so a thrown connect still leaves durable demand.
         #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
 
         // Step 6: the radio-return sweep (D-1 event 12) re-links the held id without a second
@@ -2673,7 +2673,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
 
         // A radio reset invalidates live references (clears cbPeripherals) but preserves the hold.
-        CBMCentralManagerMock.simulateInitialState(.resetting)
+        await Mock.simulateInitialState(.resetting)
         _ = await Mock.waitForState("Resetting", on: manager)
         #expect(!(await manager.bluetooth.testContainsCBPeripheral(handle.id)))
         #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
@@ -2682,7 +2682,7 @@ struct ReliaBLEManagerTests {
         try await handle.disconnect()
         #expect(!(await manager.bluetooth.testHasManualConnectHold(for: handle.id)))
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -3055,7 +3055,7 @@ struct ReliaBLEManagerTests {
         // `.reconnecting(.system)`. Unlike `testInjectDisconnect` (which bypasses the mock and leaves
         // it connected), this drives the actual limbo the idle-torn guard protects: a physically
         // dropped link the OS is still trying to relink.
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
         #expect(await pollUntil(timeout: 3.0) {
             if case .reconnecting(.system, _, _) = await manager.currentConnectionStates[handle.id] {
                 return true
@@ -3388,9 +3388,9 @@ struct ReliaBLEManagerTests {
         let token = try await handle.acquireWorkLease()
         #expect(await pollUntil(timeout: 3.0) { await manager.currentConnectionStates[handle.id] == .connected })
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
 
         // Demand survived the radio cycle; the sweep re-links without re-acquiring.
@@ -3419,7 +3419,7 @@ struct ReliaBLEManagerTests {
         try await handle.connect()
         _ = await pollUntil(timeout: 3.0) { await manager.currentConnectionStates[handle.id] == .connected }
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
 
         // The stream shows .disconnected(.bluetoothUnavailable) THEN .reconnecting(.library, nil, nil),
@@ -3435,7 +3435,7 @@ struct ReliaBLEManagerTests {
         }
         #expect(handle.connectionState != nil)
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
         try? await handle.disconnect()
     }
@@ -3485,7 +3485,7 @@ struct ReliaBLEManagerTests {
 
         // Flip the radio off while the ladder is sleeping. The ladder's performReconnect reads
         // centralManager.state synchronously (now .poweredOff) and must refuse to issue a connect.
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
 
         // Allow any racing ladder step to run; then assert no `.connecting` was issued on the dead radio.
@@ -3500,7 +3500,7 @@ struct ReliaBLEManagerTests {
         #expect(!issuedConnecting, "Ladder must not issue a connect against a dead radio")
 
         // Cleanup: restore the radio and tear down the lease.
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
         await handle.releaseWorkLease(token)
     }
@@ -3548,7 +3548,7 @@ struct ReliaBLEManagerTests {
 
         // Flip the radio off and let the delegate-driven invalidation settle deterministically, so the
         // ladder bookkeeping is stationary before we drive the step ourselves.
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
 
         // Drive one ladder step on a dead radio. The gate must refuse to issue a connect.
@@ -3567,7 +3567,7 @@ struct ReliaBLEManagerTests {
                 "Ladder step must not issue a connect against a dead radio")
 
         // Cleanup: restore the radio and tear down the lease.
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
         await handle.releaseWorkLease(token)
     }
@@ -3589,7 +3589,7 @@ struct ReliaBLEManagerTests {
         try await handle.connect(autoReconnect: false)
         _ = await pollUntil(timeout: 3.0) { await manager.currentConnectionStates[handle.id] == .connected }
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
 
         let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 2_000_000_000)
@@ -3597,7 +3597,7 @@ struct ReliaBLEManagerTests {
         #expect(!hasLibrary)
         #expect(events.contains { $0.state == .disconnected(reason: .bluetoothUnavailable) })
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
         try? await handle.disconnect()
     }
@@ -3617,9 +3617,9 @@ struct ReliaBLEManagerTests {
         try await handle.connect(autoReconnect: false)
         _ = await pollUntil(timeout: 3.0) { await manager.currentConnectionStates[handle.id] == .connected }
 
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
 
         // wantsReconnect false → reason .radioReturned does not satisfy the issue gate.
@@ -3680,7 +3680,7 @@ struct ReliaBLEManagerTests {
 
         // Force the (still virtually-connected) spec to advertise again so an app-driven scan can
         // rediscover it — event 15 then relinks the demanded, stranded id.
-        Mock.connectionTestSpec.simulateDisconnection()
+        await Mock.simulateDisconnection()
         try await manager.startScanning()
         let rediscovered = await Mock.waitForDiscovered(id: Mock.connectionTestPeripheralID, on: manager, withinNanoseconds: 3_000_000_000)
         #expect(rediscovered != nil)
@@ -3746,7 +3746,7 @@ struct ReliaBLEManagerTests {
         await Mock.ensureReady(manager)
 
         let scanUUID = CBUUID(string: "180D")
-        CBMCentralManagerMock.simulatePowerOff()
+        await Mock.simulatePowerOff()
         _ = await Mock.waitForState("Powered Off", on: manager)
         await manager.bluetooth.testHandleWillRestoreState(scanServices: [scanUUID])
         #expect(await manager.bluetooth.testPendingRestoredScanServices() == [scanUUID])
@@ -3755,14 +3755,14 @@ struct ReliaBLEManagerTests {
         await manager.bluetooth.testInvalidatePeripherals()
         #expect(await manager.bluetooth.testPendingRestoredScanServices() == [scanUUID])
 
-        CBMCentralManagerMock.simulatePowerOn()
+        await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
         let resumed = await pollUntil(timeout: 3.0) { await manager.bluetooth.testPendingRestoredScanServices() == nil }
         #expect(resumed)
         await manager.stopScanning()
     }
 
-    @Test func restoredLinkWithoutHoldIdlesOut() async throws {
+    @Test @MainActor func restoredLinkWithoutHoldIdlesOut() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()); Mock.clearStateRestoration() }
 
@@ -3797,7 +3797,7 @@ struct ReliaBLEManagerTests {
         await Mock.tearDown(manager2)
     }
 
-    @Test func restoredManualHoldSurvivesRelaunch() async throws {
+    @Test @MainActor func restoredManualHoldSurvivesRelaunch() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()); Mock.clearStateRestoration() }
 
@@ -3831,7 +3831,7 @@ struct ReliaBLEManagerTests {
         await Mock.tearDown(manager2)
     }
 
-    @Test func restoredHoldWithAutoReconnectFalseSuppressesIdleButNotTier1() async throws {
+    @Test @MainActor func restoredHoldWithAutoReconnectFalseSuppressesIdleButNotTier1() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()); Mock.clearStateRestoration() }
 
@@ -3865,7 +3865,7 @@ struct ReliaBLEManagerTests {
         await Mock.tearDown(manager2)
     }
 
-    @Test func workLeasesDoNotSurviveRelaunch() async throws {
+    @Test @MainActor func workLeasesDoNotSurviveRelaunch() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()); Mock.clearStateRestoration() }
 
@@ -4009,7 +4009,7 @@ enum Mock {
         activeManager = nil
     }
 
-    static func tearDown(_ manager: ReliaBLEManager, resetMockConnections: Bool = true) async {
+    @MainActor static func tearDown(_ manager: ReliaBLEManager, resetMockConnections: Bool = true) async {
         if resetMockConnections {
             connectionTestSpec.simulateDisconnection()
         }
@@ -4023,7 +4023,7 @@ enum Mock {
     /// ``CBMPeripheralSpec``s and scan-service UUIDs (no live `CBPeripheral` / actor state).
     ///
     /// **Always** pair with `defer { Mock.clearStateRestoration() }`.
-    static func installStateRestoration(
+    @MainActor static func installStateRestoration(
         restoreIdentifier: String,
         peripherals: [CBMPeripheralSpec] = [],
         scanServices: [CBMUUID]? = nil
@@ -4041,8 +4041,44 @@ enum Mock {
         }
     }
 
-    static func clearStateRestoration() {
+    @MainActor static func clearStateRestoration() {
         CBMCentralManagerMock.simulateStateRestoration = nil
+    }
+
+    // MARK: - Main-Actor Simulation Wrappers
+    //
+    // CoreBluetoothMock's simulation API is not thread-safe and must be driven from the main
+    // thread, where its advertisement `NSTimer` fires. Routing every `simulate*` call through these
+    // `@MainActor` wrappers serializes the test-driven mutations (made from async test bodies on a
+    // background concurrency executor) against the mock's own main-thread timers, eliminating the
+    // SIGSEGV-causing data race on the mock's global mutable state. Tests call these with `await`.
+
+    @MainActor static func simulateAuthorization(_ authorization: CBMManagerAuthorization) {
+        CBMCentralManagerMock.simulateAuthorization(authorization)
+    }
+
+    @MainActor static func simulateInitialState(_ state: CBMManagerState) {
+        CBMCentralManagerMock.simulateInitialState(state)
+    }
+
+    @MainActor static func simulatePeripherals(_ peripherals: [CBMPeripheralSpec]) {
+        CBMCentralManagerMock.simulatePeripherals(peripherals)
+    }
+
+    @MainActor static func simulatePowerOn() {
+        CBMCentralManagerMock.simulatePowerOn()
+    }
+
+    @MainActor static func simulatePowerOff() {
+        CBMCentralManagerMock.simulatePowerOff()
+    }
+
+    @MainActor static func simulateConnection() {
+        connectionTestSpec.simulateConnection()
+    }
+
+    @MainActor static func simulateDisconnection() {
+        connectionTestSpec.simulateDisconnection()
     }
 
     /// Builds manager 2 for a cold relaunch: restores under `restoreIdentifier` when the central
@@ -4052,7 +4088,7 @@ enum Mock {
     /// Leaves authorization undetermined until after stream subscribers are registered, then
     /// authorizes so `willRestoreState` fires during central init. Poll for settled actor state
     /// after return — restore side effects are applied asynchronously relative to authorize.
-    static func makeRestoredManager(
+    @MainActor static func makeRestoredManager(
         restoreIdentifier: String,
         loggingEnabled: Bool = false,
         reconnectPolicy: ReconnectPolicy? = nil,
@@ -4090,14 +4126,14 @@ enum Mock {
     /// - Parameter tearDownPrevious: When `true` (default), tears down the suite's previous
     ///   active stack first. Pass `false` only for multi-stack scenarios that keep two managers
     ///   alive (and call ``tearDown(_:)`` on each when done).
-    static func makeManager(
+    @MainActor static func makeManager(
         loggingEnabled: Bool = false,
         reconnectPolicy: ReconnectPolicy? = nil,
         restoreIdentifier: String? = nil,
         idleDisconnectInterval: TimeInterval? = nil,
         tearDownPrevious: Bool = true
     ) async -> ReliaBLEManager {
-        await SimulationConfig.shared.ensureConfigured()
+        SimulationConfig.shared.ensureConfigured()
 
         if tearDownPrevious, let previous = activeManager {
             await tearDown(previous)
@@ -4130,7 +4166,7 @@ enum Mock {
     /// earlier test), ensures power is on, triggers central creation if needed, clears any leaked scan, then waits for
     /// the powered-on state. With `.allowedAlways`, `authorizeBluetooth()` sets up the central and returns without
     /// suspending.
-    static func ensureReady(_ manager: ReliaBLEManager) async {
+    @MainActor static func ensureReady(_ manager: ReliaBLEManager) async {
         CBMCentralManagerMock.simulateAuthorization(.allowedAlways)
         // Drop any lingering mock connection so the connectable spec advertises again, then
         // bounce power so advertising resumes cleanly for a fresh central.
@@ -4239,14 +4275,14 @@ enum Mock {
 
 /// Process-wide sentinel that performs the Nordic mock's one-time global configuration exactly once.
 ///
-/// `CBMCentralManagerMock.simulateInitialState(_:)` and `simulatePeripherals(_:)` must run once, before any central
+/// `await Mock.simulateInitialState(_:)` and `simulatePeripherals(_:)` must run once, before any central
 /// is created. Keying this off "a central exists yet" is wrong — tests that never create a central (or that create one
 /// lazily via `authorize()`) would let these run repeatedly. This actor provides a correct one-shot guard.
 actor SimulationConfig {
     static let shared = SimulationConfig()
-    private var configured = false
+    nonisolated(unsafe) private var configured = false
 
-    func ensureConfigured() {
+    @MainActor func ensureConfigured() {
         guard !configured else { return }
         configured = true
         CBMCentralManagerMock.simulateInitialState(.poweredOn)
