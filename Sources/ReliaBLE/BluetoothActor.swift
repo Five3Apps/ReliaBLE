@@ -279,6 +279,13 @@ actor BluetoothActor {
     /// on wake. A stale generation means the timer was superseded and must not fire (D-1 event 6/7).
     private var idleGeneration: [String: UInt64] = [:]
 
+    /// Generation counter per peripheral for the Tier-1 reconnect ladder. The same cancel-during-sleep
+    /// defense as ``idleGeneration``: a cancel landing while the ladder task is sleeping must not let a
+    /// superseded task drive ``performReconnect``. Bump on arm, capture in ``scheduleReconnect``, and
+    /// re-check on wake (closing the prior critique's taskRegistry cancel-during-sleep race).
+    private var reconnectGeneration: [String: UInt64] = [:]
+
+
     // MARK: - Initialization
 
     /// Bridge to the owning manager's handle registry.
@@ -369,8 +376,8 @@ actor BluetoothActor {
         activeLeases.removeAll()
         manualConnectHold.removeAll()
         idleGeneration.removeAll()
+        reconnectGeneration.removeAll()
         pendingRestoredScanServices = nil
-        pendingRestoredScanOptions = nil
     }
 
     // MARK: - Event Streams
@@ -1025,12 +1032,11 @@ actor BluetoothActor {
     /// Restored `CBPeripheral`s arrive with no peripheral delegate and must be re-associated into
     /// ``cbPeripherals`` immediately. Connection state is seeded from each peripheral's
     /// `CBPeripheral.state`; no synchronous reconnect is issued (standing connects are OS-held).
-    /// Tier-1 reconnect intent is re-armed only for peripherals whose per-connect
-    /// `autoReconnect: true` intent was persisted before termination — a connection made with
-    /// `autoReconnect: false` is restored (state seeded, reference registered) without re-arming
-    /// the library ladder.
+    /// Reconnect intent is re-armed only for peripherals with a **persisted manual-connect hold**
+    /// (D-restore), which rehydrates and suppresses idle; a restored link the app never explicitly
+    /// asked for starts an idle timer and eventually tears down. Work leases are never rehydrated.
     /// If Bluetooth is later reported off/unauthorized, ``invalidatePeripherals()`` clears this
-    /// state intentionally.
+    /// state intentionally while preserving demand.
     ///
     /// Restored peripherals are deliberately **not** emitted on the `peripheralDiscoveries`
     /// advertisement feed — restoration carries no advertisement payload or RSSI, so consumers
@@ -1048,8 +1054,10 @@ actor BluetoothActor {
         let now = Date()
         var didMutatePeripherals = false
 
-        // Reconnect intent persisted across launches; only ids in this set are re-armed below.
-        let persistedIntent = persistedReconnectIntent()
+        // Manual-connect holds persisted across launches (D-restore). A value written by an older
+        // build (array-of-ids) does not decode as the new map; a decode failure is treated as "no
+        // persisted holds". Work leases are never persisted and never rehydrated (case 3).
+        let persistedHolds = persistedHoldMap()
 
         for cbPeripheral in restoredPeripherals {
             // Restored peripherals arrive with no delegate; re-associate into actor-owned maps using the same
@@ -1070,20 +1078,27 @@ actor BluetoothActor {
             cbPeripherals[resolvedId] = cbPeripheral
             didMutatePeripherals = true
 
-            // Seed connection state after the live reference is registered. Do not reconnect here.
-            // Tier-1 intent is re-armed only when it was persisted at connect time (autoReconnect: true).
+            // D-restore: a persisted manual-connect hold rehydrates, suppressing idle and re-arming
+            // reconnect intent for this link. Reconnect intent is now derived from demand, so there is
+            // no separate disconnected/connecting seeding of ``reconnectEnabled``.
+            let rehydratedHold = persistedHolds[resolvedId]
+            if let rehydratedHold {
+                manualConnectHold[resolvedId] = ManualConnectHold(reconnectDesired: rehydratedHold)
+                syncReconnectIntent(id: resolvedId)
+                log?.info(
+                    tags: [.peripheral(resolvedId), .category(.connection)],
+                    "Rehydrated manual-connect hold (reconnectDesired=\(rehydratedHold))"
+                )
+            }
+
+            // Seed connection state after the live reference is registered. Do not reconnect here;
+            // standing connects are OS-held. `reevaluateLink` below re-issues only when not linked.
             let connectionState: ConnectionState?
             switch cbPeripheral.state {
             case .connected:
                 connectionState = .connected
-                if persistedIntent.contains(resolvedId) {
-                    reconnectEnabled.insert(resolvedId)
-                }
             case .connecting:
                 connectionState = .connecting
-                if persistedIntent.contains(resolvedId) {
-                    reconnectEnabled.insert(resolvedId)
-                }
             case .disconnecting:
                 connectionState = .disconnecting
             case .disconnected:
@@ -1094,6 +1109,28 @@ actor BluetoothActor {
 
             if let connectionState {
                 setConnectionState(connectionState, for: resolvedId)
+            }
+
+            // Link-retention policy per D-restore:
+            //  - Case 1 / case 4 (persisted hold present): **no** idle timer; ensure the link if it is
+            //    not already establishing. A hold with `reconnectDesired: false` suppresses idle but
+            //    arms neither tier and is not re-issued (``reevaluateLink``'s issue gate refuses
+            //    `radioReturned` without `wantsReconnect`).
+            //  - Case 2 (no persisted hold): the idle timer starts — restored links the app never
+            //    explicitly asked for still idle out (NFR-3.2).
+            if rehydratedHold != nil {
+                do {
+                    try reevaluateLink(id: resolvedId, reason: .radioReturned)
+                } catch {
+                    let reason = (error as? PeripheralError) ?? .unknown
+                    if reason == .notFound {
+                        setConnectionState(.failed(reason: .notFound), for: resolvedId)
+                    }
+                }
+            } else if connectionState != nil {
+                // Only *linked* restored peripherals (connected/connecting) idle out (D-restore case 2).
+                // A disconnected restored peripheral has nothing to tear down and must stay untracked.
+                beginIdleGrace(id: resolvedId)
             }
         }
 
@@ -1155,11 +1192,19 @@ actor BluetoothActor {
             if let services = pendingRestoredScanServices {
                 resumeRestoredScan(services: services, options: pendingRestoredScanOptions)
             }
-        case .poweredOff, .unknown:
-            // These states do not invalidate peripherals.
-            break
-        case .resetting, .unsupported, .unauthorized:
+
+            // Radio-return sweep (D-1 event 12): after the radio returns, re-link every demanded id
+            // and start the idle timer for restored links with no demand. ``refreshPeripherals()``
+            // re-populates ``cbPeripherals`` from the CoreBluetooth cache first, so ids not
+            // retrievable surface as terminal `.failed(reason: .notFound)` (stranded lease).
+            sweepRadioReturnedDemand()
+        case .resetting, .unsupported, .unauthorized, .poweredOff:
+            // `.poweredOff` joins the invalidate triggers (D-1 event 13): CoreBluetooth invalidates
+            // `CBPeripheral` objects across a power cycle, so the cached `.connected` must clear and
+            // demand re-issue on return. `.unknown` is genuinely transient and does not invalidate.
             invalidatePeripherals()
+        case .unknown:
+            break
         @unknown default:
             log?.error("Unknown CBCentralManager state encountered: \(centralManager.state.rawValue)")
             assertionFailure("Unknown CBCentralManager state encountered: \(centralManager.state.rawValue)")
@@ -1168,6 +1213,40 @@ actor BluetoothActor {
         updateState()
         resolvePendingAuthorization()
         resolvePoweredOnWaiters()
+    }
+
+    /// Radio-return sweep (D-1 event 12), run from ``handleCentralManagerStateUpdate``'s `.poweredOn`
+    /// arm. For every id with demand that is not yet linked, re-evaluate the link (this is what
+    /// re-establishes a demanded link after a radio cycle); and for every id with no demand, start
+    /// an idle grace if linked (this is D-restore case 2, a restored link without a hold).
+    ///
+    /// ``reevaluateLink`` runs in delegate context here, so it cannot propagate a throw. ``.notFound``
+    /// is the terminal outcome an app must observe (the lease or hold is retained, no scan, no retry
+    /// loop) — publish it via ``setConnectionState`` rather than dropping it.
+    private func sweepRadioReturnedDemand() {
+        // Re-link every id that currently has demand (from work leases or manual-connect holds), not
+        // just ids with a tracked connection state — a hold created while the radio was down (via a
+        // `connect()` that threw) leaves the id untracked yet still demanding, and it must be linked
+        // when the radio returns (D-hold).
+        let demandedIds = Set(activeLeases.keys).union(manualConnectHold.keys)
+        for id in demandedIds {
+            do {
+                try reevaluateLink(id: id, reason: .radioReturned)
+            } catch {
+                let reason = (error as? PeripheralError) ?? .unknown
+                if reason == .notFound {
+                    log?.warn(tags: [.peripheral(id), .category(.connection)],
+                              "Radio-return relink failed (.notFound) — demand retained, no scan/retry")
+                    setConnectionState(.failed(reason: .notFound), for: id)
+                }
+                // Other radio errors (e.g. radio flipped off again) leave demand as-is; a later
+                // sweep or evaluation re-drives it.
+            }
+        }
+        // Idle out linked ids with no demand (D-restore case 2, a restored link without a hold).
+        for id in Array(connectionStates.keys) where !demand(id: id) {
+            beginIdleGrace(id: id)
+        }
     }
 
     func handlePeripheralDiscovered(
@@ -1200,6 +1279,32 @@ actor BluetoothActor {
         // Stash the live reference under the resolved id. Never escapes the actor.
         cbPeripherals[resolvedId] = cbPeripheral
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
+
+        // D-1 event 15 (optional polish): discovery upserting an id that already has demand links it
+        // opportunistically — the cheap recovery for the `notFound` terminal case. It starts **no**
+        // scan of its own; it only links when something else (typically an app-driven scan) finds a
+        // device demand is already waiting on. Narrowed to the terminal `.failed` state so repeated
+        // advertisements do not spam connect attempts against an already-linked or in-transition
+        // peripheral; richer demand-driven scan policy is FR-8.2.
+        if demand(id: resolvedId) {
+            // Skip ids already being linked or torn down; genuinely not-linked demanded ids
+            // (`.failed`, `.disconnected`, or currently untracked/`nil`) are re-issued here so the
+            // rediscovery of a stranded demand is the cheap recovery path (D-never). `.reconnecting`
+            // ids are already being driven (ladder or AwaitingRadio projection), so they are skipped.
+            switch connectionStates[resolvedId] {
+            case .connected, .connecting, .disconnecting, .reconnecting(_, _, _):
+                break
+            default:
+                do {
+                    try reevaluateLink(id: resolvedId, reason: .discoveredWhileDemanded)
+                } catch {
+                    let reason = (error as? PeripheralError) ?? .unknown
+                    if reason == .notFound {
+                        setConnectionState(.failed(reason: .notFound), for: resolvedId)
+                    }
+                }
+            }
+        }
     }
 
     /// Resolves the app-facing id for a peripheral, upserts its snapshot into ``discoveredPeripherals``, and
@@ -1302,46 +1407,73 @@ actor BluetoothActor {
     }
 
     private func invalidatePeripherals() {
-        // The value snapshots hold no CoreBluetooth reference to clear; drop the live registry instead.
+        // The normative per-id invalidation sequence (D-1 event 13). Replaces the bulk
+        // ``clearConnectionStates()`` nil-out with a per-id policy because demand survives a radio
+        // outage and the public stream must distinguish "the library will bring this back" from
+        // "this is over":
+        let trackedIds = Array(connectionStates.keys)
+
+        // (1) Every tracked id emits a terminal `.disconnected` — the link really is dead.
+        for id in trackedIds {
+            setConnectionState(.disconnected(reason: .bluetoothUnavailable), for: id)
+        }
+
+        // (2) Drop live references and cancel every in-flight timer/ladder. `activeLeases` and
+        // `manualConnectHold` are **preserved** — demand survives a radio outage (D-1 event 13).
         cbPeripherals.removeAll()
-        clearConnectionStates()
         taskRegistry.cancelAll()
+        idleTaskRegistry.cancelAll()
         reconnectAttempts.removeAll()
-        reconnectEnabled.removeAll()
-        persistReconnectIntent()
+        reconnectGeneration.removeAll()
         intentionalDisconnects.removeAll()
-        pendingRestoredScanServices = nil
-        pendingRestoredScanOptions = nil
+        reconnectEnabled.removeAll()  // re-synced per-id from demand below.
+
+        // Recompute the projection per id: no-demand ids are untracked, wants-reconnect ids move
+        // to AwaitingRadio, and demand-but-no-wants-reconnect ids settle at disconnected.
+        let reconnectingIds = trackedIds.filter { wantsReconnect(id: $0) }
+        let suppressedIds = trackedIds.filter { demand(id: $0) && !wantsReconnect(id: $0) }
+        let untrackedIds = trackedIds.filter { !demand(id: $0) }
+
+        // (5) No-demand ids are simply untracked: the handle reverts to nil after the clear.
+        for id in untrackedIds {
+            registry.applyConnectionState(id: id, state: nil)
+        }
+        connectionStates.removeAll()
+
+        // (3) For each id that wants a link back, publish the AwaitingRadio projection
+        // `.reconnecting(source: .library, attempt: nil, nextRetryAt: nil)`. This holds until
+        // ``issueConnect`` moves it to `.connecting`, the ladder supplies real attempt values, the
+        // link succeeds, or demand is cleared.
+        for id in reconnectingIds {
+            syncReconnectIntent(id: id)
+            setConnectionState(.reconnecting(source: .library, attempt: nil, nextRetryAt: nil), for: id)
+        }
+
+        // (4) Demand with no `wantsReconnect` (a `connect(autoReconnect: false)` hold) gets **no**
+        // `.reconnecting` signal — nothing will re-issue for it (event 12's issue gate refuses), so
+        // settling at `.disconnected` is the honest state.
+        for id in suppressedIds {
+            syncReconnectIntent(id: id)
+        }
+
+        // This method must **never** write to disk: ``syncReconnectIntent`` is called without
+        // `persistHold`, and the old `persistReconnectIntent()` here is gone. A transient blip must
+        // not erase the durable hold map (D-1 event 13). The deferred restored scan is also
+        // **preserved** rather than cleared, so a warm power-off does not drop it (FR-8.2).
+
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
         log?.debug("Invalidated all peripheral references")
     }
 
     // MARK: - Persisted Reconnect Intent
 
-    /// `UserDefaults` key for the persisted reconnect-intent set, namespaced by restore identifier.
+    /// `UserDefaults` key for the persisted manual-connect hold map, namespaced by restore
+    /// identifier.
     ///
     /// `nil` when no ``restoreIdentifier`` is configured — without state restoration there is no
     /// relaunch path that could consume persisted intent, so nothing is written.
     private var reconnectIntentDefaultsKey: String? {
         restoreIdentifier.map { "com.five3apps.relia-ble.reconnect-intent.\($0)" }
-    }
-
-    /// Mirrors ``reconnectEnabled`` to `UserDefaults` so per-connect `autoReconnect` intent
-    /// survives process death. ``handleWillRestoreState(_:)`` re-arms Tier-1 reconnect only for
-    /// restored peripherals present in this persisted set.
-    ///
-    /// Called after every explicit mutation of ``reconnectEnabled`` (connect, disconnect,
-    /// invalidation). Restoration itself only reads the set.
-    private func persistReconnectIntent() {
-        guard let key = reconnectIntentDefaultsKey else { return }
-        UserDefaults.standard.set(Array(reconnectEnabled).sorted(), forKey: key)
-    }
-
-    /// Reads the reconnect-intent set persisted by a previous launch (or this one).
-    private func persistedReconnectIntent() -> Set<String> {
-        guard let key = reconnectIntentDefaultsKey,
-              let stored = UserDefaults.standard.stringArray(forKey: key) else { return [] }
-        return Set(stored)
     }
 
     private func refreshPeripherals() {
@@ -1404,19 +1536,56 @@ actor BluetoothActor {
         centralManager.connect(cbPeripheral, options: options)
     }
 
-    /// Keeps ``reconnectEnabled`` in step with the derived demand signal, and is the place hold-driven
-    /// persistence is written from.
+    /// Keeps ``reconnectEnabled`` in step with the derived demand signal. This is the **sole**
+    /// persistence writer: it is the only place a manual-connect hold is written to `UserDefaults`.
     ///
-    /// Inserts ``id`` when ``wantsReconnect(id)`` is true, removes it otherwise.
-    // TODO(step 6): reshape this into the persisted hold map (id → reconnectDesired) and make this the
-    // sole persistence writer. This step keeps the existing set-shaped persistence shape/format.
-    private func syncReconnectIntent(id: String) {
-        if wantsReconnect(id: id) {
+    /// Inserts ``id`` into ``reconnectEnabled`` when ``wantsReconnect(id)`` is true, removes it
+    /// otherwise (and cancels that id's Tier-1 ladder when it no longer wants a link back).
+    ///
+    /// Persistence is **hold-driven only**: `persistHold` is `true` only from the two manual-connect
+    /// entry points (``applyManualConnectHold(id:reconnectDesired:)`` and
+    /// ``applyManualDisconnect(id:)``), never from work-lease or event-driven demand changes. The
+    /// persisted artifact is the hold map (`id → reconnectDesired`), not the reconnect-enabled set,
+    /// and is namespaced by ``restoreIdentifier``. Nothing is written when there is no restore
+    /// identifier (no relaunch path could consume it) — D-4 / D-restore.
+    private func syncReconnectIntent(id: String, persistHold: Bool = false) {
+        let wants = wantsReconnect(id: id)
+        if wants {
             reconnectEnabled.insert(id)
         } else {
             reconnectEnabled.remove(id)
+            // Demand no longer wants a link back — cancel the Tier-1 ladder so a quiet peripheral
+            // cannot keep scheduling retries. Idle teardown and manual disconnect also route here.
+            // Clear attempts and bump the generation too, so a racing ladder task whose cancel
+            // landed mid-sleep cannot re-drive `performReconnect` against a now-quiet link.
+            taskRegistry.cancel(id)
+            reconnectAttempts[id] = nil
+            reconnectGeneration[id] = (reconnectGeneration[id] ?? 0) + 1
         }
-        persistReconnectIntent()
+        if persistHold, restoreIdentifier != nil {
+            persistHoldMap()
+        }
+    }
+
+    /// Writes the persisted hold map (`id → reconnectDesired`) for the current ``restoreIdentifier``.
+    ///
+    /// Only ``syncReconnectIntent`` (with `persistHold: true`) and the restore-time read-back call
+    /// this — it is the single on-disk write. ``invalidatePeripherals()`` and ``shutdown()`` must
+    /// never reach here, or a transient blip would erase the durable hold map (D-1 event 13/14).
+    private func persistHoldMap() {
+        guard let key = reconnectIntentDefaultsKey else { return }
+        let holds = manualConnectHold.mapValues { $0.reconnectDesired }
+        UserDefaults.standard.set(holds, forKey: key)
+    }
+
+    /// Reads the persisted hold map (`id → reconnectDesired`) back at restore time.
+    ///
+    /// A value written by an older build (array-of-ids) does not decode as the new `[String: Bool]`
+    /// map — treat a decode failure as "no persisted holds" and move on. No migration shim (pre-release).
+    private func persistedHoldMap() -> [String: Bool] {
+        guard let key = reconnectIntentDefaultsKey,
+              let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: Bool] else { return [:] }
+        return stored
     }
 
     /// The single ensure-linked entry point (D-1 event 5).
@@ -1485,7 +1654,7 @@ actor BluetoothActor {
         idleGeneration[id] = (idleGeneration[id] ?? 0) + 1
         idleTaskRegistry.cancel(id)
         log?.info(tags: [.peripheral(id), .category(.connection)], "Manual connect")
-        syncReconnectIntent(id: id)
+        syncReconnectIntent(id: id, persistHold: true)
     }
 
     /// Clears a manual-connect hold and tears down the link per the settling rule (D-1 event 4).
@@ -1494,7 +1663,7 @@ actor BluetoothActor {
     /// dropping a hold during a radio outage must not throw `.notFound`.
     func applyManualDisconnect(id: String) {
         manualConnectHold.removeValue(forKey: id)
-        syncReconnectIntent(id: id)
+        syncReconnectIntent(id: id, persistHold: true)
 
         log?.info(tags: [.peripheral(id), .category(.connection)], "Manual disconnect")
 
@@ -1703,39 +1872,68 @@ actor BluetoothActor {
             log?.warn(tags: [.category(.connection)], "didDisconnect for unknown peripheral — dropped")
             return
         }
-        
+
         if intentionalDisconnects.remove(id) != nil {
+            // Intentional (D-1 event 9): clean `.disconnected(reason: nil)`, clear attempts.
             // Contract: `.disconnected(reason:)` carries `nil` for a clean, app-initiated disconnect.
             // CoreBluetooth can still deliver a benign cancellation-style error on-device for an
-            // explicit `cancelPeripheralConnection`, so we intentionally ignore `payload.error` here
-            // and always report a clean disconnect — otherwise the app/Demo would misclassify an
-            // intentional disconnect as an error drop.
+            // explicit `cancelPeripheralConnection`, so we intentionally ignore `payload.error` here.
             log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected (explicit)")
+            clearReconnectState(for: id)
             setConnectionState(.disconnected(reason: nil), for: id)
-            
+
+            // Deferred half of ``disconnectWithActiveLeaseRelinks``: a Manual `disconnect()` that races
+            // pending work must not strand it — if any lease is live, re-drive the link.
+            if workCount(for: id) > 0 {
+                do {
+                    try reevaluateLink(id: id, reason: .relinkAfterIntentional)
+                } catch {
+                    let reason = (error as? PeripheralError) ?? .unknown
+                    if reason == .notFound {
+                        setConnectionState(.failed(reason: .notFound), for: id)
+                    }
+                }
+            }
             return
         }
-        
+
         if payload.isReconnecting {
-            // Defensively cancel any pending library ladder so Tier 0 (system) and Tier 1
-            // (library) cannot overlap under odd callback ordering.
+            // Tier-0 in progress (D-1 event 9). Defensively cancel any pending library ladder so Tier 0
+            // (system) and Tier 1 (library) cannot overlap under odd callback ordering.
             taskRegistry.cancel(id)
 
-            log?.info(tags: [.peripheral(id), .category(.connection)], "System auto-reconnect in progress")
-            setConnectionState(.reconnecting(source: .system, attempt: nil, nextRetryAt: nil), for: id)
-            
+            if wantsReconnect(id: id) {
+                log?.info(tags: [.peripheral(id), .category(.connection)], "System auto-reconnect in progress")
+                setConnectionState(.reconnecting(source: .system, attempt: nil, nextRetryAt: nil), for: id)
+            } else {
+                // Do NOT trust Tier-0: publish `.disconnected(reason: nil)` immediately (so the app does
+                // not read a `nil` handle as an auto-relink), and cancel as fire-and-forget suppression.
+                // Per the settling rule we do NOT insert into `intentionalDisconnects`: the peripheral is
+                // already physically disconnected, so there is no `.disconnecting` to settle. This branch
+                // cannot loop: `!wantsReconnect` implies no live leases, so the relink branch above is
+                // unreachable from it.
+                log?.info(tags: [.peripheral(id), .category(.connection)],
+                          "Tier-0 reconnect suppressed (no demand wants it)")
+                setConnectionState(.disconnected(reason: nil), for: id)
+                if let cbPeripheral = cbPeripherals[id] {
+                    centralManager?.cancelPeripheralConnection(cbPeripheral)
+                }
+            }
             return
         }
-        
+
+        // Otherwise unexpected (D-1 event 9, final branch).
         let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
         if let error = mappedError {
             log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected with error: \(error)")
         } else {
             log?.info(tags: [.peripheral(id), .category(.connection)], "Peripheral disconnected")
         }
-        
+
         setConnectionState(.disconnected(reason: mappedError), for: id)
-        armReconnect(id: id)
+        if wantsReconnect(id: id) {
+            armReconnect(id: id)
+        }
     }
 
     private func handleDidFailToConnect(_ payload: ConnectionPayload) {
@@ -1743,27 +1941,33 @@ actor BluetoothActor {
             log?.warn(tags: [.category(.connection)], "didFailToConnect for unknown peripheral — dropped")
             return
         }
-        
+
         let mappedError: PeripheralError? = payload.error.map { ($0 as? CBError).map(PeripheralError.fromCBError) ?? .unknown }
         log?.warn(tags: [.peripheral(id), .category(.connection)], "Peripheral connection failed with error: \(mappedError ?? .unknown)")
-        
+
         setConnectionState(.failed(reason: mappedError), for: id)
-        armReconnect(id: id)
+        // Close the prior critique's incomplete intentionalDisconnects clearing on fail.
+        intentionalDisconnects.remove(id)
+        if wantsReconnect(id: id) {
+            armReconnect(id: id)
+        }
     }
 
     // MARK: - Reconnection
 
     private func armReconnect(id: String) {
-        guard reconnectEnabled.contains(id) else { return }
+        // Gated on whether demand currently wants a link back (D-4 / #59). A quiet peripheral never
+        // runs the ladder, even if it connected with `autoReconnect: true` earlier and demand later
+        // dropped.
+        guard wantsReconnect(id: id) else { return }
 
         let attempts = reconnectAttempts[id] ?? 0
         guard reconnectPolicy.maxAttempts > 0, attempts < reconnectPolicy.maxAttempts else {
-            // Give-up clears in-flight ladder bookkeeping only. `reconnectEnabled` is deliberately
-            // retained so reconnection intent survives until an explicit `disconnect` — a later
-            // unexpected drop must start a fresh ladder from attempt 1.
+            // Give-up clears in-flight ladder bookkeeping only. Demand is deliberately retained so a
+            // later re-evaluation can start a fresh ladder.
             clearReconnectState(for: id)
             log?.info(tags: [.peripheral(id), .category(.connection)], "Reconnect attempts exhausted")
-            
+
             return
         }
 
@@ -1772,8 +1976,12 @@ actor BluetoothActor {
     }
 
     private func scheduleReconnect(id: String, attempt: Int) {
+        // Bump the per-id generation so a stale sleeping task (whose wake raced a cancel from
+        // ``taskRegistry``) cannot drive ``performReconnect`` after being superseded. The same
+        // cancel-during-sleep defense ``idleGeneration`` applies to the idle timer (carry-over).
+        let generation = (reconnectGeneration[id] ?? 0) + 1
+        reconnectGeneration[id] = generation
         taskRegistry.cancel(id)
-
         // `ReconnectPolicy` is public and unvalidated; collapse any non-finite field (`nan`/`inf`)
         // to a safe value here. Beyond the UInt64 conversion below, a non-finite `jitter` would also
         // trap `Double.random(in: -jitter...jitter)` ("Range requires lowerBound <= upperBound").
@@ -1808,13 +2016,14 @@ actor BluetoothActor {
                 return
             }
             
-            await self.performReconnect(id: id, attempt: attempt)
+            await self.performReconnect(id: id, attempt: attempt, generation: generation)
         }
         taskRegistry.insert(id, task)
     }
 
-    private func performReconnect(id: String, attempt: Int) {
+    private func performReconnect(id: String, attempt: Int, generation: UInt64) {
         guard !Task.isCancelled,
+              reconnectGeneration[id] == generation,
               reconnectAttempts[id] == attempt,
               case .reconnecting(_, let currentAttempt?, _) = connectionStates[id],
               currentAttempt == attempt
@@ -1834,6 +2043,11 @@ actor BluetoothActor {
     
     private func clearReconnectState(for id: String) {
         taskRegistry.cancel(id)
+        // Invalidate any in-flight ladder task's captured generation so it cannot re-drive after
+        // being cleared (success / give-up / intentional). Close the prior critique's incomplete
+        // intentionalDisconnects clearing path on give-up and success: intentionalDisconnects is
+        // removed here, and handleDidFailToConnect removes it on fail.
+        reconnectGeneration[id] = (reconnectGeneration[id] ?? 0) + 1
         reconnectAttempts[id] = nil
         intentionalDisconnects.remove(id)
     }
@@ -1891,6 +2105,22 @@ actor BluetoothActor {
     /// Test-only hook: runs the same peripheral invalidation as a Bluetooth reset/unauthorized path.
     func testInvalidatePeripherals() {
         invalidatePeripherals()
+    }
+
+    /// Test-only hook: clears all discovered snapshots so ``refreshPeripherals()`` cannot retrieve
+    /// any id (simulating a peripheral that is no longer in the system cache — the D-never stranded
+    /// case).
+    func testClearDiscoveredPeripherals() {
+        discoveredPeripherals = []
+    }
+
+    /// Test-only hook: simulates the radio returning (as if the central just reached `.poweredOn`),
+    /// running the same refresh + radio-return sweep as ``handleCentralManagerStateUpdate``
+    /// (D-1 event 12). Deterministic way for a stranded-lease or rediscovery test to drive the sweep
+    /// without a real power cycle.
+    func testSimulateRadioReturn() {
+        refreshPeripherals()
+        sweepRadioReturnedDemand()
     }
 
     /// Test-only hook: whether `id` is currently marked as an intentional disconnect.
@@ -1991,9 +2221,10 @@ actor BluetoothActor {
         delegateShim is BluetoothDelegateShim
     }
 
-    /// Test-only hook: reconnect intent persisted for the current restore identifier.
-    func testPersistedReconnectIntent() -> Set<String> {
-        persistedReconnectIntent()
+    /// Test-only hook: the persisted manual-connect hold map (`id → reconnectDesired`) for the
+    /// current restore identifier.
+    func testPersistedManualConnectHolds() -> [String: Bool] {
+        persistedHoldMap()
     }
 
     /// Test-only hook: removes any persisted reconnect intent for the current restore identifier.

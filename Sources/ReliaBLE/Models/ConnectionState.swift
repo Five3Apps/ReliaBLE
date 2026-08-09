@@ -34,10 +34,13 @@ public enum ConnectionState: Sendable, Equatable, Hashable {
     case connecting
     /// A reconnection is in progress.
     ///
-    /// ``ReconnectSource/system`` means iOS is reconnecting at the daemon level; the library
-    /// is not involved and exposes no attempt count or next-retry time (both are `nil`).
-    /// ``ReconnectSource/library`` means the app-side exponential-backoff ladder has armed;
-    /// `attempt` and `nextRetryAt` are populated.
+    /// For ``ReconnectSource/library``, a `nil` `attempt` / `nextRetryAt` means the link is
+    /// **waiting for the radio** (projected the moment a demanded link's radio drops, and held
+    /// until a connect is issued, the ladder supplies real values, the link succeeds, or demand
+    /// clears) — not yet on the backoff ladder. A ladder step that has actually armed carries
+    /// **real** values: `attempt >= 1` and a concrete `nextRetryAt`. ``ReconnectSource/system``
+    /// is iOS reconnecting at the daemon level; the library is not involved and always exposes
+    /// `nil` for both.
     case reconnecting(source: ReconnectSource, attempt: Int?, nextRetryAt: Date?)
     /// The peripheral is currently connected.
     case connected
@@ -46,7 +49,9 @@ public enum ConnectionState: Sendable, Equatable, Hashable {
     /// The peripheral has disconnected.
     ///
     /// The `reason` is `nil` for a clean, explicit disconnect and non-`nil` for an unexpected
-    /// drop from CoreBluetooth.
+    /// drop from CoreBluetooth. Idle-grace teardown also surfaces as an intentional
+    /// `reason: nil` — deliberately indistinguishable from an app-initiated disconnect to the
+    /// reconnect policy (FR-11.5 "intentional").
     case disconnected(reason: PeripheralError?)
     /// A connection attempt has failed.
     ///
