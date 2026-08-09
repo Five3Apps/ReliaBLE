@@ -2975,7 +2975,7 @@ struct ReliaBLEManagerTests {
 
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
-        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+        await manager.bluetooth.setIdleDisconnectInterval(0.01)
 
         let changes = manager.connectionStateChanges
 
@@ -2994,21 +2994,36 @@ struct ReliaBLEManagerTests {
             await manager.currentConnectionStates[handle.id] == .connected
         })
 
-        // OS-delivered Tier-0 reconnect: cached state moves to .reconnecting(.system).
-        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: true)
+        // OS-delivered Tier-0 reconnect: a REAL drop of the (auto-reconnect) connected peripheral, so
+        // the live `CBPeripheral` is no longer connected and the cached state moves to
+        // `.reconnecting(.system)`. Unlike `testInjectDisconnect` (which bypasses the mock and leaves
+        // it connected), this drives the actual limbo the idle-torn guard protects: a physically
+        // dropped link the OS is still trying to relink.
+        Mock.connectionTestSpec.simulateDisconnection()
         #expect(await pollUntil(timeout: 3.0) {
             if case .reconnecting(.system, _, _) = await manager.currentConnectionStates[handle.id] {
                 return true
             }
             return false
         })
+        // Confirm we are genuinely in the non-connected limbo, not still `.connected` in the mock.
+        #expect(await manager.bluetooth.testContainsCBPeripheral(handle.id))
+        #expect((await manager.bluetooth.testCBPeripheralState(for: handle.id)) != .connected,
+                "Scenario must drive the non-connected Tier-0 limbo")
 
-        // Demand drops mid-system-reconnect: idle teardown must settle AND cancel the OS's pending work.
+        // Demand drops mid-system-reconnect: idle teardown must settle AND issue exactly one cancel to
+        // stop the OS's pending reconnect work. The mock cannot complete the OS-reconnect on its own, so
+        // we pin the cancel CALL itself rather than a downstream side effect the mock cannot produce — a
+        // "no later .connected" assertion would pass trivially whether or not the cancel fires.
         await handle.releaseWorkLease(token)
         #expect(await pollUntil(timeout: 3.0) {
             await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
         })
         #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
+        #expect(await manager.bluetooth.testCancelPeripheralConnectionCount(for: handle.id) == 1,
+                "Idle teardown must issue exactly one cancel for the Tier-0 reconnect")
+        #expect(await manager.bluetooth.testContainsIntentionalDisconnect(handle.id) == false,
+                "Idle teardown of a non-connected Tier-0 limbo must not mark the disconnect intentional")
 
         // No later .connected may arrive from the suppressed Tier-0 reconnect. First flush the events
         // already observed (the buffer includes the initial .connecting/.connected from lease acquisition
@@ -3276,11 +3291,12 @@ struct ReliaBLEManagerTests {
         try? await handle.disconnect()
     }
 
-    // Defect 2: a reconnect ladder step must not issue a connect against a dead radio. A ladder retry
-    // that wakes only reads `centralManager.state`; the synchronous flip on `simulatePowerOff` is
-    // observed before the deferred delegate invalidation cancels the ladder, so without the radio gate
-    // a redundant connect could be issued. We assert the ladder never reaches `.connecting` on a dead
-    // radio and instead surfaces `.bluetoothPoweredOff` after the gate.
+    // INVARIANT COVERAGE (not a regression test): a reconnect ladder step must not issue a connect
+    // against a dead radio. This is an end-to-end behavioral check, but it does NOT pin the gate —
+    // the synchronous flip on `simulatePowerOff` races the deferred delegate invalidation, which can
+    // cancel the ladder before a sleeping step ever wakes, so `performReconnect`'s radio gate is not
+    // strictly what prevents the connect here. The gate itself is pinned deterministically by
+    // `reconnectLadderStepRefusesToIssueWhenRadioIsOff` (see that test).
     @Test func reconnectLadderDoesNotIssueAgainstDeadRadio() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
@@ -3333,6 +3349,73 @@ struct ReliaBLEManagerTests {
         let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 2_000_000_000)
         let issuedConnecting = events.contains { $0.state == .connecting }
         #expect(!issuedConnecting, "Ladder must not issue a connect against a dead radio")
+
+        // Cleanup: restore the radio and tear down the lease.
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+        await handle.releaseWorkLease(token)
+    }
+
+    // WHITE-BOX regression test for the reconnect ladder's dead-radio gate. The end-to-end test
+    // (`reconnectLadderDoesNotIssueAgainstDeadRadio`) cannot pin this gate because the delegate-driven
+    // invalidation cancels a sleeping ladder before its step wakes — so we drive one ladder step
+    // deterministically via the test-only `testInvokeLadderStep` hook while the radio is off, and
+    // assert the gate refuses to issue a connect and instead surfaces `.failed(.bluetoothPoweredOff)`.
+    // If the `.poweredOff` gate in `performReconnect` is removed, this fails.
+    @Test func reconnectLadderStepRefusesToIssueWhenRadioIsOff() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        var policy = ReconnectPolicy()
+        policy.maxAttempts = 5
+        policy.initialDelay = 0.1
+        policy.jitter = 0.0
+        let manager = await Mock.makeManager(reconnectPolicy: policy)
+        await Mock.ensureReady(manager)
+        await manager.bluetooth.setIdleDisconnectInterval(0.1)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        let token = try await handle.acquireWorkLease()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+
+        // Unexpected drop arms the Tier-1 ladder.
+        await manager.bluetooth.testInjectDisconnect(for: handle.id, isReconnecting: false)
+        #expect(await pollUntil(timeout: 3.0) {
+            if case .reconnecting(.library, _, _) = await manager.currentConnectionStates[handle.id] {
+                return true
+            }
+            return false
+        })
+
+        // Flip the radio off and let the delegate-driven invalidation settle deterministically, so the
+        // ladder bookkeeping is stationary before we drive the step ourselves.
+        CBMCentralManagerMock.simulatePowerOff()
+        _ = await Mock.waitForState("Powered Off", on: manager)
+
+        // Drive one ladder step on a dead radio. The gate must refuse to issue a connect.
+        await manager.bluetooth.testInvokeLadderStep(for: handle.id)
+
+        // The gate deterministically settles the ladder to a terminal `.failed(.bluetoothPoweredOff)`
+        // (via `failLadderRadio`) on this actor turn. If the `.poweredOff` gate were removed,
+        // `performReconnect` would fall through and `issueConnect` would instead publish `.connecting`
+        // — so the `.connecting` absence is the load-bearing regression check. Read the actor's
+        // authoritative state rather than racing a time-bounded stream drain.
+        let settledToPoweredOff = await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .failed(reason: .bluetoothPoweredOff)
+        }
+        #expect(settledToPoweredOff, "Ladder step on a dead radio must fail via .bluetoothPoweredOff, not connect")
+        #expect(await manager.currentConnectionStates[handle.id] != .connecting,
+                "Ladder step must not issue a connect against a dead radio")
 
         // Cleanup: restore the radio and tear down the lease.
         CBMCentralManagerMock.simulatePowerOn()

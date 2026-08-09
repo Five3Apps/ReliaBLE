@@ -292,6 +292,11 @@ actor BluetoothActor {
     private var intentionalDisconnects: Set<String> = []
     private var reconnectAttempts: [String: Int] = [:]
 
+    /// Test-only: number of `cancelPeripheralConnection` calls issued per peripheral id, so a test
+    /// can pin that a cancel was actually issued (mirrors the ``testLastScanServices`` hook style).
+    /// Incremented at the single choke point ``issueCancel(_:)`` so it cannot drift from reality.
+    private var cancelCallCounts: [String: Int] = [:]
+
     /// Live work-lease UUIDs per peripheral. `workCount(id)` is `activeLeases[id]?.count ?? 0`.
     /// A `Set<UUID>` rather than a bare `Int` so an already-released token is *detectable*.
     private var activeLeases: [String: Set<UUID>] = [:]
@@ -1551,6 +1556,17 @@ actor BluetoothActor {
         centralManager.connect(cbPeripheral, options: options)
     }
 
+    /// Single choke point for every `cancelPeripheralConnection` call, so the test-only cancel counter
+    /// (``cancelCallCounts``) cannot drift from reality. The CoreBluetooth cancel is issued unchanged —
+    /// routing through here adds only bookkeeping, never a behavioral change to which cancels are sent
+    /// or their ordering.
+    private func issueCancel(_ cbPeripheral: CBPeripheral) {
+        if let id = id(for: cbPeripheral) {
+            cancelCallCounts[id, default: 0] += 1
+        }
+        centralManager?.cancelPeripheralConnection(cbPeripheral)
+    }
+
     /// Keeps ``reconnectEnabled`` in step with the derived demand signal. This is the **sole**
     /// persistence writer: it is the only place a manual-connect hold is written to `UserDefaults`.
     ///
@@ -1693,7 +1709,7 @@ actor BluetoothActor {
         if cbPeripheral.state == .connected {
             intentionalDisconnects.insert(id)
             setConnectionState(.disconnecting, for: id)
-            centralManager?.cancelPeripheralConnection(cbPeripheral)
+            issueCancel(cbPeripheral)
         } else {
             // Settling rule: never publish an optimistic `.disconnecting` unless the peripheral is
             // currently `.connected`. Settle synchronously and do NOT mark intentional — a late
@@ -1705,7 +1721,7 @@ actor BluetoothActor {
             // It is fire-and-forget and deliberately NOT inserted into `intentionalDisconnects`.
             setConnectionState(.disconnected(reason: nil), for: id)
             if cbPeripheral.state == .connecting || cachedSystemReconnect(id: id) {
-                centralManager?.cancelPeripheralConnection(cbPeripheral)
+                issueCancel(cbPeripheral)
             }
         }
     }
@@ -1810,14 +1826,14 @@ actor BluetoothActor {
             // is no `.disconnecting` to settle) and without publishing `.disconnecting`.
             setConnectionState(.disconnected(reason: nil), for: id)
             if let live = cbPeripherals[id], live.state == .connecting || cachedSystemReconnect(id: id) {
-                centralManager?.cancelPeripheralConnection(live)
+                issueCancel(live)
             }
             return
         }
 
         intentionalDisconnects.insert(id)
         setConnectionState(.disconnecting, for: id)
-        centralManager?.cancelPeripheralConnection(cbPeripheral)
+        issueCancel(cbPeripheral)
     }
 
     /// Test-only hook: number of live work leases for `id`.
@@ -1946,7 +1962,7 @@ actor BluetoothActor {
                           "Tier-0 reconnect suppressed (no demand wants it)")
                 setConnectionState(.disconnected(reason: nil), for: id)
                 if let cbPeripheral = cbPeripherals[id] {
-                    centralManager?.cancelPeripheralConnection(cbPeripheral)
+                    issueCancel(cbPeripheral)
                 }
             }
             return
@@ -2259,9 +2275,40 @@ actor BluetoothActor {
         cbPeripherals[id] != nil
     }
 
+    /// Test-only hook: the live `CBPeripheral`'s CoreBluetooth state for `id`, or `nil` if none.
+    func testCBPeripheralState(for id: String) -> CBPeripheralState? {
+        cbPeripherals[id]?.state
+    }
+
     /// Test-only hook: whether the central is currently scanning.
     func testIsScanning() -> Bool {
         centralManager?.isScanning == true
+    }
+
+    /// Test-only hook: number of `cancelPeripheralConnection` calls issued for `id`.
+    ///
+    /// Lets a test pin that a cancel was actually issued (rather than reasoning about a downstream
+    /// side effect the mock cannot produce), mirroring the ``testIsScanning`` / ``testLastScanServices``
+    /// hook style.
+    func testCancelPeripheralConnectionCount(for id: String) -> Int {
+        cancelCallCounts[id] ?? 0
+    }
+
+    /// Test-only hook: drives one reconnect-ladder step for `id` on this actor turn, bypassing the
+    /// sleep/backoff machinery.
+    ///
+    /// Re-seeds the ladder bookkeeping (``reconnectGeneration``, ``reconnectAttempts``) and a
+    /// `.reconnecting(source: .library, attempt:nextRetryAt:)` cached state, then invokes
+    /// ``performReconnect(id:attempt:generation:)`` directly so a test can pin the dead-radio gate
+    /// deterministically instead of racing the delegate-driven invalidation that cancels a sleeping
+    /// ladder. White-box test hook only — never called from production code.
+    func testInvokeLadderStep(for id: String) {
+        let attempt = 1
+        let generation = (reconnectGeneration[id] ?? 0) + 1
+        reconnectGeneration[id] = generation
+        reconnectAttempts[id] = attempt
+        setConnectionState(.reconnecting(source: .library, attempt: attempt, nextRetryAt: Date()), for: id)
+        performReconnect(id: id, attempt: attempt, generation: generation)
     }
 
     /// Test-only hook: number of registered `connectionStateChanges` subscribers.
