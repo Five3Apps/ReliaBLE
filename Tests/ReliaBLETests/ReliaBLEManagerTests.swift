@@ -459,6 +459,41 @@ struct ReliaBLEManagerTests {
         await manager.stopScanning()
     }
 
+    @Test func cancellingSupersededScanWaiterDoesNotCancelNewerRequest() async throws {
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        CBMCentralManagerMock.simulateInitialState(.unknown)
+        _ = await Mock.waitForState("Unknown", on: manager)
+
+        let scanUUID = CBUUID(string: "180D")
+
+        // Waiter A parks with a NIL filter while the radio is transient.
+        let first = Task { try await manager.startScanning(services: nil) }
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        // Waiter B (with a NON-nil filter) supersedes A, which completes successfully without
+        // scanning. B now owns the single-slot scan waiter.
+        let second = Task { try await manager.startScanning(services: [scanUUID]) }
+        _ = try await first.value // superseded — success, no scan, no error
+        _ = await pollUntil(timeout: 2.0) { await manager.bluetooth.testPendingScanWaiterCount() == 1 }
+
+        // Cancelling A's task must NOT steal B's parked waiter — cancellation is waiter-specific.
+        first.cancel()
+        _ = try await first.value // still completes; superseded return already delivered
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 1)
+
+        // Power on: B still owns the request and starts scanning with B's filter, and did not throw.
+        CBMCentralManagerMock.simulatePowerOn()
+        _ = try await second.value
+
+        #expect(await Mock.waitForState("Scanning", on: manager))
+        #expect(await manager.bluetooth.testPendingScanWaiterCount() == 0)
+        #expect(await manager.bluetooth.testLastScanServices() == [scanUUID])
+
+        await manager.stopScanning()
+    }
+
     @Test func startScanningCancellationUnblocksWaiter() async throws {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)

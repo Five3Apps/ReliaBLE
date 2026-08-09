@@ -188,10 +188,11 @@ public final class ReliaBLEManager: Sendable {
     public func startScanning(services: sending [CBUUID]? = nil) async throws {
         await bluetooth.ensureCentralManager()
 
+        let waiterID = UUID()
         try await withTaskCancellationHandler {
-            try await bluetooth.startScanning(services: services)
+            try await bluetooth.startScanning(services: services, waiterID: waiterID)
         } onCancel: {
-            Task { await bluetooth.cancelScanWaiter() }
+            Task { await bluetooth.cancelScanWaiter(waiterID) }
         }
     }
 

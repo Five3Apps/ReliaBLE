@@ -847,7 +847,7 @@ actor BluetoothActor {
     /// is called (waiter completes successfully, no scan), the waiter is superseded by a later
     /// ``startScanning(services:)`` (completes successfully without scanning), or the radio
     /// resolves to a terminal state (throws the matching typed error).
-    func startScanning(services: sending [CBUUID]? = nil) async throws {
+    func startScanning(services: sending [CBUUID]? = nil, waiterID: UUID) async throws {
         guard !isShutdown else {
             log?.warn(tags: [.category(.scanning)], "Attempted to start scan after shutdown")
             throw PeripheralError.bluetoothUnavailable
@@ -872,7 +872,7 @@ actor BluetoothActor {
         case .unauthorized:
             throw PeripheralError.bluetoothUnavailable
         case .resetting, .unknown:
-            try await parkScanWaiter(services: services)
+            try await parkScanWaiter(services: services, waiterID: waiterID)
         @unknown default:
             throw PeripheralError.bluetoothUnavailable
         }
@@ -888,7 +888,7 @@ actor BluetoothActor {
     ///
     /// The waiter is re-driven after resume, re-reading ``centralManager`` and its state, because a
     /// resumed continuation runs on a later actor turn and the radio may have flipped again.
-    private func parkScanWaiter(services: sending [CBUUID]?) async throws {
+    private func parkScanWaiter(services: sending [CBUUID]?, waiterID: UUID) async throws {
         // A later startScanning supersedes a parked one: resolve the previous waiter successfully.
         // The previous waiter carries its OWN identity/service-filter (D-2), so when it resumes it
         // can tell it was superseded and must not re-park or scan — the newer request owns the scan.
@@ -906,7 +906,7 @@ actor BluetoothActor {
                 continuation.resume(throwing: CancellationError())
                 return
             }
-            scanWaiter = ScanWaiter(id: UUID(), services: services, continuation: continuation)
+            scanWaiter = ScanWaiter(id: waiterID, services: services, continuation: continuation)
         }
 
         // Resumed. Decide from OUR OWN resume reason and identity — never a global slot field.
@@ -926,11 +926,14 @@ actor BluetoothActor {
     }
 
     /// Cancels a parked ``startScanning(services:)`` waiter, invoked from a
-    /// `withTaskCancellationHandler` onCancel. No-op when no waiter is parked.
-    func cancelScanWaiter() {
-        guard let waiter = scanWaiter else { return }
+    /// `withTaskCancellationHandler` onCancel. Only cancels the waiter if its `id` matches the
+    /// caller-supplied `waiterID`, preventing a cancelled task from stealing a newer request's
+    /// parked waiter.
+    func cancelScanWaiter(_ waiterID: UUID) {
+        guard scanWaiter?.id == waiterID else { return }
+        let waiter = scanWaiter
         scanWaiter = nil
-        waiter.continuation.resume(throwing: CancellationError())
+        waiter?.continuation.resume(throwing: CancellationError())
     }
 
     /// Issues `scanForPeripherals` for the given filter and broadcasts the resulting state.
