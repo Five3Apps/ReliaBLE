@@ -346,6 +346,15 @@ For cases that wait multiple idle multiples (e.g. “still connected after 3× i
 | **Expected** | If ladder arms: attempt ≥ 1 and countdown present; eventually Connected or Failed after max attempts. |
 | **Note** | Mock gap #40 makes OS give-up hard to unit-test; **this is an on-device observation**. Mark PARTIAL if only system reconnect is seen. |
 
+#### F3.4b Idle teardown *during* an OS reconnect attempt (on-device only)
+
+| | |
+|--|--|
+| **Devices** | C1 + P1; short idle interval (see §4.3) |
+| **Steps** | 1. Get to Connected with Auto Reconnect **ON**. 2. Drop the link so the OS starts a Tier-0 reconnect (take P1 out of range briefly) — caption shows system reconnecting. 3. While that reconnect is still in flight, remove all demand: **Disconnect** (clearing the manual hold) so nothing wants the link. 4. Bring P1 back in range and wait ≥ 60 s. |
+| **Expected** | The link is torn down and does **not** come back: idle teardown cancels the in-flight OS reconnect. Caption settles to a clean disconnected state, never `Disconnecting…` indefinitely. |
+| **Note** | CoreBluetoothMock always resolves a Tier-0 attempt (relink or `didFailToConnect`), so the in-flight window cannot be held open in unit tests; the cancel is pinned white-box by `idleTeardownDuringCachedSystemReconnectCancels`. **This is the on-device confirmation.** |
+
 #### F3.5 Quiet after clean disconnect (regression of arming)
 
 | | |

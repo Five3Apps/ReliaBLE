@@ -3023,79 +3023,16 @@ struct ReliaBLEManagerTests {
                 "Manual disconnect of a non-connected cached Tier-0 limbo must not mark the disconnect intentional")
     }
 
-    // Defect 1: idle teardown while a Tier-0 / system reconnect is in progress (.reconnecting(.system))
-    // must settle AND cancel, so the OS cannot relink a link nobody wants (FR-1.2 / D-tier).
-    @Test func idleTeardownDuringSystemReconnectCancels() async throws {
-        Mock.connectionTestDelegate.connectionResult = .success(())
-        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
-
-        let manager = await Mock.makeManager()
-        await Mock.ensureReady(manager)
-        await manager.bluetooth.setIdleDisconnectInterval(0.01)
-
-        let changes = manager.connectionStateChanges
-
-        try await manager.startScanning()
-        let snap = await Mock.waitForDiscovered(
-            id: Mock.connectionTestPeripheralID,
-            on: manager,
-            withinNanoseconds: 3_000_000_000
-        )
-        let handle = try #require(snap).peripheral
-        await manager.stopScanning()
-
-        // A work lease links the peripheral with the Tier-0 (auto-reconnect) option active.
-        let token = try await handle.acquireWorkLease()
-        #expect(await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[handle.id] == .connected
-        })
-
-        // OS-delivered Tier-0 reconnect: a REAL drop of the (auto-reconnect) connected peripheral, so
-        // the live `CBPeripheral` is no longer connected and the cached state moves to
-        // `.reconnecting(.system)`. Unlike `testInjectDisconnect` (which bypasses the mock and leaves
-        // it connected), this drives the actual limbo the idle-torn guard protects: a physically
-        // dropped link the OS is still trying to relink a now-unwanted link. Force the mock's relink
-        // attempt to fail so the peripheral is deterministically STUCK in the non-connected limbo for the
-        // assertions below, instead of racing the mock's auto-reconnect (which on a slower CI box re-links
-        // it back to `.connected` before we can observe the limbo). A failed connection request leaves the
-        // mock peripheral `.disconnected` (see `CBMPeripheralMock.connect`), never back to `.connected`.
-        Mock.connectionTestDelegate.connectionResult = .failure(CBMError(.connectionTimeout))
-        await Mock.simulateDisconnection()
-        #expect(await pollUntil(timeout: 3.0) {
-            if case .reconnecting(.system, _, _) = await manager.currentConnectionStates[handle.id] {
-                return true
-            }
-            return false
-        })
-        // Confirm we are genuinely in the non-connected limbo, not still `.connected` in the mock.
-        #expect(await manager.bluetooth.testContainsCBPeripheral(handle.id))
-        #expect((await manager.bluetooth.testCBPeripheralState(for: handle.id)) != .connected,
-                "Scenario must drive the non-connected Tier-0 limbo")
-
-        // Demand drops mid-system-reconnect: idle teardown must settle AND issue exactly one cancel to
-        // stop the OS's pending reconnect work. The mock cannot complete the OS-reconnect on its own, so
-        // we pin the cancel CALL itself rather than a downstream side effect the mock cannot produce — a
-        // "no later .connected" assertion would pass trivially whether or not the cancel fires.
-        await handle.releaseWorkLease(token)
-        #expect(await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil)
-        })
-        #expect(await manager.currentConnectionStates[handle.id] != .disconnecting)
-        #expect(await manager.bluetooth.testCancelPeripheralConnectionCount(for: handle.id) == 1,
-                "Idle teardown must issue exactly one cancel for the Tier-0 reconnect")
-        #expect(await manager.bluetooth.testContainsIntentionalDisconnect(handle.id) == false,
-                "Idle teardown of a non-connected Tier-0 limbo must not mark the disconnect intentional")
-
-        // No later .connected may arrive from the suppressed Tier-0 reconnect. First flush the events
-        // already observed (the buffer includes the initial .connecting/.connected from lease acquisition
-        // and the .reconnecting(.system) above), THEN drain a fresh window and assert nothing links again.
-        _ = await drainConnectionStateChanges(from: changes, withinNanoseconds: 400_000_000)
-        let later = await drainConnectionStateChanges(from: changes, withinNanoseconds: 2_000_000_000)
-        let anyConnected = later.contains { $0.state == .connected }
-        #expect(!anyConnected)
-        #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
-    }
-
+    // Idle teardown while a Tier-0 / system reconnect is in flight must settle AND cancel, so the OS
+    // cannot relink a link nobody wants (FR-1.2 / D-tier). This is the CACHED arm of that predicate.
+    //
+    // Seeded white-box rather than driven through a real mock disconnection on purpose: CoreBluetoothMock
+    // always resolves a Tier-0 attempt one way or the other (relinking on success, or reporting
+    // `didFailToConnect` on failure), so the window in which the cached state is `.reconnecting(.system)`
+    // is timing-dependent and cannot be held open. An end-to-end version of this test raced the mock and
+    // failed intermittently on slower CI machines in both directions. The real-radio behaviour is covered
+    // as an on-device observation (see `docs/test-plans/`, Suite F3), and the live `.connecting` arm of the
+    // same predicate is pinned by `idleTeardownDuringLiveConnectingCancels`.
     @Test func idleTeardownDuringCachedSystemReconnectCancels() async throws {
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
