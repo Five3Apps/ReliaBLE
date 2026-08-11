@@ -2345,12 +2345,20 @@ actor BluetoothActor {
     /// deterministically instead of racing the delegate-driven invalidation that cancels a sleeping
     /// ladder. White-box test hook only — never called from production code.
     func testInvokeLadderStep(for id: String) {
+        _ = testInvokeLadderStepReturningState(for: id)
+    }
+
+    /// Same as ``testInvokeLadderStep(for:)``, but returns the connection state at the end of the
+    /// actor turn so tests can assert the gate outcome without racing a later mock power-on sweep
+    /// that may rewrite no-demand terminals via ``beginIdleGrace``.
+    func testInvokeLadderStepReturningState(for id: String) -> ConnectionState? {
         let attempt = 1
         let generation = (reconnectGeneration[id] ?? 0) + 1
         reconnectGeneration[id] = generation
         reconnectAttempts[id] = attempt
         setConnectionState(.reconnecting(source: .library, attempt: attempt, nextRetryAt: Date()), for: id)
         performReconnect(id: id, attempt: attempt, generation: generation)
+        return connectionStates[id]
     }
 
     /// Test-only hook: number of registered `connectionStateChanges` subscribers.

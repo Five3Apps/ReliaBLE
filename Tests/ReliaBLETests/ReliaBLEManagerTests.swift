@@ -2251,7 +2251,8 @@ struct ReliaBLEManagerTests {
         let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        try await handle.connect()
+        // autoReconnect false: no Tier-0 option / ladder bookkeeping on a quiet disconnect path.
+        try await handle.connect(autoReconnect: false)
         #expect(await pollUntil(timeout: 3.0) { handle.connectionState == .connected })
 
         try await handle.disconnect()
@@ -2260,20 +2261,40 @@ struct ReliaBLEManagerTests {
             return false
         })
 
-        // Subscribe only after the clean disconnect so drain sees invalidate-era events alone.
+        // Subscribe only after the clean disconnect so the collector sees invalidate-era events alone.
         let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
         let changes = manager.connectionStateChanges
         #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
 
         let id = handle.id
+        let collector = Task { () -> [ConnectionState] in
+            var states: [ConnectionState] = []
+            for await change in changes where change.peripheralId == id {
+                states.append(change.state)
+            }
+            return states
+        }
+
         await manager.bluetooth.testInvalidatePeripherals()
 
-        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 1_500_000_000)
-        let forId = events.filter { $0.peripheralId == id }
-        #expect(!forId.contains { $0.state == .disconnected(reason: .bluetoothUnavailable) })
-        #expect(!forId.contains { if case .reconnecting = $0.state { return true }; return false })
+        // A rewrite to `.bluetoothUnavailable` is synchronous on the actor; a short window is enough
+        // to observe a regression without holding an open stream for a multi-second drain (which
+        // stressed CoreBluetoothMock advertisement timers and correlated with CI SIGSEGV).
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        collector.cancel()
+        let states: [ConnectionState]
+        switch await collector.result {
+        case .success(let collected): states = collected
+        case .failure: states = []
+        }
+
+        #expect(!states.contains(.disconnected(reason: .bluetoothUnavailable)))
+        #expect(!states.contains { if case .reconnecting = $0 { return true }; return false })
         // No demand after intentional disconnect → untracked (handle nil); stream stays quiet.
         #expect(handle.connectionState == nil)
+
+        // Force the mock peripheral fully idle so the next test's power-cycle starts clean.
+        await Mock.simulateDisconnection()
     }
 
     @Test func willRestoreDefersScanUntilPoweredOn() async throws {
@@ -3669,7 +3690,11 @@ struct ReliaBLEManagerTests {
         #expect(await manager.currentConnectionStates[handle.id] != .connecting)
 
         // Restore the baseline so the next test starts from a known-good radio.
-        Mock.simulateInitialState(.poweredOn)
+        // Prefer power cycle over sticky `simulateInitialState(.poweredOn)` so the live central
+        // and process-wide mock agree on `.poweredOn`.
+        Mock.simulatePowerOff()
+        Mock.simulatePowerOn()
+        await manager.bluetooth.updateState()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -3710,7 +3735,11 @@ struct ReliaBLEManagerTests {
         #expect(isLibrary, "Ladder step on a transient radio must defer, leaving .reconnecting(.library)")
         #expect(await manager.currentConnectionStates[handle.id] != .connecting)
 
-        await Mock.simulateInitialState(.poweredOn)
+        // `simulateInitialState` is sticky process-wide — restore with power cycle so later tests
+        // that assume a live `.poweredOn` central (ladder gates) are not left on `.unknown`.
+        await Mock.simulatePowerOff()
+        await Mock.simulatePowerOn()
+        await manager.bluetooth.updateState()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -3744,7 +3773,9 @@ struct ReliaBLEManagerTests {
 
         await manager.bluetooth.releaseWorkLease(token)
 
-        await Mock.simulateInitialState(.poweredOn)
+        await Mock.simulatePowerOff()
+        await Mock.simulatePowerOn()
+        await manager.bluetooth.updateState()
         _ = await Mock.waitForState("Ready", on: manager)
     }
 
@@ -3757,14 +3788,25 @@ struct ReliaBLEManagerTests {
         let manager = await Mock.makeManager()
         await Mock.ensureReady(manager)
 
+        // Prior tests can leave the process-wide mock radio sticky (e.g. `.unknown` via
+        // `simulateInitialState`). The ladder intentionally no-ops on transient radio, so require a
+        // live powered-on central before the step — `ensureReady` alone is not always enough after
+        // sticky initial-state pollution.
+        await Mock.simulatePowerOff()
+        await Mock.simulatePowerOn()
+        await manager.bluetooth.updateState()
+        #expect(await manager.bluetooth.isCentralPoweredOn)
+        #expect(await Mock.waitForState("Ready", on: manager))
+
         // A ghost id never discovered has no live `CBPeripheral` while the radio is powered on.
         let ghostId = Mock.connectionTestPeripheralID + ".ghost"
-        await manager.bluetooth.testInvokeLadderStep(for: ghostId)
+        let after = await manager.bluetooth.testInvokeLadderStepReturningState(for: ghostId)
 
-        #expect(await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[ghostId] == .failed(reason: .notFound)
-        }, "Ladder step with no live peripheral must fail via .notFound")
-        #expect(await manager.currentConnectionStates[ghostId] != .connecting)
+        // Read the state the actor observed at the end of the ladder step (same turn), not a later
+        // `currentConnectionStates` sample — a subsequent mock `poweredOn` can re-enter
+        // `sweepRadioReturnedDemand` → `beginIdleGrace` and rewrite `.failed` to `.disconnected(nil)`.
+        #expect(after == .failed(reason: .notFound), "Ladder step with no live peripheral must fail via .notFound")
+        #expect(after != .connecting)
     }
 
     // Radio regression surfaced through `connect()`: with the radio `.unsupported`, the connect waits for
