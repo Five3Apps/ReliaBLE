@@ -178,7 +178,19 @@ Demo enables logging by default (`OSLogWriter`, subsystem `com.five3apps.relia-b
 3. Settings → **Enable Logging** if you turned it off.
 4. Wireless logging to a device **inside** the sealed box is unreliable — do not require it for PASS/FAIL.
 
-Useful log themes (info): Manual connect, Manual disconnect, idle timer armed / idle disconnect (latter mainly if demand hits zero — rare via pure Manual path).
+Useful log themes (category `connection`):
+
+| Theme | Level | When you should see it |
+|-------|-------|------------------------|
+| Manual connect / Manual disconnect | info | Explicit Demo Connect / Disconnect |
+| Live connection dropped (bluetoothUnavailable) — radio invalidated | **warn** | BT off (or other radio death) while **Connected** (F4.1) |
+| In-progress connection dropped (bluetoothUnavailable) | **warn** | BT off while Connecting / Reconnecting / Disconnecting |
+| Awaiting radio return for reconnect | info | Demand still wants reconnect after radio death |
+| Radio returned — reissuing connect | info | BT back on; library re-issues connect for demanded id |
+| System auto-reconnect in progress | info | Tier-0 OS reconnect (iOS 17+) after unexpected drop |
+| Library reconnect ladder armed / scheduled / firing | info | Tier-1 ladder after hard unexpected disconnect (F3.3, Faraday) |
+| Library reconnect ladder exhausted | info | maxAttempts reached |
+| Idle timer armed / Idle disconnect | info | Demand hits zero (rare via pure Manual path) |
 
 ### 3.6 Pass / fail conventions
 

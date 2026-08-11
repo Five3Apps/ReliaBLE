@@ -1369,7 +1369,17 @@ actor BluetoothActor {
             switch connectionStates[id] {
             case .disconnected, .failed:
                 continue
-            default:
+            case .connected:
+                log?.warn(
+                    tags: [.peripheral(id), .category(.connection)],
+                    "Live connection dropped (bluetoothUnavailable) — radio invalidated"
+                )
+                setConnectionState(.disconnected(reason: .bluetoothUnavailable), for: id)
+            case .connecting, .disconnecting, .reconnecting, .none:
+                log?.warn(
+                    tags: [.peripheral(id), .category(.connection)],
+                    "In-progress connection dropped (bluetoothUnavailable) — radio invalidated"
+                )
                 setConnectionState(.disconnected(reason: .bluetoothUnavailable), for: id)
             }
         }
@@ -1405,6 +1415,10 @@ actor BluetoothActor {
         // terminal → reconnecting with no intermediate `bluetoothUnavailable`.
         for id in reconnectingIds {
             syncReconnectIntent(id: id)
+            log?.info(
+                tags: [.peripheral(id), .category(.connection)],
+                "Awaiting radio return for reconnect"
+            )
             setConnectionState(.reconnecting(source: .library, attempt: nil, nextRetryAt: nil), for: id)
         }
 
@@ -1413,6 +1427,10 @@ actor BluetoothActor {
         // settling at `.disconnected` is the honest state. If step 1 ran, the handle still carries
         // that terminal caption via the registry; if step 1 skipped, the prior terminal remains.
         for id in suppressedIds {
+            log?.info(
+                tags: [.peripheral(id), .category(.connection)],
+                "Radio invalidated — reconnect suppressed (hold does not want reconnect)"
+            )
             syncReconnectIntent(id: id)
         }
 
@@ -1422,7 +1440,10 @@ actor BluetoothActor {
         // **preserved** rather than cleared, so a warm power-off does not drop it (FR-8.2).
 
         broadcast(discoveredPeripherals, to: peripheralsContinuations)
-        log?.debug("Invalidated all peripheral references")
+        log?.info(
+            tags: [.category(.connection)],
+            "Invalidated all peripheral references (\(trackedIds.count) tracked)"
+        )
     }
 
     // MARK: - Persisted Reconnect Intent
@@ -1618,6 +1639,12 @@ actor BluetoothActor {
         }
 
         if wantsReconnect(id: id) || reason == .explicitConnect {
+            if reason == .radioReturned {
+                log?.info(
+                    tags: [.peripheral(id), .category(.connection)],
+                    "Radio returned — reissuing connect"
+                )
+            }
             try issueConnect(id: id, enableAutoReconnect: wantsReconnect(id: id))
         }
     }
@@ -1957,20 +1984,35 @@ actor BluetoothActor {
         // Gated on whether demand currently wants a link back (D-4 / #59). A quiet peripheral never
         // runs the ladder, even if it connected with `autoReconnect: true` earlier and demand later
         // dropped.
-        guard wantsReconnect(id: id) else { return }
+        guard wantsReconnect(id: id) else {
+            log?.info(
+                tags: [.peripheral(id), .category(.connection)],
+                "Library reconnect ladder not armed (no demand wants reconnect)"
+            )
+            return
+        }
 
         let attempts = reconnectAttempts[id] ?? 0
-        guard reconnectPolicy.maxAttempts > 0, attempts < reconnectPolicy.maxAttempts else {
+        let maxAttempts = reconnectPolicy.maxAttempts
+        guard maxAttempts > 0, attempts < maxAttempts else {
             // Give-up clears in-flight ladder bookkeeping only. Demand is deliberately retained so a
             // later re-evaluation can start a fresh ladder.
             clearReconnectState(for: id)
-            log?.info(tags: [.peripheral(id), .category(.connection)], "Reconnect attempts exhausted")
+            log?.info(
+                tags: [.peripheral(id), .category(.connection)],
+                "Library reconnect ladder exhausted (maxAttempts=\(maxAttempts))"
+            )
 
             return
         }
 
-        reconnectAttempts[id] = attempts + 1
-        scheduleReconnect(id: id, attempt: attempts + 1)
+        let nextAttempt = attempts + 1
+        reconnectAttempts[id] = nextAttempt
+        log?.info(
+            tags: [.peripheral(id), .category(.connection)],
+            "Library reconnect ladder armed (attempt \(nextAttempt)/\(maxAttempts))"
+        )
+        scheduleReconnect(id: id, attempt: nextAttempt)
     }
 
     private func scheduleReconnect(id: String, attempt: Int) {
@@ -2000,6 +2042,11 @@ actor BluetoothActor {
         let sleepNanos: UInt64 = nanosDouble >= Double(UInt64.max) ? .max : UInt64(nanosDouble)
 
         let nextRetryAt = Date().addingTimeInterval(delaySeconds)
+        let delayDisplay = String(format: "%.1f", delaySeconds)
+        log?.info(
+            tags: [.peripheral(id), .category(.connection)],
+            "Library reconnect scheduled attempt \(attempt) in \(delayDisplay)s"
+        )
         setConnectionState(.reconnecting(source: .library, attempt: attempt, nextRetryAt: nextRetryAt), for: id)
 
         let task = Task { [weak self] in
@@ -2054,6 +2101,10 @@ actor BluetoothActor {
             failLadderRadio(.bluetoothUnavailable, id: id)
             return
         case .resetting, .unknown:
+            log?.info(
+                tags: [.peripheral(id), .category(.connection)],
+                "Library reconnect fire deferred (radio transient) — attempt \(attempt)"
+            )
             return // Radio transient — the radio-return sweep will re-drive the ladder later (D-radio).
         @unknown default:
             failLadderRadio(.bluetoothUnavailable, id: id)
@@ -2069,17 +2120,25 @@ actor BluetoothActor {
         // let it run rather than issuing a redundant connect.
         switch connectionStates[id] {
         case .connecting, .reconnecting(source: .system, attempt: _, nextRetryAt: _):
+            log?.info(
+                tags: [.peripheral(id), .category(.connection)],
+                "Library reconnect fire skipped (connect already in flight) — attempt \(attempt)"
+            )
             return
         default:
             break
         }
 
+        log?.info(
+            tags: [.peripheral(id), .category(.connection)],
+            "Library reconnect firing attempt \(attempt)"
+        )
         do {
             try issueConnect(id: id, enableAutoReconnect: wantsReconnect(id: id))
         } catch {
             let reason = (error as? PeripheralError) ?? .unknown
             clearReconnectState(for: id)
-            log?.warn(tags: [.peripheral(id), .category(.connection)], "Reconnect attempt failed: \(reason)")
+            log?.warn(tags: [.peripheral(id), .category(.connection)], "Library reconnect attempt failed: \(reason)")
             setConnectionState(.failed(reason: reason), for: id)
         }
     }
@@ -2088,7 +2147,7 @@ actor BluetoothActor {
     /// by a dead radio / missing peripheral, mirroring ``reevaluateLink``'s error surfacing.
     private func failLadderRadio(_ error: PeripheralError, id: String) {
         clearReconnectState(for: id)
-        log?.warn(tags: [.peripheral(id), .category(.connection)], "Reconnect attempt gated: \(error)")
+        log?.warn(tags: [.peripheral(id), .category(.connection)], "Library reconnect attempt gated: \(error)")
         setConnectionState(.failed(reason: error), for: id)
     }
     
