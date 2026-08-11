@@ -189,7 +189,8 @@ Useful log themes (category `connection`):
 | In-progress connection dropped (bluetoothUnavailable) | **warn** | BT off while Connecting / Reconnecting / Disconnecting |
 | Awaiting radio return for reconnect | info | Demand still wants reconnect after radio death |
 | Radio returned — reissuing connect | info | BT back on; library re-issues connect for demanded id |
-| System auto-reconnect in progress | info | Tier-0 OS reconnect (iOS 17+) after unexpected drop |
+| Peripheral disconnected unexpectedly (system reconnecting) | **warn** | Tier-0 path: physical drop while OS auto-reconnect is active (`isReconnecting == true`); may append mapped CB error |
+| System auto-reconnect in progress | info | Follows the warn above when demand still wants the link (iOS 17+) |
 | Library reconnect ladder armed / scheduled / firing | info | Tier-1 ladder after hard unexpected disconnect (F3.3, Faraday) |
 | Library reconnect ladder exhausted | info | maxAttempts reached |
 | Idle timer armed / Idle disconnect | info | Demand hits zero (rare via pure Manual path) |

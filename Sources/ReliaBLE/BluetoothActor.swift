@@ -1972,6 +1972,20 @@ actor BluetoothActor {
             taskRegistry.cancel(id)
 
             if wantsReconnect(id: id) {
+                // Field observability: Tier-0 collapses the physical drop into `.reconnecting(source: .system)`
+                // without a `.disconnected` emission, so surface the drop at warn (including any CB error).
+                if let error = payload.error {
+                    let mapped = (error as? CBError).map(PeripheralError.fromCBError) ?? .unknown
+                    log?.warn(
+                        tags: [.peripheral(id), .category(.connection)],
+                        "Peripheral disconnected unexpectedly (system reconnecting): \(mapped)"
+                    )
+                } else {
+                    log?.warn(
+                        tags: [.peripheral(id), .category(.connection)],
+                        "Peripheral disconnected unexpectedly (system reconnecting)"
+                    )
+                }
                 log?.info(tags: [.peripheral(id), .category(.connection)], "System auto-reconnect in progress")
                 setConnectionState(.reconnecting(source: .system, attempt: nil, nextRetryAt: nil), for: id)
             } else {
