@@ -258,6 +258,9 @@ private struct DeviceDetailView: View {
     let reliaBLE: ReliaBLEManager
 
     @State private var autoReconnect = true
+    /// Surfaces thrown errors from `connect` / `disconnect` (e.g. `bluetoothPoweredOff`).
+    /// Stream-driven connection captions do not carry those fail-fast throws.
+    @State private var actionError: String?
 
     private var connectionState: ConnectionState? {
         viewModel.connectionStates[device.id]
@@ -284,12 +287,36 @@ private struct DeviceDetailView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let actionError {
+                Text(actionError)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+                    .multilineTextAlignment(.center)
+            }
+
             Button(action: {
                 let handle = reliaBLE.peripheral(id: device.id)
+                actionError = nil
                 if isActive {
-                    Task { try? await handle.disconnect() }
+                    Task {
+                        do {
+                            try await handle.disconnect()
+                        } catch {
+                            await MainActor.run {
+                                actionError = "Disconnect Failed: \(error)"
+                            }
+                        }
+                    }
                 } else {
-                    Task { try? await handle.connect(autoReconnect: autoReconnect) }
+                    Task {
+                        do {
+                            try await handle.connect(autoReconnect: autoReconnect)
+                        } catch {
+                            await MainActor.run {
+                                actionError = "Connect Failed: \(error)"
+                            }
+                        }
+                    }
                 }
             }) {
                 Text(isActive ? "Disconnect" : "Connect")
@@ -307,6 +334,13 @@ private struct DeviceDetailView: View {
             }
         }
         .padding()
+        .onChange(of: connectionState?.isActiveConnection) { _, isActiveConnection in
+            // A later stream transition to an in-progress/linked state means the radio recovered
+            // (or a new attempt started) — drop a stale fail-fast caption from an earlier tap.
+            if isActiveConnection == true {
+                actionError = nil
+            }
+        }
     }
 }
 

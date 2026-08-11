@@ -70,12 +70,14 @@ From Demo `ConnectionState.description`:
 | `.reconnecting(.library, attempt, …)` | `Reconnecting (attempt N)` — **N may be 0** when waiting for radio (`attempt == nil` displays as 0) | yellow |
 | Ladder step | Same + optional `Next retry in: Xs` countdown | yellow |
 
-**Radio-await projection (important):** after Bluetooth power-off with Auto Reconnect demand, expect roughly:
+**Radio-await projection (important):** after Bluetooth power-off **while linked or connecting** with Auto Reconnect demand, expect roughly:
 
 1. `Disconnected (bluetoothUnavailable)` (or similar reason text)
 2. then `Reconnecting (attempt 0)` **without** a retry countdown (library waiting for radio, not ladder)
 
-When Auto Reconnect was **off**, expect settle at disconnected **without** a lasting “reconnecting” claim.
+When Auto Reconnect was **off** and the device was still linked, expect settle at `Disconnected (bluetoothUnavailable)` **without** a lasting “reconnecting” claim.
+
+When the peripheral was **already** cleanly `Disconnected` / `Failed` before power-off (e.g. intentional Disconnect, then BT off), the library does **not** rewrite the caption to `bluetoothUnavailable` — stay on the prior terminal text (Demo stream cache) or clear to untracked.
 
 ---
 
@@ -263,7 +265,7 @@ For cases that wait multiple idle multiples (e.g. “still connected after 3× i
 |--|--|
 | **Devices** | C1 + P1 (P1 must have been discovered **before** BT off, so a device row/handle exists) |
 | **Steps** | 1. With BT on, scan and ensure P1 is in Devices. 2. Stop scan optional. 3. Turn BT **Off**. 4. Open P1 detail → Auto Reconnect **ON** → **Connect**. |
-| **Expected** | Connection does **not** succeed. Prefer: visible failed/disconnected path and/or no stuck “Connecting” forever. *(Demo uses `try?` on connect, so a thrown `bluetoothPoweredOff` may not show an alert — watch for not stuck connecting and for later relink behavior in F1.4.)* |
+| **Expected** | Connection does **not** succeed. Prefer: visible failed/disconnected path and/or no stuck “Connecting” forever. Demo device detail should show a red error caption for the thrown `bluetoothPoweredOff` (or similar). Watch for not stuck connecting and for later relink behavior in F1.4. |
 | **Important** | Hold is registered **before** the radio wait. Intent survives the throw when Auto Reconnect is on. |
 
 #### F1.4 Auto Reconnect ON: relink when radio returns

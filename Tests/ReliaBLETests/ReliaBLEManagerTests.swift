@@ -2178,10 +2178,10 @@ struct ReliaBLEManagerTests {
     }
 
     @Test func invalidatePeripheralsEmitsTerminalConnectionStateChange() async throws {
-        // Clearing tracked connection state is the one transition a subscriber cannot infer on its own: a cleared
-        // peripheral produces no further events, so without an explicit emit a UI driven only by
-        // `connectionStateChanges` renders `.connected` forever after a radio reset. The handle reverting to `nil`
-        // is not enough — nothing tells the app to go re-read it.
+        // Non-terminal path: clearing a live/in-progress link is the transition a stream-only UI
+        // cannot infer. Without `.disconnected(.bluetoothUnavailable)`, it would stick on
+        // `.connected` after a radio reset. Already-terminal ids are covered by
+        // `invalidateSkipsBluetoothUnavailableWhenAlreadyTerminal`.
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
 
@@ -2230,6 +2230,50 @@ struct ReliaBLEManagerTests {
         // id still wants reconnect (a hold is held), so it is not `.connected` and not `nil`.
         #expect(handle.connectionState != .connected)
         #expect(handle.connectionState == .reconnecting(source: .library, attempt: nil, nextRetryAt: nil))
+    }
+
+    @Test func invalidateSkipsBluetoothUnavailableWhenAlreadyTerminal() async throws {
+        // Invalidate must not rewrite a settled `.disconnected` / `.failed` into
+        // `.bluetoothUnavailable`. Intentional disconnect then radio death is the HW case that
+        // was re-tagging a clean "Disconnected" caption as an orange radio fault with no live link.
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        try await handle.connect()
+        #expect(await pollUntil(timeout: 3.0) { handle.connectionState == .connected })
+
+        try await handle.disconnect()
+        #expect(await pollUntil(timeout: 3.0) {
+            if case .disconnected(reason: nil) = handle.connectionState { return true }
+            return false
+        })
+
+        // Subscribe only after the clean disconnect so drain sees invalidate-era events alone.
+        let subscriberBaseline = await manager.bluetooth.testConnectionStateSubscriberCount()
+        let changes = manager.connectionStateChanges
+        #expect(await Mock.waitForConnectionSubscription(on: manager, above: subscriberBaseline))
+
+        let id = handle.id
+        await manager.bluetooth.testInvalidatePeripherals()
+
+        let events = await drainConnectionStateChanges(from: changes, withinNanoseconds: 1_500_000_000)
+        let forId = events.filter { $0.peripheralId == id }
+        #expect(!forId.contains { $0.state == .disconnected(reason: .bluetoothUnavailable) })
+        #expect(!forId.contains { if case .reconnecting = $0.state { return true }; return false })
+        // No demand after intentional disconnect → untracked (handle nil); stream stays quiet.
+        #expect(handle.connectionState == nil)
     }
 
     @Test func willRestoreDefersScanUntilPoweredOn() async throws {
@@ -3614,7 +3658,7 @@ struct ReliaBLEManagerTests {
         let handle = try #require(snap).peripheral
         await manager.stopScanning()
 
-        await Mock.simulateInitialState(mockState)
+        Mock.simulateInitialState(mockState)
         _ = await Mock.waitForState(stateDescription, on: manager)
 
         await manager.bluetooth.testInvokeLadderStep(for: handle.id)
@@ -3625,7 +3669,7 @@ struct ReliaBLEManagerTests {
         #expect(await manager.currentConnectionStates[handle.id] != .connecting)
 
         // Restore the baseline so the next test starts from a known-good radio.
-        await Mock.simulateInitialState(.poweredOn)
+        Mock.simulateInitialState(.poweredOn)
         _ = await Mock.waitForState("Ready", on: manager)
     }
 

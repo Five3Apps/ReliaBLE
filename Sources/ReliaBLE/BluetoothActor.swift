@@ -1360,9 +1360,18 @@ actor BluetoothActor {
         // "this is over":
         let trackedIds = Array(connectionStates.keys)
 
-        // (1) Every tracked id emits a terminal `.disconnected` — the link really is dead.
+        // (1) Non-terminal tracked states emit `.disconnected(.bluetoothUnavailable)` so a
+        // stream-only UI never sticks on `.connected` / in-progress after radio death.
+        // Already-terminal `.disconnected` / `.failed` skip that rewrite — re-tagging a settled
+        // clean disconnect (or prior failure) as a radio fault confuses observers when Bluetooth
+        // toggles with no live link. Demand projection below still runs for every tracked id.
         for id in trackedIds {
-            setConnectionState(.disconnected(reason: .bluetoothUnavailable), for: id)
+            switch connectionStates[id] {
+            case .disconnected, .failed:
+                continue
+            default:
+                setConnectionState(.disconnected(reason: .bluetoothUnavailable), for: id)
+            }
         }
 
         // (2) Drop live references and cancel every in-flight timer/ladder. `activeLeases` and
@@ -1382,6 +1391,8 @@ actor BluetoothActor {
         let untrackedIds = trackedIds.filter { !demand(id: $0) }
 
         // (5) No-demand ids are simply untracked: the handle reverts to nil after the clear.
+        // When step 1 skipped (already terminal), this clear is silent on the stream — correct,
+        // because observers already hold a terminal caption.
         for id in untrackedIds {
             registry.applyConnectionState(id: id, state: nil)
         }
@@ -1390,7 +1401,8 @@ actor BluetoothActor {
         // (3) For each id that wants a link back, publish the AwaitingRadio projection
         // `.reconnecting(source: .library, attempt: nil, nextRetryAt: nil)`. This holds until
         // ``issueConnect`` moves it to `.connecting`, the ladder supplies real attempt values, the
-        // link succeeds, or demand is cleared.
+        // link succeeds, or demand is cleared. When step 1 skipped, the stream moves
+        // terminal → reconnecting with no intermediate `bluetoothUnavailable`.
         for id in reconnectingIds {
             syncReconnectIntent(id: id)
             setConnectionState(.reconnecting(source: .library, attempt: nil, nextRetryAt: nil), for: id)
@@ -1398,7 +1410,8 @@ actor BluetoothActor {
 
         // (4) Demand with no `wantsReconnect` (a `connect(autoReconnect: false)` hold) gets **no**
         // `.reconnecting` signal — nothing will re-issue for it (event 12's issue gate refuses), so
-        // settling at `.disconnected` is the honest state.
+        // settling at `.disconnected` is the honest state. If step 1 ran, the handle still carries
+        // that terminal caption via the registry; if step 1 skipped, the prior terminal remains.
         for id in suppressedIds {
             syncReconnectIntent(id: id)
         }

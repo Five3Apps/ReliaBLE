@@ -177,15 +177,27 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
         // still leaves durable demand behind — the throw is informational, not destructive (D-hold).
         await manager.bluetooth.applyManualConnectHold(id: id, reconnectDesired: autoReconnect)
 
-        // Await a usable radio (cancellable), then ensure the link.
-        let waiterID = UUID()
-        try await withTaskCancellationHandler {
-            try await manager.bluetooth.waitUntilPoweredOn(waiterID: waiterID)
-        } onCancel: {
-            Task { await manager.bluetooth.cancelPoweredOnContinuation(waiterID) }
-        }
+        // Await a usable radio (cancellable), then ensure the link. Failures after the hold is
+        // recorded (terminal radio, missing peripheral, etc.) are warned so Console shows why
+        // the call threw; `CancellationError` is not a failure and is rethrown quietly.
+        do {
+            let waiterID = UUID()
+            try await withTaskCancellationHandler {
+                try await manager.bluetooth.waitUntilPoweredOn(waiterID: waiterID)
+            } onCancel: {
+                Task { await manager.bluetooth.cancelPoweredOnContinuation(waiterID) }
+            }
 
-        try await manager.bluetooth.reevaluateLink(id: id, reason: .explicitConnect)
+            try await manager.bluetooth.reevaluateLink(id: id, reason: .explicitConnect)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            manager.loggingService.warn(
+                tags: [.peripheral(id), .category(.connection)],
+                "Manual connect failed: \(error)"
+            )
+            throw error
+        }
     }
 
     /// Initiates a disconnection from this peripheral.
