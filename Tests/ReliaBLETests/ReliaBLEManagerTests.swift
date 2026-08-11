@@ -2680,7 +2680,61 @@ struct ReliaBLEManagerTests {
     @Test func connectPoweredOffSetsHoldAndRelinksOnPowerOn() async throws {
         // D-hold, completed for step 6: a `connect()` issued while powered off registers the hold
         // BEFORE the radio wait, throws `bluetoothPoweredOff`, and leaves durable demand — which the
-        // radio-return sweep (D-1 event 12) turns into a relink once the radio returns.
+        // radio-return sweep (D-1 event 12) turns into a relink once the radio returns. The hold path
+        // also projects AwaitingRadio so stream-only UIs leave a terminal caption while demand is live.
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
+
+        let manager = await Mock.makeManager()
+        await Mock.ensureReady(manager)
+
+        let changes = manager.connectionStateChanges
+
+        try await manager.startScanning()
+        let snap = await Mock.waitForDiscovered(
+            id: Mock.connectionTestPeripheralID,
+            on: manager,
+            withinNanoseconds: 3_000_000_000
+        )
+        let handle = try #require(snap).peripheral
+        await manager.stopScanning()
+
+        await Mock.simulatePowerOff()
+        _ = await Mock.waitForState("Powered Off", on: manager)
+        #expect(await pollUntil(timeout: 1.0) {
+            await manager.bluetooth.testConnectionStateSubscriberCount() >= 1
+        })
+
+        await #expect(throws: PeripheralError.bluetoothPoweredOff) {
+            try await handle.connect()
+        }
+
+        // The hold is registered BEFORE the radio wait, so a thrown connect still leaves durable demand.
+        #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
+        #expect(await manager.currentConnectionStates[handle.id]
+            == .reconnecting(source: .library, attempt: nil, nextRetryAt: nil))
+        #expect(handle.connectionState
+            == .reconnecting(source: .library, attempt: nil, nextRetryAt: nil))
+
+        let projected = await firstConnectionStateChange(from: changes, withinNanoseconds: 2_000_000_000)
+        #expect(projected?.peripheralId == handle.id)
+        #expect(projected?.state == .reconnecting(source: .library, attempt: nil, nextRetryAt: nil))
+
+        await Mock.simulatePowerOn()
+        _ = await Mock.waitForState("Ready", on: manager)
+
+        // Step 6: the radio-return sweep (D-1 event 12) re-links the held id without a second
+        // connect() call. The sweep re-evaluates demanded ids from the hold (not just tracked-state
+        // ids), so this hold — created after the earlier invalidate — is linked once the radio
+        // returns.
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
+    }
+
+    @Test func connectPoweredOffAutoReconnectFalseDoesNotProjectAwaitingRadio() async throws {
+        // Hold is still registered (idle suppression / durable intent), but without reconnectDesired
+        // there is no radio-return re-issue — stay terminal so UIs do not claim "waiting to reconnect".
         Mock.connectionTestDelegate.connectionResult = .success(())
         defer { Mock.connectionTestDelegate.connectionResult = .success(()) }
 
@@ -2700,22 +2754,29 @@ struct ReliaBLEManagerTests {
         _ = await Mock.waitForState("Powered Off", on: manager)
 
         await #expect(throws: PeripheralError.bluetoothPoweredOff) {
-            try await handle.connect()
+            try await handle.connect(autoReconnect: false)
         }
 
-        // The hold is registered BEFORE the radio wait, so a thrown connect still leaves durable demand.
         #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
+        let state = await manager.currentConnectionStates[handle.id]
+        if case .reconnecting = state {
+            Issue.record("autoReconnect: false must not project AwaitingRadio, got \(String(describing: state))")
+        }
+        // Prefer a clean terminal or untracked — not reconnecting.
+        #expect(state == nil || state == .disconnected(reason: nil)
+            || {
+                if case .disconnected = state { return true }
+                if case .failed = state { return true }
+                return false
+            }())
 
         await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        #expect(await manager.currentConnectionStates[handle.id] != .connected)
+        #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
 
-        // Step 6: the radio-return sweep (D-1 event 12) re-links the held id without a second
-        // connect() call. The sweep re-evaluates demanded ids from the hold (not just tracked-state
-        // ids), so this hold — created after the earlier invalidate — is linked once the radio
-        // returns.
-        #expect(await pollUntil(timeout: 3.0) {
-            await manager.currentConnectionStates[handle.id] == .connected
-        })
+        try? await handle.disconnect()
     }
 
     @Test func manualDisconnectDuringRadioOutageSucceeds() async throws {
@@ -2735,20 +2796,50 @@ struct ReliaBLEManagerTests {
         await manager.stopScanning()
 
         try await handle.connect()
+        #expect(await pollUntil(timeout: 3.0) {
+            await manager.currentConnectionStates[handle.id] == .connected
+        })
         #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
 
-        // A radio reset invalidates live references (clears cbPeripherals) but preserves the hold.
+        // A radio reset invalidates live references (clears cbPeripherals) but preserves the hold,
+        // and projects AwaitingRadio `.reconnecting(.library, nil, nil)`.
         await Mock.simulateInitialState(.resetting)
         _ = await Mock.waitForState("Resetting", on: manager)
         #expect(!(await manager.bluetooth.testContainsCBPeripheral(handle.id)))
         #expect(await manager.bluetooth.testHasManualConnectHold(for: handle.id))
+        #expect(await pollUntil(timeout: 2.0) {
+            if case .reconnecting(.library, nil, nil) = await manager.currentConnectionStates[handle.id] {
+                return true
+            }
+            return false
+        })
+        #expect(handle.connectionState == .reconnecting(source: .library, attempt: nil, nextRetryAt: nil))
 
-        // Dropping the hold during a radio outage must succeed, not throw .notFound.
+        // Subscribe *before* disconnect so the settle is not lost to registration lag; pin the
+        // stream event that stream-only UIs (Demo) rely on while the radio is still off.
+        let settleStream = manager.connectionStateChanges
+        #expect(await pollUntil(timeout: 1.0) {
+            await manager.bluetooth.testConnectionStateSubscriberCount() >= 1
+        })
+
+        // Dropping the hold during a radio outage must succeed, not throw .notFound, and must
+        // immediately settle to clean `.disconnected` so stream-only UIs leave the reconnecting
+        // caption (and can start a new connect hold) while the radio is still off.
         try await handle.disconnect()
         #expect(!(await manager.bluetooth.testHasManualConnectHold(for: handle.id)))
+        #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
+        #expect(handle.connectionState == .disconnected(reason: nil))
+
+        let settle = await firstConnectionStateChange(from: settleStream, withinNanoseconds: 2_000_000_000)
+        #expect(settle?.peripheralId == handle.id)
+        #expect(settle?.state == .disconnected(reason: nil))
 
         await Mock.simulatePowerOn()
         _ = await Mock.waitForState("Ready", on: manager)
+        // Hold was cleared: radio return must not re-link.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        #expect(await manager.currentConnectionStates[handle.id] == .disconnected(reason: nil))
+        #expect(!(await manager.bluetooth.testHasManualConnectHold(for: handle.id)))
     }
 
     @Test func manualDisconnectClearsHoldAndTearsDown() async throws {

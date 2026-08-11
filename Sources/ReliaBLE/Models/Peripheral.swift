@@ -174,7 +174,9 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
         await manager.bluetooth.ensureCentralManager()
 
         // Register the manual-connect hold FIRST so a connect that throws (e.g. bluetoothPoweredOff)
-        // still leaves durable demand behind — the throw is informational, not destructive (D-hold).
+        // still leaves durable demand behind — the throw is informational, not destructive.
+        // When `autoReconnect` is true and the radio is not usable, the hold path also projects
+        // AwaitingRadio `.reconnecting(.library, nil, nil)` so stream observers see demand immediately.
         await manager.bluetooth.applyManualConnectHold(id: id, reconnectDesired: autoReconnect)
 
         // Await a usable radio (cancellable), then ensure the link. Failures after the hold is
@@ -204,7 +206,9 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
     ///
     /// Clears this handle's manual-connect hold and intentionally cancels the link per the settling
     /// rule. Returns success even when the library holds no live reference (e.g. during a radio
-    /// outage), because dropping a hold must never throw `.notFound`.
+    /// outage), because dropping a hold must never throw `.notFound`. In that case the connection
+    /// state still settles immediately to ``ConnectionState/disconnected(reason:)`` with a `nil`
+    /// reason so observers drop any radio-await reconnecting caption without waiting for power-on.
     public func disconnect() async throws {
         guard let manager = state.withLock({ $0.manager }) else { throw PeripheralError.bluetoothUnavailable }
 

@@ -37,7 +37,14 @@ extension ConnectionState {
         case .reconnecting(let source, let attempt, _):
             switch source {
             case .system: "System reconnecting…"
-            case .library: "Reconnecting (attempt \(attempt ?? 0))"
+            case .library:
+                // `attempt == nil` is the library AwaitingRadio projection (radio off / not yet
+                // usable), not ladder attempt 0.
+                if attempt == nil {
+                    "Waiting for Bluetooth…"
+                } else {
+                    "Reconnecting (attempt \(attempt, default: "0"))"
+                }
             }
         case .connected: "Connected"
         case .disconnecting: "Disconnecting"

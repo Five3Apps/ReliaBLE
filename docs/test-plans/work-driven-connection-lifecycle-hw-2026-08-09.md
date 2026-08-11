@@ -67,15 +67,17 @@ From Demo `ConnectionState.description`:
 | `.disconnected(reason)` | `Disconnected (…)` | orange |
 | `.failed(reason)` | `Failed (…)` | red |
 | `.reconnecting(.system, …)` | `System reconnecting…` | yellow |
-| `.reconnecting(.library, attempt, …)` | `Reconnecting (attempt N)` — **N may be 0** when waiting for radio (`attempt == nil` displays as 0) | yellow |
+| `.reconnecting(.library, attempt, …)` | **`Waiting for Bluetooth…`** when `attempt == nil` (radio await); `Reconnecting (attempt N)` when ladder armed (`attempt >= 1`) | yellow |
 | Ladder step | Same + optional `Next retry in: Xs` countdown | yellow |
 
 **Radio-await projection (important):** after Bluetooth power-off **while linked or connecting** with Auto Reconnect demand, expect roughly:
 
 1. `Disconnected (bluetoothUnavailable)` (or similar reason text)
-2. then `Reconnecting (attempt 0)` **without** a retry countdown (library waiting for radio, not ladder)
+2. then **`Waiting for Bluetooth…`** **without** a retry countdown (library waiting for radio, not ladder)
 
-When Auto Reconnect was **off** and the device was still linked, expect settle at `Disconnected (bluetoothUnavailable)` **without** a lasting “reconnecting” claim.
+The same **Waiting for Bluetooth…** caption is projected when **Connect** (Auto Reconnect ON) is tapped while the radio is already off (hold-before-wait), even though the connect call fails fast with `bluetoothPoweredOff`.
+
+When Auto Reconnect was **off** and the device was still linked, expect settle at `Disconnected (bluetoothUnavailable)` **without** a lasting “waiting for Bluetooth” claim.
 
 When the peripheral was **already** cleanly `Disconnected` / `Failed` before power-off (e.g. intentional Disconnect, then BT off), the library does **not** rewrite the caption to `bluetoothUnavailable` — stay on the prior terminal text (Demo stream cache) or clear to untracked.
 
@@ -277,8 +279,8 @@ For cases that wait multiple idle multiples (e.g. “still connected after 3× i
 |--|--|
 | **Devices** | C1 + P1 (P1 must have been discovered **before** BT off, so a device row/handle exists) |
 | **Steps** | 1. With BT on, scan and ensure P1 is in Devices. 2. Stop scan optional. 3. Turn BT **Off**. 4. Open P1 detail → Auto Reconnect **ON** → **Connect**. |
-| **Expected** | Connection does **not** succeed. Prefer: visible failed/disconnected path and/or no stuck “Connecting” forever. Demo device detail should show a red error caption for the thrown `bluetoothPoweredOff` (or similar). Watch for not stuck connecting and for later relink behavior in F1.4. |
-| **Important** | Hold is registered **before** the radio wait. Intent survives the throw when Auto Reconnect is on. |
+| **Expected** | Connection does **not** succeed (no stuck permanent “Connecting” forever). Caption moves to **Waiting for Bluetooth…** (AwaitingRadio `.reconnecting(.library, nil, nil)`); button becomes **Disconnect** so the hold can be cleared while BT is still off. A red `Connect Failed: bluetoothPoweredOff` caption may flash briefly then clear when the stream becomes active. Intent survives the throw when Auto Reconnect is on (F1.4 relink). |
+| **Important** | Hold is registered **before** the radio wait. Auto Reconnect **OFF** (F1.5): hold still set, but **no** Waiting-for-Bluetooth projection — stay Disconnected + red fail-fast caption may remain until the next tap. |
 
 #### F1.4 Auto Reconnect ON: relink when radio returns
 
@@ -449,7 +451,7 @@ For cases that wait multiple idle multiples (e.g. “still connected after 3× i
 |--|--|
 | **Devices** | C1 + P1 advertising throughout |
 | **Steps** | 1. Connect Auto Reconnect ON → Connected. 2. Control Center / Settings → Bluetooth **Off** on C1. 3. Observe caption sequence (~5–15 s). 4. Bluetooth **On**. 5. Wait up to 60 s. |
-| **Expected** | Off: leaves Connected; expect disconnected with unavailability reason, then preferably **Reconnecting (attempt 0)** (radio wait — no countdown). On: returns to **Connected** without user Connect. |
+| **Expected** | Off: leaves Connected; expect disconnected with unavailability reason, then preferably **Waiting for Bluetooth…** (radio wait — no countdown). On: returns to **Connected** without user Connect. |
 | **FAIL if** | After BT on, remains disconnected forever while P1 advertises and hold was Auto Reconnect ON. |
 | **FAIL if** | Stays showing Connected while BT is off (stale cache). |
 
@@ -467,9 +469,11 @@ For cases that wait multiple idle multiples (e.g. “still connected after 3× i
 | | |
 |--|--|
 | **Devices** | C1 + P1 |
-| **Steps** | 1. Connect Auto Reconnect ON. 2. BT Off (demand/reconnecting projection). 3. Tap **Disconnect** (button may still show as active while reconnecting). 4. BT On. Wait 30 s. |
-| **Expected** | Disconnect succeeds (no hard error UI required). After BT on, **no** auto-connect (hold cleared). |
-| **FAIL if** | Link comes back after outage disconnect (hold not cleared). |
+| **Steps** | 1. Connect Auto Reconnect ON. 2. BT Off (demand/reconnecting projection — caption often **Waiting for Bluetooth…**). 3. Tap **Disconnect**. 4. (Optional) While BT still off, confirm UI settled and **Connect** is available again. 5. BT On. Wait 30 s. |
+| **Expected** | Disconnect succeeds (no hard error UI required). **Immediately** (while BT still off): caption settles to clean **Disconnected** (no reason), button returns to **Connect** — hold cleared and radio-await reconnecting projection removed. A subsequent **Connect** while BT is still off is allowed (registers a new hold; Auto Reconnect ON → **Waiting for Bluetooth…** again). After BT on with no new Connect: **no** auto-connect. |
+| **FAIL if** | Link comes back after outage disconnect (hold not cleared). UI stays on **Waiting for Bluetooth…** / **Disconnect** until BT is turned back on. |
+
+**HW finding (2026-08-11):** Pre-fix, F4.3 link behavior was correct (no reconnect after BT on), but the UI stuck on radio-await reconnecting + **Disconnect** until radio returned — library cleared the hold without publishing `.disconnected` when there was no live `CBPeripheral`. Fixed in `applyManualDisconnect` (settle when `cbPeripherals[id] == nil`). Re-run this case after rebuild.
 
 **Suite F4 result:** ___
 
@@ -678,7 +682,7 @@ Run only if time remains; each is optional.
 | **Dual central to one peripheral** | Peripheral may reject second link. |
 | **Background ads truncated** | iOS may omit local name; rely on service UUID filter. |
 | **Demo `try?` on connect** | Thrown `bluetoothPoweredOff` may lack an alert; use F1.4 relink and scanError for scan path. |
-| **`Reconnecting (attempt 0)`** | Means radio-await (`attempt == nil`), not ladder step 0. |
+| **`Waiting for Bluetooth…`** | Means radio-await (`attempt == nil`), not ladder step 0. Ladder steps show `Reconnecting (attempt N)` with `N >= 1`. |
 | **Upgrade persistence shape** | One relaunch after upgrading from pre-hold-map builds may lose standing holds — re-connect once. |
 
 ---

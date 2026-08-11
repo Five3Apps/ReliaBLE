@@ -35,9 +35,10 @@ public enum ConnectionState: Sendable, Equatable, Hashable {
     /// A reconnection is in progress.
     ///
     /// For ``ReconnectSource/library``, a `nil` `attempt` / `nextRetryAt` means the link is
-    /// **waiting for the radio** (projected the moment a demanded link's radio drops, and held
-    /// until a connect is issued, the ladder supplies real values, the link succeeds, or demand
-    /// clears) — not yet on the backoff ladder. A ladder step that has actually armed carries
+    /// **waiting for the radio** — projected when a demanded link's radio drops, or when a
+    /// reconnect-wanting manual-connect hold is registered while the radio is not yet usable, and
+    /// held until a connect is issued, the ladder supplies real values, the link succeeds, or demand
+    /// clears — not yet on the backoff ladder. A ladder step that has actually armed carries
     /// **real** values: `attempt >= 1` and a concrete `nextRetryAt`. ``ReconnectSource/system``
     /// is iOS reconnecting at the daemon level; the library is not involved and always exposes
     /// `nil` for both.

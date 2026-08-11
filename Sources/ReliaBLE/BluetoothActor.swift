@@ -1652,6 +1652,14 @@ actor BluetoothActor {
     /// Registers a manual-connect hold (D-1 event 3). Hold registration **only** — does not wait for
     /// the radio and does not issue a connect; that is split out so a `connect` that throws
     /// `bluetoothPoweredOff` still leaves durable demand behind.
+    ///
+    /// When the hold wants reconnect and the radio is not yet usable (powered off / transient),
+    /// projects AwaitingRadio ``ConnectionState/reconnecting(source:attempt:nextRetryAt:)`` with
+    /// `source: .library` and `nil` attempt/retry — the same signal ``invalidatePeripherals()`` uses
+    /// when demand survives a radio drop — so stream-only UIs show demand immediately rather than a
+    /// terminal caption while the call fails fast. Does **not** project when `reconnectDesired` is
+    /// false (no radio-return re-issue) or when the radio is already `.poweredOn` (``reevaluateLink``
+    /// / ``issueConnect`` drive `.connecting`).
     func applyManualConnectHold(id: String, reconnectDesired: Bool) {
         manualConnectHold[id] = ManualConnectHold(reconnectDesired: reconnectDesired)
         intentionalDisconnects.remove(id)
@@ -1660,12 +1668,41 @@ actor BluetoothActor {
         idleTaskRegistry.cancel(id)
         log?.info(tags: [.peripheral(id), .category(.connection)], "Manual connect")
         syncReconnectIntent(id: id, persistHold: true)
+
+        guard reconnectDesired, shouldProjectAwaitingRadio else { return }
+        switch connectionStates[id] {
+        case .connected, .connecting, .disconnecting, .reconnecting:
+            // Already linked or in progress — leave the live state alone.
+            break
+        case .disconnected, .failed, .none:
+            log?.info(
+                tags: [.peripheral(id), .category(.connection)],
+                "Awaiting radio return for reconnect"
+            )
+            setConnectionState(.reconnecting(source: .library, attempt: nil, nextRetryAt: nil), for: id)
+        }
+    }
+
+    /// Whether the radio is in a state where a connect cannot be issued yet but may become usable
+    /// (powered off, resetting, unknown, or no central yet) — not terminal unsupported / unauthorized.
+    private var shouldProjectAwaitingRadio: Bool {
+        switch centralManager?.state {
+        case .poweredOff, .resetting, .unknown, .none:
+            true
+        case .poweredOn, .unsupported, .unauthorized:
+            false
+        @unknown default:
+            false
+        }
     }
 
     /// Clears a manual-connect hold and tears down the link per the settling rule (D-1 event 4).
     ///
     /// Returns success (does not throw) when there is no live `CBPeripheral` or nothing to cancel —
-    /// dropping a hold during a radio outage must not throw `.notFound`.
+    /// dropping a hold during a radio outage must not throw `.notFound`. When there is no live
+    /// reference (typical after radio invalidation left an AwaitingRadio `.reconnecting` projection),
+    /// still settles synchronously to `.disconnected(reason: nil)` so stream-only UIs leave the
+    /// reconnecting caption and can start a new connect hold while the radio remains off.
     func applyManualDisconnect(id: String) {
         manualConnectHold.removeValue(forKey: id)
         syncReconnectIntent(id: id, persistHold: true)
@@ -1678,7 +1715,14 @@ actor BluetoothActor {
         idleTaskRegistry.cancel(id)
         reconnectAttempts[id] = nil
 
-        guard let cbPeripheral = cbPeripherals[id] else { return }
+        guard let cbPeripheral = cbPeripherals[id] else {
+            // No live peripheral (radio outage / never discovered in this process): demand is already
+            // gone above. Publish a clean intentional terminal so observers do not stick on
+            // `.reconnecting(source: .library, attempt: nil, …)` until the radio returns and
+            // `sweepRadioReturnedDemand` → `beginIdleGrace` eventually rewrites it.
+            setConnectionState(.disconnected(reason: nil), for: id)
+            return
+        }
 
         if cbPeripheral.state == .connected {
             intentionalDisconnects.insert(id)
