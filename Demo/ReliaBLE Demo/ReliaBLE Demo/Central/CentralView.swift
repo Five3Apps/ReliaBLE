@@ -204,6 +204,10 @@ struct CentralView: View {
                     }
                 }
                 group.addTask {
+                    // Seed first so force-quit relaunch / restore that already linked is visible
+                    // immediately; `connectionStateChanges` does not replay current state.
+                    let initial = await reliaBLE.currentConnectionStates
+                    await viewModel.seedConnectionStates(initial)
                     for await change in reliaBLE.connectionStateChanges {
                         await viewModel.updateConnectionState(change)
                     }
@@ -341,6 +345,13 @@ private struct DeviceDetailView: View {
             }
         }
         .padding()
+        .task(id: device.id) {
+            // Detail can open before the Central stream task seeds; pull current state for this id.
+            let states = await reliaBLE.currentConnectionStates
+            if let state = states[device.id] {
+                viewModel.seedConnectionStates([device.id: state])
+            }
+        }
         .onChange(of: connectionState?.isActiveConnection) { _, isActiveConnection in
             // A later stream transition to an in-progress/linked state means the radio recovered
             // (or a new attempt started) — drop a stale fail-fast caption from an earlier tap.

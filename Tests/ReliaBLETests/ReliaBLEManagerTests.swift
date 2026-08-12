@@ -4479,6 +4479,119 @@ struct ReliaBLEManagerTests {
         await manager2.bluetooth.testClearPersistedReconnectIntent()
         await Mock.tearDown(manager2)
     }
+
+    /// Force-quit style relaunch with **no** `willRestoreState` still rehydrates the durable hold
+    /// and reconnects once the peripheral is rediscovered (or retrieved).
+    @Test @MainActor func coldStartRehydratesHoldWithoutWillRestore() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer {
+            Mock.connectionTestDelegate.connectionResult = .success(())
+            Mock.clearStateRestoration()
+        }
+
+        let restoreId = "com.five3apps.relia-ble.tests.cold-start-hold"
+        let manager1 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager1)
+        await manager1.bluetooth.testClearPersistedReconnectIntent()
+
+        try await manager1.startScanning()
+        let snap = await Mock.waitForDiscovered(id: Mock.connectionTestPeripheralID, on: manager1, withinNanoseconds: 3_000_000_000)
+        let handle = try #require(snap).peripheral
+        await manager1.stopScanning()
+        try await handle.connect()
+        _ = await pollUntil(timeout: 3.0) { await manager1.currentConnectionStates[handle.id] == .connected }
+        #expect(await manager1.bluetooth.testPersistedManualConnectHolds()[handle.id] == true)
+        let persistedUUID = await manager1.bluetooth.testPersistedHoldCbUUID(for: handle.id)
+        #expect(persistedUUID != nil, "Hold row must store cbUUID for stable rediscovery")
+
+        // Full process death simulation: tear down stack, reset mock links, **no** state-restoration fixture.
+        await Mock.tearDown(manager1, resetMockConnections: true)
+        Mock.clearStateRestoration()
+
+        let manager2 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager2)
+
+        // Disk → memory without willRestore.
+        #expect(await manager2.bluetooth.testHasManualConnectHold(for: Mock.connectionTestPeripheralID))
+        #expect(await manager2.bluetooth.testIsReconnectEnabled(Mock.connectionTestPeripheralID))
+
+        // Rediscovery (or retrieve) must re-issue connect under the durable hold.
+        try await manager2.startScanning()
+        _ = await Mock.waitForDiscovered(id: Mock.connectionTestPeripheralID, on: manager2, withinNanoseconds: 3_000_000_000)
+        #expect(await pollUntil(timeout: 5.0) {
+            await manager2.currentConnectionStates[Mock.connectionTestPeripheralID] == .connected
+        })
+
+        await manager2.stopScanning()
+        await manager2.bluetooth.testClearPersistedReconnectIntent()
+        await Mock.tearDown(manager2)
+    }
+
+    /// Hold persisted under a different app-facing id but same `cbUUID` rebinds on rediscovery and
+    /// still auto-connects.
+    @Test @MainActor func holdRebindsAcrossNameDerivedIdDrift() async throws {
+        Mock.connectionTestDelegate.connectionResult = .success(())
+        defer {
+            Mock.connectionTestDelegate.connectionResult = .success(())
+            Mock.clearStateRestoration()
+        }
+
+        let restoreId = "com.five3apps.relia-ble.tests.hold-id-drift"
+        let manager1 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager1)
+        await manager1.bluetooth.testClearPersistedReconnectIntent()
+
+        try await manager1.startScanning()
+        let snap = await Mock.waitForDiscovered(id: Mock.connectionTestPeripheralID, on: manager1, withinNanoseconds: 3_000_000_000)
+        let handle = try #require(snap).peripheral
+        await manager1.stopScanning()
+        try await handle.connect()
+        _ = await pollUntil(timeout: 3.0) { await manager1.currentConnectionStates[handle.id] == .connected }
+        let cbUUID = try #require(await manager1.bluetooth.testPersistedHoldCbUUID(for: handle.id))
+
+        await Mock.tearDown(manager1, resetMockConnections: true)
+        Mock.clearStateRestoration()
+
+        // Rewrite disk as if the previous session keyed the hold under a different name-derived id.
+        let key = "com.five3apps.relia-ble.reconnect-intent.\(restoreId)"
+        UserDefaults.standard.set(
+            [[
+                "id": "StaleAdvertisedName",
+                "reconnectDesired": true,
+                "cbUUID": cbUUID.uuidString,
+            ]],
+            forKey: key
+        )
+
+        let manager2 = await Mock.makeManager(restoreIdentifier: restoreId)
+        await Mock.ensureReady(manager2)
+
+        // Rehydrate loads the stale-id row; `retrieveAndBindHeldPeripherals` and/or scan then
+        // rebind by cbUUID onto the live name-derived id. Either may win first depending on mock timing.
+        let hasStaleHold = await manager2.bluetooth.testHasManualConnectHold(for: "StaleAdvertisedName")
+        let hasLiveHold = await manager2.bluetooth.testHasManualConnectHold(for: Mock.connectionTestPeripheralID)
+        #expect(hasStaleHold || hasLiveHold, "Durable hold must be in memory under the stale id and/or already rebound")
+
+        try await manager2.startScanning()
+        _ = await Mock.waitForDiscovered(id: Mock.connectionTestPeripheralID, on: manager2, withinNanoseconds: 3_000_000_000)
+
+        // Eventually demand lives only under the resolved id and the link comes back.
+        #expect(await pollUntil(timeout: 5.0) {
+            let onLive = await manager2.bluetooth.testHasManualConnectHold(for: Mock.connectionTestPeripheralID)
+            let onStale = await manager2.bluetooth.testHasManualConnectHold(for: "StaleAdvertisedName")
+            return onLive && !onStale
+        })
+        #expect(await pollUntil(timeout: 5.0) {
+            await manager2.currentConnectionStates[Mock.connectionTestPeripheralID] == .connected
+        })
+        // Disk should be rewritten under the live id.
+        #expect(await manager2.bluetooth.testPersistedManualConnectHolds()[Mock.connectionTestPeripheralID] == true)
+        #expect(await manager2.bluetooth.testPersistedManualConnectHolds()["StaleAdvertisedName"] == nil)
+
+        await manager2.stopScanning()
+        await manager2.bluetooth.testClearPersistedReconnectIntent()
+        await Mock.tearDown(manager2)
+    }
 }
 
 // MARK: - Logging Test Support

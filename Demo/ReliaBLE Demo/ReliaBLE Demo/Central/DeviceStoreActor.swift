@@ -69,14 +69,35 @@ actor DeviceStoreActor: ModelActor {
         assertWritesOffMainThread()
 
         do {
-            let allDevices = try modelContext.fetch(FetchDescriptor<Device>())
+            var allDevices = try modelContext.fetch(FetchDescriptor<Device>())
             for peripheral in peripherals {
-                if let existingDevice = allDevices.first(where: { $0.id == peripheral.id }) {
+                let cbUUID = peripheral.cbIdentifier?.uuidString
+
+                // Prefer exact library id match; else same radio via CoreBluetooth UUID (name-derived
+                // id often drifts: "ReliaBLE Demo" / UUID-string / "iPhone" for one peripheral).
+                let existingDevice =
+                    allDevices.first(where: { $0.id == peripheral.id })
+                    ?? cbUUID.flatMap { uuid in allDevices.first(where: { $0.cbUUID == uuid }) }
+
+                if let existingDevice {
+                    // Identity drift: keep one SwiftData row, adopt the live library id for connect().
+                    if existingDevice.id != peripheral.id {
+                        existingDevice.id = peripheral.id
+                    }
+                    if let cbUUID {
+                        existingDevice.cbUUID = cbUUID
+                    }
                     existingDevice.name = peripheral.name
                     existingDevice.lastSeen = peripheral.lastSeen
                 } else {
-                    let newDevice = Device(id: peripheral.id, name: peripheral.name, lastSeen: peripheral.lastSeen)
+                    let newDevice = Device(
+                        id: peripheral.id,
+                        name: peripheral.name,
+                        lastSeen: peripheral.lastSeen,
+                        cbUUID: cbUUID
+                    )
                     modelContext.insert(newDevice)
+                    allDevices.append(newDevice)
                 }
             }
             try modelContext.save()

@@ -60,6 +60,16 @@ import ReliaBLE
         connectionStates[change.peripheralId] = change.state
     }
 
+    /// Seeds captions from ``ReliaBLEManager/currentConnectionStates`` so restore/reconnect that
+    /// already completed (or is in flight) is visible before the next stream event. Stream updates
+    /// still win afterward via ``updateConnectionState``.
+    @MainActor
+    func seedConnectionStates(_ states: [String: ConnectionState]) {
+        for (id, state) in states {
+            connectionStates[id] = state
+        }
+    }
+
     func authorizeBluetooth() {
         Task { try? await reliaBLE?.authorizeBluetooth() }
     }
