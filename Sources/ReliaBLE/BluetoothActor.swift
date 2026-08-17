@@ -316,6 +316,22 @@ actor BluetoothActor {
     /// on wake. A stale generation means the timer was superseded and must not fire (D-1 event 6/7).
     private var idleGeneration: [String: UInt64] = [:]
 
+    /// Obsolete app-facing id → the id that replaced it, written by
+    /// ``migrateIdentity(from:to:cbIdentifier:)``.
+    ///
+    /// A ``Peripheral`` handle is interned under the id in force when it was vended, and its `id` is
+    /// immutable — so an app that stored a handle before an identity upgrade keeps addressing the
+    /// actor by a key nothing is filed under any more. Without this map its `connect` / `disconnect`
+    /// silently no-op against the migrated hold, leaving a live link the app believes it dropped.
+    /// Entries are re-pointed rather than chained, so a lookup is always one hop.
+    ///
+    /// The map serves the handle surface, not the stream. A replaced id keeps working as a handle —
+    /// ``canonicalId(_:)`` routes its calls and ``setConnectionState(_:for:)`` mirrors state back onto
+    /// it — while on ``connectionStateChanges`` it receives one terminal at migration and then goes
+    /// quiet, because a subscriber keyed by an id has no way to be told that id moved. Consumers that
+    /// need to follow a rename read ``discoveredPeripherals``, where one radio is always one row.
+    private var migratedIds: [String: String] = [:]
+
     /// Generation counter per peripheral for the Tier-1 reconnect ladder. The same cancel-during-sleep
     /// defense as ``idleGeneration``: a cancel landing while the ladder task is sleeping must not let a
     /// superseded task drive ``performReconnect``. Bump on arm, capture in ``scheduleReconnect``, and
@@ -1300,9 +1316,9 @@ actor BluetoothActor {
         // D-1 event 15 (optional polish): discovery upserting an id that already has demand links it
         // opportunistically — the cheap recovery for the `notFound` terminal case. It starts **no**
         // scan of its own; it only links when something else (typically an app-driven scan) finds a
-        // device demand is already waiting on. Narrowed to the terminal `.failed` state so repeated
-        // advertisements do not spam connect attempts against an already-linked or in-transition
-        // peripheral; richer demand-driven scan policy is FR-8.2.
+        // device demand is already waiting on. Restricted to ids nothing is currently driving (see the
+        // skip set below) so repeated advertisements do not spam connect attempts against an
+        // already-linked or in-transition peripheral; richer demand-driven scan policy is FR-8.2.
         let hasDemand = demand(id: resolvedId)
         // First live ref only — avoids advertising spam while still logging demand/hold mismatches.
         if firstLiveRefThisLaunch {
@@ -1321,10 +1337,19 @@ actor BluetoothActor {
         if hasDemand {
             // Skip ids already being linked or torn down; genuinely not-linked demanded ids
             // (`.failed`, `.disconnected`, or currently untracked/`nil`) are re-issued here so the
-            // rediscovery of a stranded demand is the cheap recovery path (D-never). `.reconnecting`
-            // ids are already being driven (ladder or AwaitingRadio projection), so they are skipped.
+            // rediscovery of a stranded demand is the cheap recovery path (D-never). A ladder step is
+            // already being driven and is skipped too.
+            //
+            // The AwaitingRadio projection (`source: .library` with a `nil` attempt) is the exception:
+            // nothing is driving it — it is demand parked until a radio and a live reference exist,
+            // and this is the moment both do. Re-issuing here is also what makes the ordering safe,
+            // since the live reference is not bound until after identity resolution has returned.
+            // Once this issues, the state becomes `.connecting` and later advertisements skip again.
             switch connectionStates[resolvedId] {
-            case .connected, .connecting, .disconnecting, .reconnecting(_, _, _):
+            case .connected, .connecting, .disconnecting,
+                 .reconnecting(source: .system, attempt: _, nextRetryAt: _):
+                break
+            case .reconnecting(source: .library, attempt: .some, nextRetryAt: _):
                 break
             default:
                 log?.info(
@@ -1359,6 +1384,10 @@ actor BluetoothActor {
     ///    (callers should pass local-name-first; ad local name beats GAP/OS device name).
     /// 4. When an advertisement **does** carry a local name that differs from a held id, use the local-name
     ///    id so a later scan can upgrade a GAP-only hold key (rebind moves the hold).
+    ///
+    /// When resolution upgrades the id of a device already in ``discoveredPeripherals``, the row is reused and
+    /// ``migrateIdentity(from:to:cbIdentifier:)`` moves every other per-id record onto the new id, so no state —
+    /// least of all the live `CBPeripheral` — is left stranded under the obsolete key.
     ///
     /// **Merge rule for name:** prefer `advertisement.localName`, then existing snapshot name, then caller
     /// `name`, then a durable hold id for this UUID (label), then GAP name. Never let a retrieve-only GAP
@@ -1454,11 +1483,40 @@ actor BluetoothActor {
             registry: registry
         )
 
+        // An alias only holds while nothing else answers to the retired id. The moment a device
+        // resolves to it again, that id is a live catalog entry: keeping the alias would route a
+        // caller asking for this device to the one that vacated the name. Same-name devices still
+        // collapse into one entry (FR-8.5), but a *retired* name must not re-collapse after the
+        // upgrade that separated them.
+        if let supersededAlias = migratedIds.removeValue(forKey: resolvedId) {
+            // Dropping the alias stops *future* mirroring, but the handle interned under this id is
+            // still carrying the departed device's state from every mirror before now. Re-point it at
+            // whatever the library tracks for the device claiming the id — `nil` for one it has never
+            // linked — so a discovery UI cannot render two connected devices for one live link.
+            applyToHandles(id: resolvedId, state: connectionStates[resolvedId])
+            log?.info(
+                tags: [.peripheral(resolvedId), .category(.connection)],
+                "Alias id=\(resolvedId) → id=\(supersededAlias) dropped — a device now resolves to that id"
+            )
+        }
+
+        let previousId = existing?.id
         if let existingIndex {
             discoveredPeripherals[existingIndex] = snapshot
         } else {
             log?.debug(tags: [.category(.scanning), .peripheral(resolvedId)], "Adding newly discovered peripheral")
             discoveredPeripherals.append(snapshot)
+        }
+
+        // The row was upgraded in place above; every other record keyed by the obsolete id has to
+        // follow it. Runs after the upsert so migration cannot invalidate `existingIndex`.
+        if let previousId, previousId != resolvedId {
+            let carried = demand(id: previousId) ? "demand carried over" : "no demand"
+            log?.info(
+                tags: [.peripheral(resolvedId), .category(.connection)],
+                "Identity upgraded: id=\(previousId) → id=\(resolvedId) for cbUUID=\(cbIdentifier.uuidString) (\(carried))"
+            )
+            migrateIdentity(from: previousId, to: resolvedId, cbIdentifier: cbIdentifier)
         }
 
         // Apply before the caller broadcasts — see the Important note above.
@@ -1525,7 +1583,7 @@ actor BluetoothActor {
         // When step 1 skipped (already terminal), this clear is silent on the stream — correct,
         // because observers already hold a terminal caption.
         for id in untrackedIds {
-            registry.applyConnectionState(id: id, state: nil)
+            applyToHandles(id: id, state: nil)
         }
         connectionStates.removeAll()
 
@@ -1680,6 +1738,21 @@ actor BluetoothActor {
     private func cachedSystemReconnect(id: String) -> Bool {
         if case .reconnecting(source: .system, _, _) = connectionStates[id] { return true }
         return false
+    }
+
+    /// Resolves an id supplied by a caller to the id the library currently files that device under.
+    ///
+    /// Apply this to every entry point that accepts an id from outside the actor — a ``Peripheral``
+    /// handle's `id` is fixed at the moment it was vended, and an identity upgrade since then would
+    /// otherwise turn the caller's request into a silent no-op. Internal call sites already work in
+    /// current ids, where this is the identity function.
+    private func canonicalId(_ id: String) -> String {
+        guard let current = migratedIds[id] else { return id }
+        log?.debug(
+            tags: [.peripheral(current), .category(.connection)],
+            "Resolved caller id=\(id) to current id=\(current)"
+        )
+        return current
     }
 
     /// The only place in the codebase that may call `centralManager.connect(_:options:)`.
@@ -1846,49 +1919,109 @@ actor BluetoothActor {
             "Hold identity drift: moving hold from id=\(oldId) → id=\(resolvedId) for cbUUID=\(oldUUID) (name-derived id changed; demand preserved)"
         )
 
-        let hold = oldEntry.value
-        manualConnectHold.removeValue(forKey: oldId)
+        migrateIdentity(from: oldId, to: resolvedId, cbIdentifier: cbIdentifier)
+        return true
+    }
 
-        var moved = hold
-        moved.cbIdentifier = cbIdentifier
-        manualConnectHold[resolvedId] = moved
+    /// Moves every per-id record from `oldId` onto `newId` after identity resolution assigned a
+    /// different app-facing id to the same radio.
+    ///
+    /// Upholds the invariant ``id(for:)`` depends on — **one ``cbPeripherals`` key per live
+    /// `CBPeripheral`** — and keeps demand, connection state, and scheduled work addressed by the id
+    /// the app can actually see. Identity drift is not exclusive to durable holds: an advertisement
+    /// that first arrives without a local name resolves to the `cbIdentifier` string and is upgraded
+    /// by the next packet, before any hold exists.
+    ///
+    /// Callers own the log line describing *why* the id moved; this only moves state.
+    private func migrateIdentity(from oldId: String, to newId: String, cbIdentifier: UUID) {
+        guard oldId != newId else { return }
+
+        // Re-point existing aliases before adding this one, so every obsolete id resolves in one hop.
+        for (stale, current) in migratedIds where current == oldId {
+            migratedIds[stale] = newId
+        }
+        migratedIds[oldId] = newId
+        migratedIds[newId] = nil
+
+        if var hold = manualConnectHold.removeValue(forKey: oldId) {
+            hold.cbIdentifier = cbIdentifier
+            manualConnectHold[newId] = hold
+        }
 
         // Transfer demand-adjacent bookkeeping so ladders / leases / terminal states do not stick
         // under the obsolete id.
         if let leases = activeLeases.removeValue(forKey: oldId) {
-            activeLeases[resolvedId, default: []].formUnion(leases)
+            activeLeases[newId, default: []].formUnion(leases)
         }
         if intentionalDisconnects.remove(oldId) != nil {
-            intentionalDisconnects.insert(resolvedId)
+            intentionalDisconnects.insert(newId)
         }
         if let cb = cbPeripherals.removeValue(forKey: oldId) {
-            cbPeripherals[resolvedId] = cb
+            cbPeripherals[newId] = cb
         }
-        if let state = connectionStates.removeValue(forKey: oldId) {
-            // Publish under the new id so stream observers follow the rebind.
-            setConnectionState(state, for: resolvedId)
+        let movedState = connectionStates.removeValue(forKey: oldId)
+        if let movedState {
+            // A stream-only observer still keyed by `oldId` would render the moved state forever — no
+            // further event can ever reach it — so give that id one terminal. The *handle* interned
+            // under `oldId` is not cleared: the alias registered above keeps its calls working, and
+            // ``setConnectionState(_:for:)`` mirrors the live state back onto it.
+            broadcast(
+                ConnectionStateChange(peripheralId: oldId, state: .disconnected(reason: nil)),
+                to: connectionStateChangesContinuations
+            )
+            setConnectionState(movedState, for: newId)
         }
         if let attempts = reconnectAttempts.removeValue(forKey: oldId) {
-            reconnectAttempts[resolvedId] = attempts
+            reconnectAttempts[newId] = attempts
         }
         if let gen = reconnectGeneration.removeValue(forKey: oldId) {
-            reconnectGeneration[resolvedId] = gen
+            reconnectGeneration[newId] = gen
         }
         if let gen = idleGeneration.removeValue(forKey: oldId) {
-            idleGeneration[resolvedId] = gen
+            idleGeneration[newId] = gen
         }
-        // Drop the obsolete discovery snapshot so consumers do not see two rows for one radio.
+        if let cancels = cancelCallCounts.removeValue(forKey: oldId) {
+            cancelCallCounts[newId, default: 0] += cancels
+        }
+        // Drop any obsolete discovery snapshot so consumers do not see two rows for one radio. An id
+        // upgraded in place by ``resolveAndUpsertDiscovered`` already reuses its row, so this is a
+        // no-op on that path.
         if let oldIdx = discoveredPeripherals.firstIndex(where: { $0.id == oldId }) {
             discoveredPeripherals.remove(at: oldIdx)
         }
+
+        // Both task registries key their closures by the id captured at arm time, so the old id's
+        // pending work cannot be reused and has to be cancelled. Re-drive it under the new id below —
+        // the maps are silent about scheduled work, and nothing else will pick a ladder step or an
+        // idle timer back up. (An AwaitingRadio projection is the one case discovery does re-issue,
+        // once the live reference is bound, which is later than this runs.)
         taskRegistry.cancel(oldId)
         idleTaskRegistry.cancel(oldId)
-
-        // Drop reconnect-enabled under the old key; re-sync both ids (old clears, new arms).
         reconnectEnabled.remove(oldId)
-        syncReconnectIntent(id: oldId)
-        syncReconnectIntent(id: resolvedId, persistHold: restoreIdentifier != nil)
-        return true
+        syncReconnectIntent(id: newId, persistHold: restoreIdentifier != nil && manualConnectHold[newId] != nil)
+
+        switch movedState {
+        case .connected, .connecting, .reconnecting(source: .system, attempt: _, nextRetryAt: _):
+            // Re-arms only when demand is still zero; `beginIdleGrace` self-guards.
+            beginIdleGrace(id: newId)
+        case .reconnecting(source: .library, let attempt, _):
+            guard wantsReconnect(id: newId) else { break }
+            if let attempt {
+                // Same attempt number, fresh delay: the move restarts the wait but must not inflate
+                // the ladder's progress toward `maxAttempts`. `scheduleReconnect` does not write
+                // ``reconnectAttempts``, and ``performReconnect`` refuses to fire unless the map and
+                // the scheduled step agree, so pin it here.
+                reconnectAttempts[newId] = attempt
+                scheduleReconnect(id: newId, attempt: attempt)
+            } else {
+                // A `nil` attempt is the AwaitingRadio projection — demand waiting on a usable radio,
+                // not a ladder step. Re-drive the link directly; if the radio is still unusable this
+                // throws and leaves the projection standing for the radio-return sweep.
+                try? reevaluateLink(id: newId, reason: .discoveredWhileDemanded)
+            }
+        case .disconnecting, .disconnected, .failed, .none:
+            break
+        }
     }
 
     /// Writes the persisted hold records for the current ``restoreIdentifier``.
@@ -1988,6 +2121,7 @@ actor BluetoothActor {
     /// live peripheral, and the current link state before deciding whether to issue a connect.
     /// `.notFound` is terminal for the automatic path — no scan, no retry loop — and demand is retained.
     func reevaluateLink(id: String, reason: LinkReason) throws {
+        let id = canonicalId(id)
         guard demand(id: id) else { return }
 
         // Re-check the radio per D-radio: a waiter resumed at .poweredOn runs on a later actor turn, by
@@ -2066,7 +2200,13 @@ actor BluetoothActor {
     /// terminal caption while the call fails fast. Does **not** project when `reconnectDesired` is
     /// false (no radio-return re-issue) or when the radio is already `.poweredOn` (``reevaluateLink``
     /// / ``issueConnect`` drive `.connecting`).
-    func applyManualConnectHold(id: String, reconnectDesired: Bool) {
+    /// - Returns: The id the hold was actually filed under. A caller that follows this with a second
+    ///   actor call (``reevaluateLink(id:reason:)``) must pass this back rather than re-resolving its
+    ///   own id: resolution can change across the `await` between them, and the two calls landing on
+    ///   different devices is exactly the split this prevents.
+    @discardableResult
+    func applyManualConnectHold(id: String, reconnectDesired: Bool) -> String {
+        let id = canonicalId(id)
         let cbId = cbPeripherals[id]?.identifier
             ?? discoveredPeripherals.first(where: { $0.id == id })?.cbIdentifier
             ?? manualConnectHold[id]?.cbIdentifier
@@ -2083,7 +2223,7 @@ actor BluetoothActor {
         )
         syncReconnectIntent(id: id, persistHold: true)
 
-        guard reconnectDesired, shouldProjectAwaitingRadio else { return }
+        guard reconnectDesired, shouldProjectAwaitingRadio else { return id }
         switch connectionStates[id] {
         case .connected, .connecting, .disconnecting, .reconnecting:
             // Already linked or in progress — leave the live state alone.
@@ -2095,6 +2235,8 @@ actor BluetoothActor {
             )
             setConnectionState(.reconnecting(source: .library, attempt: nil, nextRetryAt: nil), for: id)
         }
+
+        return id
     }
 
     /// Whether the radio is in a state where a connect cannot be issued yet but may become usable
@@ -2118,6 +2260,7 @@ actor BluetoothActor {
     /// still settles synchronously to `.disconnected(reason: nil)` so stream-only UIs leave the
     /// reconnecting caption and can start a new connect hold while the radio remains off.
     func applyManualDisconnect(id: String) {
+        let id = canonicalId(id)
         manualConnectHold.removeValue(forKey: id)
         syncReconnectIntent(id: id, persistHold: true)
 
@@ -2173,6 +2316,7 @@ actor BluetoothActor {
     /// Fails `.notFound` when there is no live `CBPeripheral`. The radio wait (D-radio) is done by the
     /// caller-facing wrapper (``Peripheral/acquireWorkLease()``) before calling here.
     func acquireWorkLease(id: String) async throws -> WorkLeaseToken {
+        let id = canonicalId(id)
         guard cbPeripherals[id] != nil else { throw PeripheralError.notFound }
 
         // Work arriving suppresses idle: bump the generation and cancel any pending idle timer.
@@ -2187,14 +2331,28 @@ actor BluetoothActor {
     }
 
     /// Releases a work lease. Releasing an unknown or already-released token is a no-op.
+    ///
+    /// The lease UUID, not ``WorkLeaseToken/id``, is the identity that matters here: a token minted
+    /// before ``migrateIdentity(from:to:cbIdentifier:)`` moved the peripheral onto a new app-facing id
+    /// still names the obsolete one, and a lookup that trusted it would silently fail to release —
+    /// leaving demand asserted forever and the link unable to idle.
     func releaseWorkLease(_ token: WorkLeaseToken) async {
-        guard activeLeases[token.id]?.remove(token.leaseID) != nil else {
+        let resolvedId = activeLeases[token.id]?.contains(token.leaseID) == true
+            ? token.id
+            : activeLeases.first { $0.value.contains(token.leaseID) }?.key
+        guard let resolvedId, activeLeases[resolvedId]?.remove(token.leaseID) != nil else {
             log?.debug(tags: [.peripheral(token.id)], "releaseWorkLease: unknown or already-released token — no-op")
             return
         }
-        syncReconnectIntent(id: token.id)
-        if !demand(id: token.id) {
-            beginIdleGrace(id: token.id)
+        if resolvedId != token.id {
+            log?.debug(
+                tags: [.peripheral(resolvedId), .category(.connection)],
+                "releaseWorkLease: token named id=\(token.id); lease had moved to id=\(resolvedId)"
+            )
+        }
+        syncReconnectIntent(id: resolvedId)
+        if !demand(id: resolvedId) {
+            beginIdleGrace(id: resolvedId)
         }
     }
 
@@ -2293,8 +2451,25 @@ actor BluetoothActor {
     /// leave the handle's cached value silently stale.
     private func setConnectionState(_ state: ConnectionState, for id: String) {
         connectionStates[id] = state
-        registry.applyConnectionState(id: id, state: state)
+        applyToHandles(id: id, state: state)
         broadcast(ConnectionStateChange(peripheralId: id, state: state), to: connectionStateChangesContinuations)
+    }
+
+    /// Pushes `state` onto the handle for `id` **and** onto every handle whose id `id` replaced.
+    ///
+    /// A handle's `id` is fixed when it is vended, so an app holding one from before an identity
+    /// upgrade would otherwise watch a device it can still act on (``canonicalId(_:)`` routes its
+    /// calls) report nothing at all. Every write to a handle goes through here, so a replaced id can
+    /// never disagree with the id that replaced it — including clears, where a handle left reporting
+    /// `.connected` is not merely stale but known to be false.
+    ///
+    /// The stream deliberately does not follow suit: an obsolete id gets one terminal at migration and
+    /// then goes quiet, because a subscriber keyed by it has no way to learn the id moved.
+    private func applyToHandles(id: String, state: ConnectionState?) {
+        registry.applyConnectionState(id: id, state: state)
+        for (stale, current) in migratedIds where current == id {
+            registry.applyConnectionState(id: stale, state: state)
+        }
     }
 
     /// Drops all tracked connection state, mirroring the clear onto every affected handle and broadcasting a
@@ -2314,7 +2489,7 @@ actor BluetoothActor {
     /// is a no-op there — a torn-down stack ends its streams rather than emitting a final state into them.
     private func clearConnectionStates() {
         for id in connectionStates.keys {
-            registry.applyConnectionState(id: id, state: nil)
+            applyToHandles(id: id, state: nil)
             broadcast(
                 ConnectionStateChange(peripheralId: id, state: .disconnected(reason: .bluetoothUnavailable)),
                 to: connectionStateChangesContinuations
@@ -2328,9 +2503,24 @@ actor BluetoothActor {
     /// Derives nothing — it reads back the key that ``handlePeripheralDiscovered(_:advertisementData:rssi:)``
     /// already assigned, so ``handlePeripheralDiscovered(_:advertisementData:rssi:)`` remains the library's single
     /// source of identity truth.
+    ///
+    /// ``migrateIdentity(from:to:cbIdentifier:)`` maintains one key per live object, so the lookup is
+    /// normally unambiguous. A duplicate means that invariant broke: resolve it in favour of the id
+    /// currently published in ``discoveredPeripherals`` and log, rather than letting dictionary order
+    /// route a delegate callback to an arbitrary id.
     // TODO: FR-8.5
     private func id(for cbPeripheral: CBPeripheral) -> String? {
-        cbPeripherals.first { $0.value === cbPeripheral }?.key
+        let matches = cbPeripherals.filter { $0.value === cbPeripheral }.map(\.key)
+        guard matches.count > 1 else { return matches.first }
+
+        let published = discoveredPeripherals.first { $0.cbIdentifier == cbPeripheral.identifier }?.id
+        let resolved = published.flatMap { matches.contains($0) ? $0 : nil } ?? matches[0]
+        log?.warn(
+            tags: [.peripheral(resolved), .category(.connection)],
+            "Multiple ids map to one CBPeripheral (\(matches.sorted().joined(separator: ", "))) — resolved to \(resolved)"
+        )
+
+        return resolved
     }
 
     private func handleDidConnect(_ payload: ConnectionPayload) {
@@ -2702,6 +2892,10 @@ actor BluetoothActor {
         manualConnectHold.removeAll()
         idleGeneration.removeAll()
         reconnectGeneration.removeAll()
+        // Aliases belong to the handles dropped just above, so they go with them. Note this is
+        // teardown only — `invalidatePeripherals()` deliberately does not clear them, because a handle
+        // survives a radio reset and the id it carries has to keep resolving afterwards.
+        migratedIds.removeAll()
         pendingRestoredScanServices = nil
     }
 
@@ -2768,6 +2962,31 @@ actor BluetoothActor {
         guard let cbPeripheral = cbPeripherals[id] else { return }
         let payload = ConnectionPayload(peripheral: cbPeripheral, isReconnecting: false, error: nil)
         handleDidConnect(payload)
+    }
+
+    /// Test-only hook: replays an advertisement for an already-bound peripheral carrying a different
+    /// local name, driving an identity upgrade through the real
+    /// ``handlePeripheralDiscovered(_:advertisementData:rssi:)`` path. The mock cannot vary a spec's
+    /// advertised local name between packets.
+    func testRediscover(id: String, advertisedLocalName: String) {
+        guard let cbPeripheral = cbPeripherals[id] else { return }
+        handlePeripheralDiscovered(
+            cbPeripheral,
+            advertisementData: [CBAdvertisementDataLocalNameKey: advertisedLocalName],
+            rssi: -50
+        )
+    }
+
+    /// Test-only hook: the id a caller-supplied `id` currently resolves to through the alias map.
+    func testCanonicalId(for id: String) -> String {
+        canonicalId(id)
+    }
+
+    /// Test-only hook: the number of ids currently bound to the same live `CBPeripheral` as `id`.
+    /// One is the invariant ``id(for:)`` depends on; more means identity migration leaked a key.
+    func testIdCount(boundToPeripheralFor id: String) -> Int {
+        guard let cbPeripheral = cbPeripherals[id] else { return 0 }
+        return cbPeripherals.values.filter { $0 === cbPeripheral }.count
     }
 
     /// Test-only hook: runs the same peripheral invalidation as a Bluetooth reset/unauthorized path.

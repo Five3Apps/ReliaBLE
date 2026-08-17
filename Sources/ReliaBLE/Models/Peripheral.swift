@@ -177,7 +177,10 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
         // still leaves durable demand behind — the throw is informational, not destructive.
         // When `autoReconnect` is true and the radio is not usable, the hold path also projects
         // AwaitingRadio `.reconnecting(.library, nil, nil)` so stream observers see demand immediately.
-        await manager.bluetooth.applyManualConnectHold(id: id, reconnectDesired: autoReconnect)
+        // The actor resolves this handle's id to whatever it currently files the device under, and
+        // returns it. Reuse that below rather than passing `id` again: the two calls are separated by
+        // an `await`, and re-resolving could land the connect on a different device than the hold.
+        let resolvedID = await manager.bluetooth.applyManualConnectHold(id: id, reconnectDesired: autoReconnect)
 
         // Await a usable radio (cancellable), then ensure the link. Failures after the hold is
         // recorded (terminal radio, missing peripheral, etc.) are warned so Console shows why
@@ -190,7 +193,7 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
                 Task { await manager.bluetooth.cancelPoweredOnContinuation(waiterID) }
             }
 
-            try await manager.bluetooth.reevaluateLink(id: id, reason: .explicitConnect)
+            try await manager.bluetooth.reevaluateLink(id: resolvedID, reason: .explicitConnect)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
