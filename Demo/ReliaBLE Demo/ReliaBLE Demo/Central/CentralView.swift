@@ -37,7 +37,14 @@ extension ConnectionState {
         case .reconnecting(let source, let attempt, _):
             switch source {
             case .system: "System reconnecting…"
-            case .library: "Reconnecting (attempt \(attempt ?? 0))"
+            case .library:
+                // `attempt == nil` is the library AwaitingRadio projection (radio off / not yet
+                // usable), not ladder attempt 0.
+                if attempt == nil {
+                    "Waiting for Bluetooth…"
+                } else {
+                    "Reconnecting (attempt \(attempt, default: "0"))"
+                }
             }
         case .connected: "Connected"
         case .disconnecting: "Disconnecting"
@@ -108,6 +115,13 @@ struct CentralView: View {
     private func centralContent(reliaBLE: ReliaBLEManager) -> some View {
         NavigationSplitView {
             Text("ReliaBLE state: \(viewModel.currentState.description)")
+
+            if let scanError = viewModel.scanError {
+                Text(scanError)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+                    .padding(.horizontal)
+            }
 
             if case BluetoothState.unauthorized(let authState) = viewModel.currentState, authState == .notDetermined {
                 Button("Authorize Bluetooth") {
@@ -190,6 +204,10 @@ struct CentralView: View {
                     }
                 }
                 group.addTask {
+                    // Seed first so force-quit relaunch / restore that already linked is visible
+                    // immediately; `connectionStateChanges` does not replay current state.
+                    let initial = await reliaBLE.currentConnectionStates
+                    await viewModel.seedConnectionStates(initial)
                     for await change in reliaBLE.connectionStateChanges {
                         await viewModel.updateConnectionState(change)
                     }
@@ -251,6 +269,9 @@ private struct DeviceDetailView: View {
     let reliaBLE: ReliaBLEManager
 
     @State private var autoReconnect = true
+    /// Surfaces thrown errors from `connect` / `disconnect` (e.g. `bluetoothPoweredOff`).
+    /// Stream-driven connection captions do not carry those fail-fast throws.
+    @State private var actionError: String?
 
     private var connectionState: ConnectionState? {
         viewModel.connectionStates[device.id]
@@ -277,12 +298,36 @@ private struct DeviceDetailView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let actionError {
+                Text(actionError)
+                    .foregroundStyle(.red)
+                    .font(.caption)
+                    .multilineTextAlignment(.center)
+            }
+
             Button(action: {
                 let handle = reliaBLE.peripheral(id: device.id)
+                actionError = nil
                 if isActive {
-                    Task { try? await handle.disconnect() }
+                    Task {
+                        do {
+                            try await handle.disconnect()
+                        } catch {
+                            await MainActor.run {
+                                actionError = "Disconnect Failed: \(error)"
+                            }
+                        }
+                    }
                 } else {
-                    Task { try? await handle.connect(autoReconnect: autoReconnect) }
+                    Task {
+                        do {
+                            try await handle.connect(autoReconnect: autoReconnect)
+                        } catch {
+                            await MainActor.run {
+                                actionError = "Connect Failed: \(error)"
+                            }
+                        }
+                    }
                 }
             }) {
                 Text(isActive ? "Disconnect" : "Connect")
@@ -300,6 +345,20 @@ private struct DeviceDetailView: View {
             }
         }
         .padding()
+        .task(id: device.id) {
+            // Detail can open before the Central stream task seeds; pull current state for this id.
+            let states = await reliaBLE.currentConnectionStates
+            if let state = states[device.id] {
+                viewModel.seedConnectionStates([device.id: state])
+            }
+        }
+        .onChange(of: connectionState?.isActiveConnection) { _, isActiveConnection in
+            // A later stream transition to an in-progress/linked state means the radio recovered
+            // (or a new attempt started) — drop a stale fail-fast caption from an earlier tap.
+            if isActiveConnection == true {
+                actionError = nil
+            }
+        }
     }
 }
 

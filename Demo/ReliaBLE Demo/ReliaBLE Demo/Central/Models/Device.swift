@@ -27,13 +27,18 @@ import SwiftData
 
 @Model
 final class Device {
+    /// Library ``Peripheral/id`` (name-derived today). May change across launches when GAP/local
+    /// name availability changes; ``cbUUID`` is the stable merge key.
     var id: String
+    /// CoreBluetooth `CBPeripheral.identifier` when known — stable per central for the same radio.
+    var cbUUID: String?
     var name: String?
     var lastSeen: Date?
 
-    init(id: String, name: String?, lastSeen: Date?) {
+    init(id: String, name: String?, lastSeen: Date?, cbUUID: String? = nil) {
         self.id = id
         self.name = name
         self.lastSeen = lastSeen
+        self.cbUUID = cbUUID
     }
 }

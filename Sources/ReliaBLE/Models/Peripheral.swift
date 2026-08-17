@@ -154,6 +154,12 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
 
     /// Initiates a connection to this peripheral.
     ///
+    /// Rather than silently no-op'ing or throwing when the radio is not yet usable, this waits for
+    /// a transient (`.resetting` / `.unknown`) radio state to resolve before issuing the connect,
+    /// and fails fast with a typed error for terminal states (``PeripheralError/bluetoothPoweredOff``,
+    /// ``PeripheralError/bluetoothUnsupported``, ``PeripheralError/bluetoothUnavailable``). Cancelling
+    /// the calling task while parked on a transient state unblocks the wait with a `CancellationError`.
+    ///
     /// - Parameter autoReconnect: When `true` (the default), the library passes
     ///   `CBConnectPeripheralOptionEnableAutoReconnect` to the system and arms the app-side exponential-backoff
     ///   ladder for cases the OS option doesn't cover. Set to `false` for one-shot connections where reconnection
@@ -166,18 +172,77 @@ public final class Peripheral: Sendable, Identifiable, Hashable {
         guard let manager = state.withLock({ $0.manager }) else { throw PeripheralError.bluetoothUnavailable }
 
         await manager.bluetooth.ensureCentralManager()
-        try await manager.bluetooth.connect(id: id, autoReconnect: autoReconnect)
+
+        // Register the manual-connect hold FIRST so a connect that throws (e.g. bluetoothPoweredOff)
+        // still leaves durable demand behind — the throw is informational, not destructive.
+        // When `autoReconnect` is true and the radio is not usable, the hold path also projects
+        // AwaitingRadio `.reconnecting(.library, nil, nil)` so stream observers see demand immediately.
+        // The actor resolves this handle's id to whatever it currently files the device under, and
+        // returns it. Reuse that below rather than passing `id` again: the two calls are separated by
+        // an `await`, and re-resolving could land the connect on a different device than the hold.
+        let resolvedID = await manager.bluetooth.applyManualConnectHold(id: id, reconnectDesired: autoReconnect)
+
+        // Await a usable radio (cancellable), then ensure the link. Failures after the hold is
+        // recorded (terminal radio, missing peripheral, etc.) are warned so Console shows why
+        // the call threw; `CancellationError` is not a failure and is rethrown quietly.
+        do {
+            let waiterID = UUID()
+            try await withTaskCancellationHandler {
+                try await manager.bluetooth.waitUntilPoweredOn(waiterID: waiterID)
+            } onCancel: {
+                Task { await manager.bluetooth.cancelPoweredOnContinuation(waiterID) }
+            }
+
+            try await manager.bluetooth.reevaluateLink(id: resolvedID, reason: .explicitConnect)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            manager.loggingService.warn(
+                tags: [.peripheral(id), .category(.connection)],
+                "Manual connect failed: \(error)"
+            )
+            throw error
+        }
     }
 
     /// Initiates a disconnection from this peripheral.
     ///
-    /// - Throws: ``PeripheralError/notFound`` if the library holds no live reference for this ``id``, or
-    ///   ``PeripheralError/bluetoothUnavailable`` if Bluetooth has not been set up or the vending manager is gone.
+    /// Clears this handle's manual-connect hold and intentionally cancels the link per the settling
+    /// rule. Returns success even when the library holds no live reference (e.g. during a radio
+    /// outage), because dropping a hold must never throw `.notFound`. In that case the connection
+    /// state still settles immediately to ``ConnectionState/disconnected(reason:)`` with a `nil`
+    /// reason so observers drop any radio-await reconnecting caption without waiting for power-on.
     public func disconnect() async throws {
         guard let manager = state.withLock({ $0.manager }) else { throw PeripheralError.bluetoothUnavailable }
 
+        await manager.bluetooth.applyManualDisconnect(id: id)
+    }
+
+    /// Acquires a work lease on this peripheral (internal demand substrate).
+    ///
+    /// Ensures a central, awaits a usable radio (cancellable), then forwards to the actor lease
+    /// acquisition, which creates demand and drives an auto-connect without a prior manual
+    /// ``connect(autoReconnect:)``. `@testable`-visible only; no public surface this phase (D-work).
+    func acquireWorkLease() async throws -> WorkLeaseToken {
+        guard let manager = state.withLock({ $0.manager }) else { throw PeripheralError.bluetoothUnavailable }
+
         await manager.bluetooth.ensureCentralManager()
-        try await manager.bluetooth.disconnect(id: id)
+
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await manager.bluetooth.waitUntilPoweredOn(waiterID: waiterID)
+        } onCancel: {
+            Task { await manager.bluetooth.cancelPoweredOnContinuation(waiterID) }
+        }
+
+        return try await manager.bluetooth.acquireWorkLease(id: id)
+    }
+
+    /// Releases a work lease previously acquired on this peripheral. Releasing an unknown or
+    /// already-released token is a no-op.
+    func releaseWorkLease(_ token: WorkLeaseToken) async {
+        guard let manager = state.withLock({ $0.manager }) else { return }
+        await manager.bluetooth.releaseWorkLease(token)
     }
 
     // MARK: - Internal mutation

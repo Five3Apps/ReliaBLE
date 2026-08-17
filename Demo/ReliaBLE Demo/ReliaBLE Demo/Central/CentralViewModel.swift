@@ -34,6 +34,7 @@ import ReliaBLE
     var currentState: BluetoothState = .unknown
     /// Defaults to the Demo peripheral service UUID so background scans have a required filter.
     var servicesInput = "12345678-90AB-CDEF-1234-567890ABCDEF"
+    var scanError: String?
     var connectionStates: [String: ConnectionState] = [:]
 
     private var deviceStore: DeviceStoreActor?
@@ -59,13 +60,32 @@ import ReliaBLE
         connectionStates[change.peripheralId] = change.state
     }
 
+    /// Seeds captions from ``ReliaBLEManager/currentConnectionStates`` so restore/reconnect that
+    /// already completed (or is in flight) is visible before the next stream event. Stream updates
+    /// still win afterward via ``updateConnectionState``.
+    @MainActor
+    func seedConnectionStates(_ states: [String: ConnectionState]) {
+        for (id, state) in states {
+            connectionStates[id] = state
+        }
+    }
+
     func authorizeBluetooth() {
         Task { try? await reliaBLE?.authorizeBluetooth() }
     }
 
     func startScanning() {
         let services = parseServices(from: servicesInput)
-        Task { await reliaBLE?.startScanning(services: services) }
+        scanError = nil
+        Task {
+            do {
+                try await reliaBLE?.startScanning(services: services)
+            } catch {
+                await MainActor.run {
+                    scanError = String(describing: error)
+                }
+            }
+        }
     }
 
     func stopScanning() {

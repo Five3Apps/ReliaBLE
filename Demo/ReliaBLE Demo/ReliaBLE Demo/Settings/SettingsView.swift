@@ -38,6 +38,7 @@ struct SettingsView: View {
     @AppStorage("reconnectPolicy.initialDelay") private var initialDelay = 1.0
     @AppStorage("reconnectPolicy.maxDelay") private var maxDelay = 30.0
     @AppStorage("reconnectPolicy.jitter") private var jitter = 0.2
+    @AppStorage("idleDisconnectInterval") private var idleDisconnectInterval = 5.0
 
     var body: some View {
         NavigationView {
@@ -71,6 +72,19 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 } header: {
                     Text("Reconnect Policy")
+                }
+
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Idle Disconnect: \(String(format: "%.1f", idleDisconnectInterval))s")
+                        Slider(value: $idleDisconnectInterval, in: 0...30, step: 0.5)
+                    }
+
+                    Text("Changes take effect on next app launch.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Connection Lifecycle")
                 }
             }
             .navigationTitle("Settings")

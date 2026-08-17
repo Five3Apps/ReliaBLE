@@ -65,10 +65,18 @@ public struct ReliaBLEConfig: Sendable {
     /// The default `nil` disables state restoration and preserves the existing lazy-init
     /// contract unchanged.
     public var restoreIdentifier: String? = nil
-    
+
+    /// The idle time, in seconds, after which a connected peripheral is torn down when it has
+    /// no pending work and no manual-connect hold (FR-1.5). This is **global**: it applies to
+    /// every peripheral managed by this config, not per-peripheral.
+    ///
+    /// A value of `0` tears the link down as soon as demand reaches zero. The default value
+    /// is `5.0`.
+    public var idleDisconnectInterval: TimeInterval = 5.0
+
     /// Initializes a new `ReliaBLEConfig` instance with the default values.
     public init() {
-        
+
     }
 }
 

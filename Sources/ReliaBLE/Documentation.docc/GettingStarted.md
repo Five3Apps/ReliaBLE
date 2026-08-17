@@ -4,7 +4,12 @@ Installing ReliaBLE to your project, configuration and some starter examples of 
 
 ## Overview
 
-[TODO] More details coming soon.
+ReliaBLE uses a **work-driven connection model**: a peripheral connects because pending work needs a link — not because the app called `connect`. When the work is done and there is no manual-connect hold, the link tears down after a configurable idle interval (default 5 seconds). This keeps the link alive only as long as it is needed, minimizing unnecessary BLE activity.
+
+The two ways to create demand for a link are:
+
+- **Work** (the primary path): a non-empty command queue (FR-4/FR-5, not yet shipped) drives an auto-connect. In the interim, the library uses internal work leases for the same purpose.
+- **Manual connect** (advanced, expected to be rare): ``Peripheral/connect(autoReconnect:)`` sets a manual-connect hold that suppresses idle teardown. ``Peripheral/disconnect()`` clears the hold. A manual connect is **durable across relaunch** when ``ReliaBLEConfig/restoreIdentifier`` is configured — the hold is persisted and rehydrated on restore, so a standing session survives app termination.
 
 ## Installing ReliaBLE
 
@@ -81,16 +86,15 @@ Once Bluetooth is authorized, you can start scanning for nearby Bluetooth Low En
 
 The ReliaBLEManager provides methods to control scanning:
 
-1. Ensure Bluetooth is ready before scanning. Scanning won't work if Bluetooth is unauthorized or powered off.
-2. Use ``ReliaBLEManager/startScanning(services:)`` to begin discovering peripherals. You can pass an optional array of `CBUUID` objects to filter for peripherals advertising specific services, or omit the parameter to scan for all peripherals.
-3. Use ``ReliaBLEManager/stopScanning()`` to stop the scan when done.
+1. Use ``ReliaBLEManager/startScanning(services:)`` to begin discovering peripherals. You can pass an optional array of `CBUUID` objects to filter for peripherals advertising specific services, or omit the parameter to scan for all peripherals. Rather than silently no-op'ing when the radio is not yet usable, this awaits a transient (`.resetting` / `.unknown`) state and fails fast with a typed ``PeripheralError`` for terminal states (``PeripheralError/bluetoothPoweredOff``, ``PeripheralError/bluetoothUnsupported``, ``PeripheralError/bluetoothUnavailable``).
+2. Use ``ReliaBLEManager/stopScanning()`` to stop the scan when done.
 
 Example of starting and stopping a scan for all peripherals:
 
 ```swift
 // Check if Bluetooth is ready
 if await bleManager.currentState == .ready {
-    await bleManager.startScanning()
+    try await bleManager.startScanning()
 
     // Stop scanning after 10 seconds
     try? await Task.sleep(for: .seconds(10))
@@ -109,7 +113,7 @@ import CoreBluetooth
 // Check if Bluetooth is ready
 if await bleManager.currentState == .ready {
     let serviceUUIDs = [CBUUID(string: "180D"), CBUUID(string: "180F")] // Heart Rate and Battery services
-    await bleManager.startScanning(services: serviceUUIDs)
+    try await bleManager.startScanning(services: serviceUUIDs)
 
     // Stop scanning after 10 seconds
     try? await Task.sleep(for: .seconds(10))
@@ -165,6 +169,18 @@ try await band.disconnect()
 
 ``Peripheral/connect(autoReconnect:)`` is an `async throws` call that throws ``PeripheralError/notFound`` when the device has never been discovered and ``PeripheralError/bluetoothUnavailable`` when the manager that vended the handle has been deallocated or shut down.
 
+### Manual connect
+
+The ``Peripheral/connect(autoReconnect:)`` / ``Peripheral/disconnect()`` pair is the **Manual connect** API. It sets a manual-connect hold that suppresses idle teardown while the hold is active. This is documented as **Advanced** and expected to be rare: in the final model, the primary path to a link is work (a non-empty command queue), not an explicit connect call.
+
+A manual connect is **durable across relaunch** when ``ReliaBLEConfig/restoreIdentifier`` is configured. The hold is persisted and rehydrated on state restoration, so a standing session the app explicitly established survives app termination. If no restore identifier is configured, the hold is process-scoped only.
+
+### Idle disconnect
+
+When a peripheral has no pending work and no manual-connect hold, the link tears down after ``ReliaBLEConfig/idleDisconnectInterval`` (default 5 seconds). This is **global**: it applies to every peripheral managed by this config, not per-peripheral. A value of `0` tears the link down as soon as demand reaches zero.
+
+The idle teardown is indistinguishable from a clean disconnect on the ``ReliaBLEManager/connectionStateChanges`` stream — both produce ``ConnectionState/disconnected(reason:)`` with a `nil` reason. This is by design: the reconnect policy treats it as intentional (FR-11.5).
+
 ### Reading handle metadata
 
 A ``Peripheral`` handle carries synchronous, cached, **last-known** metadata:
@@ -203,6 +219,8 @@ Reconnection is **on by default** via the `autoReconnect` parameter (default `tr
 
 1. **Tier 0 — System-managed (primary).** The connection request includes `CBConnectPeripheralOptionEnableAutoReconnect`, which asks the iOS daemon to re-establish the link itself after an unexpected drop. This is power-efficient, daemon-held, and keeps trying across app suspension. While the system retries, ReliaBLE emits ``ConnectionState/reconnecting(source:attempt:nextRetryAt:)`` with ``ReconnectSource/system`` (`attempt` and `nextRetryAt` are both `nil` — iOS exposes neither).
 2. **Tier 1 — Library-managed (supplement).** Covers what the OS option doesn't: initial-connect failures and drops where the OS gives up. The library arms an exponential-backoff ladder governed by ``ReconnectPolicy``, emitting ``ReconnectSource/library`` with populated `attempt` and `nextRetryAt` so your UI can show a countdown.
+
+Both tiers gate on the same derived demand signal: Tier 0 is passed on every connect issued while the link is wanted, and Tier 1 arms on unexpected disconnect only while demand is present. A quiet peripheral (no work, no hold) arms neither.
 
 To disable auto-reconnect for a one-shot connection, pass `autoReconnect: false`:
 
